@@ -440,4 +440,27 @@ import TurboFieldfareValidationSupport
                                seqLen: 300, mode: .full, seed: 0x502,
                                config: Self.wideHeadConfig)
     }
+
+    /// The two tests above set `numHeads` to the widest dispatch, which hides
+    /// whether scratch sizing actually consults the per-layer head counts. A
+    /// real model does not do that: Laguna-S-2.1 reports `numHeads` 48 while
+    /// its sliding layers dispatch 72. Sizing from the scalar would allocate
+    /// for 48 and trip the dispatch precondition on every sliding layer.
+    @Test func scratchCoversTheWidestLayerNotJustTheScalarHeadCount() throws {
+        let config = ArchConfig.lagunaS2_1
+        #expect(config.numHeads == 48)
+        #expect(config.maxNumHeads == 72)
+
+        let kernel = try Attention(context: try MetalContext(), config: config)
+        #expect(kernel.maxQHeads == 72)
+    }
+
+    /// End-to-end version of the above: dispatch the wide sliding-layer shape
+    /// against the real Laguna config and check it still matches the CPU
+    /// reference rather than tripping the precondition.
+    @Test func attentionSWA_lagunaConfig_dispatchesWiderThanScalarHeadCount() throws {
+        try Self.runAndCompare(headDim: 128, numQHeads: 72, numKVHeads: 8,
+                               seqLen: 300, mode: .swa(window: 96), seed: 0x503,
+                               config: .lagunaS2_1)
+    }
 }

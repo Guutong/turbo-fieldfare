@@ -51,11 +51,10 @@ final class Attention {
 
     /// Ceiling on Q heads across the dispatches this instance will serve —
     /// sizes the split-KV partial scratch (`mPartial`/`dPartial`/`oPartial`).
-    /// Derived from `config.numHeads` at construction. `ArchConfig` does not
-    /// yet distinguish per-layer-type Q head counts (every model we support
-    /// today uses the same Q head count on sliding and full layers); once it
-    /// does, this should become the max across whatever layer-type fields
-    /// exist, mirroring how `headDim`/`fullHeadDim` are already split.
+    /// Taken from `ArchConfig.maxNumHeads`, which covers models that vary the
+    /// Q head count by layer: Laguna-S-2.1 runs 48 heads on its full-attention
+    /// layers and 72 on its sliding ones, so sizing from the scalar `numHeads`
+    /// alone would trip the dispatch precondition on the wider layers.
     let maxQHeads: Int
 
     // Partial state written by pass 1, read by pass 2. One shared allocation:
@@ -91,7 +90,7 @@ final class Attention {
         self.psoGQAPartial = try context.pipeline("attention_decode_gqa_swa_partial")
         self.psoCombine = try context.pipeline("attention_decode_combine")
 
-        self.maxQHeads = max(config.numHeads, 1)
+        self.maxQHeads = max(config.maxNumHeads, 1)
 
         let md = self.maxQHeads * Self.maxChunks
         guard let m = context.device.makeBuffer(length: md * MemoryLayout<Float>.size,
