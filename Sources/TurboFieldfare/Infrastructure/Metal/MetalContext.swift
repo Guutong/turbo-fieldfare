@@ -68,6 +68,7 @@ public final class MetalContext: @unchecked Sendable {
     private static let shaderModules: [String] = [
         "dequant_int4",
         "dequant_int8",
+        "dequant_subbyte",
         "rmsnorm",
         "rope",
         "attention",
@@ -83,6 +84,7 @@ public final class MetalContext: @unchecked Sendable {
         "attention": "Metal/Attention",
         "dequant_int4": "Metal/Quant",
         "dequant_int8": "Metal/Quant",
+        "dequant_subbyte": "Metal/Quant",
         "fused": "Metal/Fusions",
         "logit": "Metal/Sampling",
         "moe": "Metal/MoE",
