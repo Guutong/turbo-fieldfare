@@ -116,7 +116,8 @@ import TurboFieldfareValidationSupport
         mode: Mode,
         shareKV: Bool = false,
         seed: UInt64,
-        tolerance: Float = Tolerance.fp16ChainedReduction
+        tolerance: Float = Tolerance.fp16ChainedReduction,
+        config: ArchConfig = .gemma4_26B_A4B
     ) throws {
         var rng = SeedTree(seed).key(
             "attn-h\(numQHeads)-kv\(numKVHeads)-d\(headDim)-T\(seqLen)-kv=\(shareKV)"
@@ -136,7 +137,7 @@ import TurboFieldfareValidationSupport
         let vFp16 = vFp32.map { Float16($0) }
 
         let ctx = try MetalContext()
-        let kernel = try Attention(context: ctx)
+        let kernel = try Attention(context: ctx, config: config)
 
         guard let qBuf = Fp16Buffer.make(ctx.device, halves: qFp16),
               let kBuf = Fp16Buffer.make(ctx.device, halves: kFp16),
@@ -175,6 +176,9 @@ import TurboFieldfareValidationSupport
         }
         cmd.commit()
         cmd.waitUntilCompleted()
+
+        #expect(kernel.fallbackPipelineHits == 0,
+                "dispatch fell back to the generic (non-specialized) pipeline for headDim=\(headDim) Hq=\(numQHeads) Hkv=\(numKVHeads) — the specialized fast path was not taken")
 
         let qRef = qFp16.map { Float($0) }
         let kRef = kFp16.map { Float($0) }
@@ -383,5 +387,57 @@ import TurboFieldfareValidationSupport
         try Self.runAndCompare(headDim: 512, numQHeads: 16, numKVHeads: 2,
                                seqLen: 128, mode: .full, shareKV: true,
                                seed: 0x177)
+    }
+
+    // MARK: - Non-Gemma shape (generalized ArchConfig sizing)
+
+    /// A stand-in for a model whose sliding and full layers use different Q
+    /// head counts (e.g. poolside/Laguna-S-2.1: head_dim 128, 48 heads on
+    /// sliding layers, 72 on full layers, 8 KV heads throughout). `ArchConfig`
+    /// doesn't carry per-layer-type Q head counts yet, so `numHeads` is set to
+    /// the max across both dispatches below — the scratch sizing this test
+    /// exercises is meant to hold for whichever shape is actually dispatched.
+    private static let wideHeadConfig = ArchConfig(
+        hiddenSize: 4096,
+        intermediateSize: 4096,
+        moeIntermediateSize: 1024,
+        numHeads: 72,
+        numKVHeads: 8,
+        numFullKVHeads: 8,
+        headDim: 128,
+        fullHeadDim: 128,
+        vocabSize: 32000,
+        slidingWindow: 256,
+        finalLogitSoftcap: 0.0,
+        ropeTheta: 10_000.0,
+        fullRopeTheta: 10_000.0,
+        partialRotaryFactor: 1.0,
+        numLayers: 1,
+        numExperts: 1,
+        topKExperts: 1,
+        tieWordEmbeddings: false,
+        attentionKEqV: false,
+        fullAttentionLayerMask: [0],
+        hiddenActivation: "gelu_pytorch_tanh"
+    )
+
+    /// Non-Gemma shape: head_dim 128, 8 KV heads, 48 Q heads on the sliding
+    /// path — well beyond the old hardcoded `maxQHeads = 16` and outside the
+    /// old literal (256,16,8)/(512,16,2) specializations, so this only passes
+    /// if pipelines and scratch are actually sized from `ArchConfig`.
+    @Test func attentionSWA_nonGemmaShape_wideQHeads() throws {
+        try Self.runAndCompare(headDim: 128, numQHeads: 48, numKVHeads: 8,
+                               seqLen: 300, mode: .swa(window: 96), seed: 0x501,
+                               config: Self.wideHeadConfig)
+    }
+
+    /// Same non-Gemma model, full-attention layer: 72 Q heads, 8 KV heads.
+    /// qPerKV = 9, which exceeds `kAttnMaxQPerKV` (2), so this also exercises
+    /// the plain (non-GQA-grouped) partial kernel at a GQA ratio Gemma never
+    /// uses.
+    @Test func attentionFull_nonGemmaShape_wideQHeads() throws {
+        try Self.runAndCompare(headDim: 128, numQHeads: 72, numKVHeads: 8,
+                               seqLen: 300, mode: .full, seed: 0x502,
+                               config: Self.wideHeadConfig)
     }
 }

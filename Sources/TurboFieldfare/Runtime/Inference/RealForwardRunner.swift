@@ -252,7 +252,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         self.embedInt4 = try EmbedLookupInt4(context: context)
         self.rms       = try RMSNorm(context: context)
         self.int4      = try DequantInt4GEMV(context: context)
-        self.attention = try Attention(context: context)
+        self.attention = try Attention(context: context, config: cfg)
         self.shared    = try SharedExpertRuntime(context: context,
                                                   weightBits: model.sharedExpertWeightBits)
         self.moe       = try MoE(context: context)
