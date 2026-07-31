@@ -27,6 +27,32 @@ public struct ManifestArch: Decodable, Equatable, Sendable {
     public let attentionKEqV: Bool
     public let hiddenActivation: String
     public let fullAttentionLayerMask: [Int]
+
+    // Optional so manifests written before these fields existed still decode.
+    // Absent means "Gemma's behaviour", matching the `ArchConfig` defaults.
+    public let headsPerLayer: [Int]?
+    public let denseMLPLayerMask: [Int]?
+    public let denseMLPIntermediateSize: Int?
+    public let fullPartialRotaryFactor: Double?
+    public let fullRopeScaling: ManifestRopeScaling?
+    public let attentionGating: String?
+    public let routedScalingFactor: Double?
+}
+
+public struct ManifestRopeScaling: Decodable, Equatable, Sendable {
+    public let factor: Double
+    public let originalMaxPositionEmbeddings: Int
+    public let betaFast: Double
+    public let betaSlow: Double
+    public let attentionFactor: Double
+
+    var asRopeScaling: RopeScaling {
+        RopeScaling(factor: factor,
+                    originalMaxPositionEmbeddings: originalMaxPositionEmbeddings,
+                    betaFast: betaFast,
+                    betaSlow: betaSlow,
+                    attentionFactor: attentionFactor)
+    }
 }
 
 public struct ManifestQuantSlot: Decodable, Equatable, Sendable {
@@ -205,5 +231,42 @@ public enum ManifestReader {
         try check("fullAttentionLayerMask",
                   actualMask.description,
                   e.fullAttentionLayerMask.description)
+
+        // Fields absent from older manifests default to the `ArchConfig`
+        // defaults, so a Gemma manifest written before they existed still
+        // validates against `ArchConfig.gemma4_26B_A4B` unchanged.
+        try check("headsPerLayer",
+                  (a.headsPerLayer ?? []).description,
+                  e.headsPerLayer.description)
+        try check("denseMLPLayerMask",
+                  (a.denseMLPLayerMask ?? []).map { UInt8($0) }.description,
+                  e.denseMLPLayerMask.description)
+        try check("denseMLPIntermediateSize",
+                  a.denseMLPIntermediateSize ?? 0,
+                  e.denseMLPIntermediateSize)
+        try check("fullPartialRotaryFactor",
+                  (a.fullPartialRotaryFactor.map { "\($0)" } ?? "nil"),
+                  (e.fullPartialRotaryFactor.map { "\($0)" } ?? "nil"))
+        try check("fullRopeScaling",
+                  (a.fullRopeScaling?.asRopeScaling).map { "\($0)" } ?? "nil",
+                  e.fullRopeScaling.map { "\($0)" } ?? "nil")
+        try check("attentionGating",
+                  a.attentionGating ?? AttentionGating.none.rawValue,
+                  e.attentionGating.rawValue)
+        try check("routedScalingFactor",
+                  a.routedScalingFactor ?? 1.0,
+                  e.routedScalingFactor)
+
+        // Per-layer arrays, when present, must cover every layer.
+        if let heads = a.headsPerLayer, !heads.isEmpty, heads.count != a.numLayers {
+            throw ModelError.archMismatch(field: "headsPerLayer.count",
+                                          expected: "\(a.numLayers)",
+                                          actual: "\(heads.count)")
+        }
+        if let dense = a.denseMLPLayerMask, !dense.isEmpty, dense.count != a.numLayers {
+            throw ModelError.archMismatch(field: "denseMLPLayerMask.count",
+                                          expected: "\(a.numLayers)",
+                                          actual: "\(dense.count)")
+        }
     }
 }

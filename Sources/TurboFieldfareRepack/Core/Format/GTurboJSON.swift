@@ -31,7 +31,7 @@ enum GTurboJSON {
                                       expertStride: UInt64,
                                       bitWidths: QuantBitWidths) throws -> Data {
         let arch = plan.arch
-        let archDict: [String: Any] = [
+        var archDict: [String: Any] = [
             "hiddenSize": arch.hiddenSize,
             "ffnIntermediate": arch.intermediateSize,
             "moeIntermediateSize": arch.moeIntermediateSize,
@@ -54,6 +54,34 @@ enum GTurboJSON {
             "hiddenActivation": arch.hiddenActivation,
             "fullAttentionLayerMask": arch.fullAttentionLayerMask.map { Int($0) }
         ]
+        // Emitted only when the model actually differs from Gemma, so a Gemma
+        // repack still writes a byte-identical `arch` block and the runtime's
+        // optional decoding of these keys stays exercised on both paths.
+        if !arch.headsPerLayer.isEmpty {
+            archDict["headsPerLayer"] = arch.headsPerLayer
+        }
+        if !arch.denseMLPLayerMask.isEmpty {
+            archDict["denseMLPLayerMask"] = arch.denseMLPLayerMask.map { Int($0) }
+            archDict["denseMLPIntermediateSize"] = arch.denseMLPIntermediateSize
+        }
+        if let prf = arch.fullPartialRotaryFactor {
+            archDict["fullPartialRotaryFactor"] = prf
+        }
+        if let s = arch.fullRopeScaling {
+            archDict["fullRopeScaling"] = [
+                "factor": s.factor,
+                "originalMaxPositionEmbeddings": s.originalMaxPositionEmbeddings,
+                "betaFast": s.betaFast,
+                "betaSlow": s.betaSlow,
+                "attentionFactor": s.attentionFactor,
+            ]
+        }
+        if arch.attentionGating != "none" {
+            archDict["attentionGating"] = arch.attentionGating
+        }
+        if arch.routedScalingFactor != 1.0 {
+            archDict["routedScalingFactor"] = arch.routedScalingFactor
+        }
         let quantBits = [
             "embedding": bitWidths.embedding,
             "attention": bitWidths.attention,

@@ -48,3 +48,6 @@ tmp/
 __pycache__/
 *.pyc
 .venv/
+
+# Ephemeral subagent worktrees
+.claude/worktrees/

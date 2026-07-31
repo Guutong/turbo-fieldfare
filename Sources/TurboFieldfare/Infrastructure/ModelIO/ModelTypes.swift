@@ -1,8 +1,50 @@
 import Foundation
 import Metal
 
-/// Compile-time architecture baseline. `manifest.json -> arch` must match this
-/// field-by-field at load time; mismatches throw `ModelError.archMismatch`.
+/// YaRN RoPE scaling parameters. Applied per layer type: Laguna-S-2.1 scales
+/// its full-attention layers with YaRN while leaving sliding layers on plain
+/// RoPE, so this is carried separately from `ropeTheta`/`fullRopeTheta`.
+/// `nil` on an `ArchConfig` means no scaling, which is Gemma's behaviour.
+public struct RopeScaling: Sendable, Equatable {
+    public let factor: Double
+    public let originalMaxPositionEmbeddings: Int
+    public let betaFast: Double
+    public let betaSlow: Double
+    /// Multiplier on attention scores that accompanies the frequency scaling.
+    public let attentionFactor: Double
+
+    public init(factor: Double,
+                originalMaxPositionEmbeddings: Int,
+                betaFast: Double,
+                betaSlow: Double,
+                attentionFactor: Double) {
+        self.factor = factor
+        self.originalMaxPositionEmbeddings = originalMaxPositionEmbeddings
+        self.betaFast = betaFast
+        self.betaSlow = betaSlow
+        self.attentionFactor = attentionFactor
+    }
+}
+
+/// Gating applied to the attention output before `o_proj`.
+///
+/// Laguna computes `gate = softplus(g_proj(hidden))` and multiplies the
+/// attention output by it. `perHead` emits one gate per query head (broadcast
+/// across `headDim`); `perElement` emits one per `(head, headDim)` channel.
+/// Gemma has no such projection, hence `.none`.
+public enum AttentionGating: String, Sendable, Equatable {
+    case none
+    case perHead
+    case perElement
+}
+
+/// Architecture description for the loaded model. `manifest.json -> arch` must
+/// match the config the runtime was handed, field-by-field, at load time;
+/// mismatches throw `ModelError.archMismatch`.
+///
+/// Fields below the `tieWordEmbeddings` line describe variation that Gemma 4
+/// does not exercise. They all default to Gemma's behaviour so existing
+/// manifests and call sites are unaffected.
 public struct ArchConfig: Sendable, Equatable {
     public let hiddenSize: Int
     public let intermediateSize: Int          // shared expert FFN (== ffnIntermediate in manifest)
@@ -26,6 +68,29 @@ public struct ArchConfig: Sendable, Equatable {
     public let fullAttentionLayerMask: [UInt8]
     public let hiddenActivation: String
 
+    /// Per-layer query-head count. Empty means every layer uses `numHeads`.
+    /// Laguna varies it by layer type (48 on full-attention, 72 on sliding).
+    public let headsPerLayer: [Int]
+    /// 1 = the layer uses a plain dense MLP instead of routed experts, of
+    /// width `denseMLPIntermediateSize`. Empty means every layer is sparse.
+    /// Laguna marks layer 0 dense (`mlp_only_layers: [0]`).
+    public let denseMLPLayerMask: [UInt8]
+    /// FFN width of the dense layers selected by `denseMLPLayerMask`. This is
+    /// the model's `intermediate_size`, which is distinct from the shared
+    /// expert width carried in `intermediateSize` (Laguna: 12288 vs 1024).
+    /// 0 when the model has no dense layers.
+    public let denseMLPIntermediateSize: Int
+    /// Partial rotary factor for full-attention layers when it differs from
+    /// `partialRotaryFactor` (which then covers sliding layers only).
+    /// `nil` means both layer types share `partialRotaryFactor`.
+    public let fullPartialRotaryFactor: Double?
+    /// YaRN scaling for full-attention layers. `nil` = plain RoPE.
+    public let fullRopeScaling: RopeScaling?
+    public let attentionGating: AttentionGating
+    /// Multiplier on the routed-expert contribution (Laguna: 2.5).
+    /// 1.0 is a no-op and matches Gemma.
+    public let routedScalingFactor: Double
+
     public init(
         hiddenSize: Int,
         intermediateSize: Int,
@@ -47,7 +112,14 @@ public struct ArchConfig: Sendable, Equatable {
         tieWordEmbeddings: Bool,
         attentionKEqV: Bool,
         fullAttentionLayerMask: [UInt8],
-        hiddenActivation: String
+        hiddenActivation: String,
+        headsPerLayer: [Int] = [],
+        denseMLPLayerMask: [UInt8] = [],
+        denseMLPIntermediateSize: Int = 0,
+        fullPartialRotaryFactor: Double? = nil,
+        fullRopeScaling: RopeScaling? = nil,
+        attentionGating: AttentionGating = .none,
+        routedScalingFactor: Double = 1.0
     ) {
         self.hiddenSize = hiddenSize
         self.intermediateSize = intermediateSize
@@ -70,6 +142,69 @@ public struct ArchConfig: Sendable, Equatable {
         self.attentionKEqV = attentionKEqV
         self.fullAttentionLayerMask = fullAttentionLayerMask
         self.hiddenActivation = hiddenActivation
+        self.headsPerLayer = headsPerLayer
+        self.denseMLPLayerMask = denseMLPLayerMask
+        self.denseMLPIntermediateSize = denseMLPIntermediateSize
+        self.fullPartialRotaryFactor = fullPartialRotaryFactor
+        self.fullRopeScaling = fullRopeScaling
+        self.attentionGating = attentionGating
+        self.routedScalingFactor = routedScalingFactor
+    }
+
+    // MARK: - Per-layer accessors
+    //
+    // Every caller should go through these rather than reading `numHeads` or
+    // `partialRotaryFactor` directly, so a model that varies them per layer
+    // behaves correctly without touching each call site again.
+
+    /// Query-head count for `layer`. Falls back to the uniform `numHeads`.
+    public func numHeads(atLayer layer: Int) -> Int {
+        guard layer >= 0, layer < headsPerLayer.count else { return numHeads }
+        return headsPerLayer[layer]
+    }
+
+    /// Largest query-head count across all layers. Scratch buffers that must
+    /// cover every layer size from one allocation should use this.
+    public var maxNumHeads: Int {
+        max(numHeads, headsPerLayer.max() ?? 0)
+    }
+
+    /// True when `layer` uses full attention rather than a sliding window.
+    public func isFullAttention(layer: Int) -> Bool {
+        guard layer >= 0, layer < fullAttentionLayerMask.count else { return false }
+        return fullAttentionLayerMask[layer] == 1
+    }
+
+    /// True when `layer` uses a dense MLP instead of routed experts.
+    public func isDenseMLP(layer: Int) -> Bool {
+        guard layer >= 0, layer < denseMLPLayerMask.count else { return false }
+        return denseMLPLayerMask[layer] == 1
+    }
+
+    /// Number of layers that actually carry routed experts. Expert streaming
+    /// and packing should size themselves from this, not `numLayers`.
+    public var numSparseLayers: Int {
+        guard !denseMLPLayerMask.isEmpty else { return numLayers }
+        return (0..<numLayers).reduce(0) { $0 + (isDenseMLP(layer: $1) ? 0 : 1) }
+    }
+
+    /// Partial rotary factor for `layer`, honouring a distinct full-attention
+    /// value when the model specifies one.
+    public func partialRotaryFactor(atLayer layer: Int) -> Double {
+        guard isFullAttention(layer: layer), let full = fullPartialRotaryFactor else {
+            return partialRotaryFactor
+        }
+        return full
+    }
+
+    /// RoPE base for `layer`.
+    public func ropeTheta(atLayer layer: Int) -> Double {
+        isFullAttention(layer: layer) ? fullRopeTheta : ropeTheta
+    }
+
+    /// YaRN scaling for `layer`, if the model scales that layer type.
+    public func ropeScaling(atLayer layer: Int) -> RopeScaling? {
+        isFullAttention(layer: layer) ? fullRopeScaling : nil
     }
 
     /// Canonical Gemma 4 26B-A4B baseline, checked against the installed
@@ -102,6 +237,69 @@ public struct ArchConfig: Sendable, Equatable {
     private static func gemma4LayerMask() -> [UInt8] {
         var mask = [UInt8](repeating: 0, count: 30)
         for i in stride(from: 5, to: 30, by: 6) { mask[i] = 1 }
+        return mask
+    }
+
+    /// poolside/Laguna-S-2.1, transcribed from its `config.json`.
+    ///
+    /// This is the generalization target: it exercises every field Gemma does
+    /// not — per-layer head counts, a dense layer 0, YaRN on full-attention
+    /// layers only, per-head attention gating, top-10 routing, and a routed
+    /// scaling factor. Not yet loadable; see the phase 0 work items.
+    ///
+    /// `intermediateSize` is the shared-expert width (1024); the dense layer-0
+    /// FFN width (12288) is carried in `denseMLPIntermediateSize`.
+    public static let lagunaS2_1 = ArchConfig(
+        hiddenSize: 3072,
+        intermediateSize: 1024,
+        moeIntermediateSize: 1024,
+        numHeads: 48,
+        numKVHeads: 8,
+        numFullKVHeads: 8,
+        headDim: 128,
+        fullHeadDim: 128,
+        vocabSize: 100352,
+        slidingWindow: 512,
+        finalLogitSoftcap: 0.0,
+        ropeTheta: 10_000.0,
+        fullRopeTheta: 500_000.0,
+        partialRotaryFactor: 1.0,
+        numLayers: 48,
+        numExperts: 256,
+        topKExperts: 10,
+        tieWordEmbeddings: false,
+        attentionKEqV: false,
+        fullAttentionLayerMask: Self.lagunaLayerMask(),
+        hiddenActivation: "silu",
+        headsPerLayer: Self.lagunaHeadsPerLayer(),
+        denseMLPLayerMask: Self.lagunaDenseMask(),
+        denseMLPIntermediateSize: 12288,
+        fullPartialRotaryFactor: 0.5,
+        fullRopeScaling: RopeScaling(factor: 128.0,
+                                     originalMaxPositionEmbeddings: 8192,
+                                     betaFast: 32.0,
+                                     betaSlow: 1.0,
+                                     attentionFactor: 1.4852030263919618),
+        attentionGating: .perHead,
+        routedScalingFactor: 2.5
+    )
+
+    /// Full attention every 4th layer starting at 0.
+    private static func lagunaLayerMask() -> [UInt8] {
+        var mask = [UInt8](repeating: 0, count: 48)
+        for i in stride(from: 0, to: 48, by: 4) { mask[i] = 1 }
+        return mask
+    }
+
+    /// 48 query heads on full-attention layers, 72 on sliding layers.
+    private static func lagunaHeadsPerLayer() -> [Int] {
+        lagunaLayerMask().map { $0 == 1 ? 48 : 72 }
+    }
+
+    /// Only layer 0 is dense (`mlp_only_layers: [0]`).
+    private static func lagunaDenseMask() -> [UInt8] {
+        var mask = [UInt8](repeating: 0, count: 48)
+        mask[0] = 1
         return mask
     }
 }
