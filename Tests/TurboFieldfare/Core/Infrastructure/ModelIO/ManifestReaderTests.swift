@@ -80,23 +80,35 @@ import Foundation
         return (dir, toy)
     }
 
+    /// - Parameter perLayerOverrides: slot name -> `[(layer, bits, groupSize)]`.
+    ///   Omitted entirely when empty, so the default output is byte-identical
+    ///   to what this helper produced before per-layer quant existed — which is
+    ///   what makes every other test in this file a backward-compat guard.
     static func quant(sharedExpertBits: Int = 4,
-                      routerBits: Int = 8) -> [String: Any] {
-        func slot(_ bits: Int) -> [String: Any] {
-            [
+                      routerBits: Int = 8,
+                      groupSizeOverrides: [String: Int] = [:],
+                      perLayerOverrides: [String: [(Int, Int, Int)]] = [:]) -> [String: Any] {
+        func slot(_ name: String, _ bits: Int) -> [String: Any] {
+            var s: [String: Any] = [
                 "weightBits": bits,
                 "scheme": "affine",
                 "scaleType": "bf16",
                 "biasType": "bf16",
-                "groupSize": Quantization.groupSize,
+                "groupSize": groupSizeOverrides[name] ?? Quantization.groupSize,
             ]
+            if let overrides = perLayerOverrides[name] {
+                s["perLayer"] = overrides.map { layer, b, g in
+                    ["layer": layer, "weightBits": b, "groupSize": g] as [String: Any]
+                }
+            }
+            return s
         }
         return [
-            "embedding": slot(4),
-            "attention": slot(4),
-            "router": slot(routerBits),
-            "sharedExpert": slot(sharedExpertBits),
-            "routedExpert": slot(4),
+            "embedding": slot("embedding", 4),
+            "attention": slot("attention", 4),
+            "router": slot("router", routerBits),
+            "sharedExpert": slot("sharedExpert", sharedExpertBits),
+            "routedExpert": slot("routedExpert", 4),
         ]
     }
 
@@ -223,6 +235,150 @@ import Foundation
         } throws: { error in
             guard case ModelError.indexCorrupt(let detail) = error else { return false }
             return detail.contains("unsupported quantization")
+        }
+    }
+
+    /// `routedExpert` joined this set once the generic MoE kernels
+    /// (`moe_phase1_gate_up_act_u16load_generic` and friends) learned group
+    /// 128 — it is Laguna's routed-expert layout, and the whole point of that
+    /// kernel work.
+    @Test func productionManifestAcceptsGroup128ForInt4GenericSlots() throws {
+        let (dir, config) = try Self.writeToyManifest(
+            ["quant": Self.quant(groupSizeOverrides: ["embedding": 128,
+                                                      "attention": 128,
+                                                      "routedExpert": 128])],
+            config: .gemma4_26B_A4B)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let manifest = try ManifestReader.load(directoryURL: dir, expecting: config)
+        #expect(manifest.quant?.embedding.groupSize == 128)
+        #expect(manifest.quant?.attention.groupSize == 128)
+        #expect(manifest.quant?.routedExpert.groupSize == 128)
+    }
+
+    /// `router` is 8-bit (`router_gemv_gemma4_r4`) and `sharedExpert` still
+    /// goes through the group-64 block-vectorized shared-MLP path. Accepting
+    /// 128 for either would load cleanly and then produce silently wrong
+    /// numbers, so the rejection is the feature. Relax a slot only in the same
+    /// change that teaches its kernel group 128.
+    @Test(arguments: ["sharedExpert", "router"])
+    func productionManifestRejectsGroup128ForSlotsWhoseKernelIsGroup64(
+        _ slotName: String
+    ) throws {
+        let (dir, config) = try Self.writeToyManifest(
+            ["quant": Self.quant(groupSizeOverrides: [slotName: 128])],
+            config: .gemma4_26B_A4B)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        #expect {
+            _ = try ManifestReader.load(directoryURL: dir, expecting: config)
+        } throws: { error in
+            guard case ModelError.indexCorrupt(let detail) = error else { return false }
+            return detail.contains(slotName)
+        }
+    }
+
+    // MARK: - Per-layer quantization
+
+    /// A manifest written before per-layer quant existed has no `perLayer` key
+    /// at all. It must still decode, with the slot reporting its scalar width
+    /// at every layer — otherwise this format change bricks installed models.
+    @Test func manifestWithoutPerLayerKeyDecodesAsUniform() throws {
+        let (dir, config) = try Self.writeToyManifest(["quant": Self.quant()],
+                                                      config: .gemma4_26B_A4B)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let manifest = try ManifestReader.load(directoryURL: dir, expecting: config)
+        let attention = try #require(manifest.quant?.attention)
+        #expect(attention.perLayer == nil)
+        for layer in [0, 7, 29] {
+            #expect(attention.resolved(atLayer: layer).weightBits == 4)
+            #expect(attention.resolved(atLayer: layer).groupSize == Quantization.groupSize)
+        }
+        #expect(attention.distinctConfigurations.count == 1)
+    }
+
+    /// The shape Laguna needs: one slot, two widths, selected by layer. Uses
+    /// group 128 on the overridden layers so the values stay inside what the
+    /// int4-generic kernels actually decode — the point is the *mechanism*,
+    /// and a guard-clearing fixture keeps this test about that.
+    @Test func perLayerOverrideSelectsWidthByLayer() throws {
+        let (dir, config) = try Self.writeToyManifest(
+            ["quant": Self.quant(perLayerOverrides: ["attention": [(3, 4, 128), (5, 4, 128)]])],
+            config: .gemma4_26B_A4B)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let manifest = try ManifestReader.load(directoryURL: dir, expecting: config)
+        let attention = try #require(manifest.quant?.attention)
+        #expect(attention.resolved(atLayer: 3).groupSize == 128)
+        #expect(attention.resolved(atLayer: 5).groupSize == 128)
+        // Unlisted layers fall back to the slot default, not to the override.
+        #expect(attention.resolved(atLayer: 4).groupSize == Quantization.groupSize)
+        #expect(attention.resolved(atLayer: 0).groupSize == Quantization.groupSize)
+        #expect(attention.distinctConfigurations.count == 2)
+    }
+
+    /// Validation has to clear every configuration a slot can present, not the
+    /// scalar default alone. A slot whose default is fine but whose override
+    /// names an unsupported width would otherwise load cleanly and then hand
+    /// the kernels bits they cannot decode.
+    @Test func perLayerOverrideWithUnsupportedWidthIsRejected() throws {
+        let (dir, config) = try Self.writeToyManifest(
+            ["quant": Self.quant(perLayerOverrides: ["attention": [(3, 5, 64)]])],
+            config: .gemma4_26B_A4B)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        #expect {
+            _ = try ManifestReader.load(directoryURL: dir, expecting: config)
+        } throws: { error in
+            guard case ModelError.indexCorrupt(let detail) = error else { return false }
+            return detail.contains("attention") && detail.contains("5-bit")
+        }
+    }
+
+    /// Same rule for group size: `sharedExpert` is group-64-only, and an
+    /// override must not be a side door around the slot-level gate.
+    @Test func perLayerOverrideCannotBypassAGroupSizeGate() throws {
+        let (dir, config) = try Self.writeToyManifest(
+            ["quant": Self.quant(perLayerOverrides: ["sharedExpert": [(1, 4, 128)]])],
+            config: .gemma4_26B_A4B)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        #expect {
+            _ = try ManifestReader.load(directoryURL: dir, expecting: config)
+        } throws: { error in
+            guard case ModelError.indexCorrupt(let detail) = error else { return false }
+            return detail.contains("sharedExpert")
+        }
+    }
+
+    /// Two entries for the same layer are two different answers to "what is the
+    /// width here". `resolved(atLayer:)` would quietly take the first; rejecting
+    /// is the honest response.
+    @Test func duplicatePerLayerOverrideIsRejected() throws {
+        let (dir, config) = try Self.writeToyManifest(
+            ["quant": Self.quant(perLayerOverrides: ["attention": [(3, 4, 128), (3, 4, 64)]])],
+            config: .gemma4_26B_A4B)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        #expect {
+            _ = try ManifestReader.load(directoryURL: dir, expecting: config)
+        } throws: { error in
+            guard case ModelError.indexCorrupt(let detail) = error else { return false }
+            return detail.contains("duplicate per-layer quant override")
+        }
+    }
+
+    /// Laguna's actual attention slot, as a whole: 5-bit on 20 layers, 8-bit on
+    /// 28. The format can now *express* it; the kernels still cannot decode
+    /// 5-bit attention, so loading must still fail — and fail naming the width,
+    /// not with the old "cannot be represented" silence.
+    @Test func lagunaMixedAttentionIsExpressibleButStillRejectedByTheKernelGate() throws {
+        let fiveBitLayers = [0, 1, 3, 4, 5, 6, 7, 9, 10, 11, 13, 14, 15]
+        let (dir, config) = try Self.writeToyManifest(
+            ["quant": Self.quant(
+                groupSizeOverrides: ["attention": 64],
+                perLayerOverrides: ["attention": fiveBitLayers.map { ($0, 5, 64) }])],
+            config: .gemma4_26B_A4B)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        #expect {
+            _ = try ManifestReader.load(directoryURL: dir, expecting: config)
+        } throws: { error in
+            guard case ModelError.indexCorrupt(let detail) = error else { return false }
+            return detail.contains("attention") && detail.contains("5-bit")
         }
     }
 

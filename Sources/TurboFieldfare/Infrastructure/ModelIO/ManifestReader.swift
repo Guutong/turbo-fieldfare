@@ -55,12 +55,57 @@ public struct ManifestRopeScaling: Decodable, Equatable, Sendable {
     }
 }
 
+/// One layer's exception to a slot's `weightBits`/`groupSize`.
+///
+/// Only the two fields that vary are overridable. `scheme`/`scaleType`/
+/// `biasType` stay on the slot because no known checkpoint varies them per
+/// layer, and a field that can differ is a field every reader has to check.
+public struct ManifestQuantLayerOverride: Decodable, Equatable, Sendable {
+    public let layer: Int
+    public let weightBits: Int
+    public let groupSize: Int
+}
+
 public struct ManifestQuantSlot: Decodable, Equatable, Sendable {
     public let weightBits: Int
     public let scheme: String
     public let scaleType: String
     public let biasType: String
     public let groupSize: Int
+    /// Sparse per-layer exceptions, or nil when the slot is uniform.
+    ///
+    /// Some checkpoints quantize per *layer*, not per role. Laguna-S-2.1
+    /// quantizes attention at 5 bits on 20 layers and 8 bits on the other 28,
+    /// which a single `weightBits` cannot describe at all. The shape here
+    /// mirrors the upstream `config.json`: scalar defaults plus a sparse
+    /// override table, so the common uniform case costs nothing.
+    ///
+    /// Optional on purpose — existing manifests have no such key and decode
+    /// with this nil, which is what keeps already-installed `.gturbo` files
+    /// readable byte-for-byte.
+    public let perLayer: [ManifestQuantLayerOverride]?
+
+    /// The `(weightBits, groupSize)` in effect at `layer`, which is the slot's
+    /// own values unless an override names that layer.
+    public func resolved(atLayer layer: Int) -> (weightBits: Int, groupSize: Int) {
+        if let o = perLayer?.first(where: { $0.layer == layer }) {
+            return (o.weightBits, o.groupSize)
+        }
+        return (weightBits, groupSize)
+    }
+
+    /// Every distinct `(weightBits, groupSize)` this slot can present, which is
+    /// what validation has to clear — checking only the scalar would admit a
+    /// manifest whose overrides name a width no kernel implements.
+    public var distinctConfigurations: [(weightBits: Int, groupSize: Int)] {
+        var seen: [(weightBits: Int, groupSize: Int)] = [(weightBits, groupSize)]
+        for o in perLayer ?? [] where !seen.contains(where: {
+            $0.weightBits == o.weightBits && $0.groupSize == o.groupSize
+        }) {
+            seen.append((o.weightBits, o.groupSize))
+        }
+        return seen
+    }
 }
 
 public struct ManifestQuant: Decodable, Equatable, Sendable {
@@ -179,20 +224,56 @@ public enum ManifestReader {
     }
 
     private static func validateQuant(_ quant: ManifestQuant) throws {
-        let slots: [(String, ManifestQuantSlot, Set<Int>)] = [
-            ("embedding", quant.embedding, [4]),
-            ("attention", quant.attention, [4]),
-            ("router", quant.router, [8]),
-            ("sharedExpert", quant.sharedExpert, [4, 8]),
-            ("routedExpert", quant.routedExpert, [4]),
+        // Group sizes are allowed per slot, not globally, because each slot is
+        // read by a different kernel and they do not all handle 128 yet.
+        // `dequant_int4_gemv_generic` strides by lane and so takes any
+        // multiple of 32; `routedExpert` is decoded by the group-size-generic
+        // MoE kernels (`moe_phase1_gate_up_act_u16load_generic` /
+        // `moe_phase1_gate_up_act_subset_u16load_generic` /
+        // `moe_phase2_down_reduce_generic` in Metal/MoE/moe.metal), which now
+        // handle 128 the same way. `router` and `sharedExpert` still feed the
+        // group-64-only kernels (`router_gemv_gemma4_r4`,
+        // `moe_int4_gemv_row_simd_dev_vec` for the shared MLP path) — widen
+        // those together with their kernels, not before. Admitting 128 for a
+        // slot its kernel cannot decode would turn a clean load-time rejection
+        // into silently wrong numbers at inference.
+        let defaultGroup: Set<Int> = [Quantization.groupSize]
+        let int4GenericGroups: Set<Int> = [Quantization.groupSize, 128]
+        let slots: [(String, ManifestQuantSlot, Set<Int>, Set<Int>)] = [
+            ("embedding", quant.embedding, [4], int4GenericGroups),
+            ("attention", quant.attention, [4], int4GenericGroups),
+            ("router", quant.router, [8], defaultGroup),
+            // sharedExpert still feeds the group-64-only shared-MLP kernel.
+            ("sharedExpert", quant.sharedExpert, [4, 8], defaultGroup),
+            ("routedExpert", quant.routedExpert, [4], int4GenericGroups),
         ]
-        for (name, slot, allowedBits) in slots {
-            guard allowedBits.contains(slot.weightBits),
-                  slot.scheme.lowercased() == "affine",
+        for (name, slot, allowedBits, allowedGroupSizes) in slots {
+            guard slot.scheme.lowercased() == "affine",
                   slot.scaleType.lowercased() == "bf16",
-                  slot.biasType.lowercased() == "bf16",
-                  slot.groupSize == Quantization.groupSize else {
+                  slot.biasType.lowercased() == "bf16" else {
                 throw ModelError.indexCorrupt(detail: "unsupported quantization for \(name)")
+            }
+            // Every configuration the slot can present has to clear the gate,
+            // not just the scalar default. A per-layer override is a value the
+            // kernels will actually be handed, so admitting the slot on its
+            // default alone would let an override smuggle in a bit width or
+            // group size nothing can decode — exactly the silent-wrong-numbers
+            // trade this guard exists to prevent.
+            for config in slot.distinctConfigurations {
+                guard allowedBits.contains(config.weightBits),
+                      allowedGroupSizes.contains(config.groupSize) else {
+                    throw ModelError.indexCorrupt(
+                        detail: "unsupported quantization for \(name): "
+                            + "\(config.weightBits)-bit group \(config.groupSize)")
+                }
+            }
+            // A duplicate layer entry means two different answers to "what is
+            // the width at layer N", and `resolved(atLayer:)` would silently
+            // take the first. Reject rather than pick.
+            let layers = (slot.perLayer ?? []).map(\.layer)
+            guard Set(layers).count == layers.count else {
+                throw ModelError.indexCorrupt(
+                    detail: "duplicate per-layer quant override for \(name)")
             }
         }
     }
