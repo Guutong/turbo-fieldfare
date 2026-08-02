@@ -3,19 +3,22 @@ import TurboFieldfareRepackCore
 
 private let usage = """
 Usage:
-  TurboFieldfareRepack --output <model.gturbo> [--overwrite] [--resume]
+  TurboFieldfareRepack --output <model.gturbo> [--model <id>] [--overwrite] [--resume]
   TurboFieldfareRepack --discard-partial --output <model.gturbo>
   TurboFieldfareRepack --verify-install --input-gturbo <model.gturbo>
   TurboFieldfareRepack --help
 
-The installer streams the supported Gemma 4 checkpoint from Hugging Face and
-repackages it without materializing the source checkpoint on disk. Set HF_TOKEN
-only if Hugging Face requests authentication. A cancelled or interrupted
-download can be continued with --resume or removed with --discard-partial.
+The installer streams a supported checkpoint from Hugging Face and repackages
+it without materializing the source checkpoint on disk. --model selects which
+catalog entry to install (default: \(SupportedModelSource.default.id)); valid ids:
+\(SupportedModelSource.all.map(\.id).joined(separator: ", ")). Set HF_TOKEN only
+if Hugging Face requests authentication. A cancelled or interrupted download
+can be continued with --resume or removed with --discard-partial.
 """
 
 private struct Arguments {
     var output: String?
+    var model: String?
     var overwrite = false
     var resume = false
     var discardPartial = false
@@ -42,14 +45,14 @@ private struct Arguments {
             case "--verify-install":
                 parsed.verifyInstall = true
                 index += 1
-            case "--output", "--input-gturbo":
+            case "--output", "--input-gturbo", "--model":
                 guard index + 1 < values.count else {
                     throw ParseError.missingValue(flag)
                 }
-                if flag == "--output" {
-                    parsed.output = values[index + 1]
-                } else {
-                    parsed.inputGTurbo = values[index + 1]
+                switch flag {
+                case "--output":       parsed.output = values[index + 1]
+                case "--input-gturbo": parsed.inputGTurbo = values[index + 1]
+                default:                parsed.model = values[index + 1]
                 }
                 index += 2
             default:
@@ -64,7 +67,8 @@ private struct Arguments {
             guard parsed.output != nil else {
                 throw ParseError.missingRequired("--output")
             }
-            guard parsed.inputGTurbo == nil, !parsed.overwrite, !parsed.verifyInstall else {
+            guard parsed.inputGTurbo == nil, !parsed.overwrite, !parsed.verifyInstall,
+                  parsed.model == nil else {
                 throw ParseError.invalidMode("--discard-partial only accepts --output")
             }
             return parsed
@@ -73,7 +77,8 @@ private struct Arguments {
             guard parsed.inputGTurbo != nil else {
                 throw ParseError.missingRequired("--input-gturbo")
             }
-            guard parsed.output == nil, !parsed.overwrite, !parsed.resume else {
+            guard parsed.output == nil, !parsed.overwrite, !parsed.resume,
+                  parsed.model == nil else {
                 throw ParseError.invalidMode("verification accepts only --input-gturbo")
             }
         } else {
@@ -147,14 +152,29 @@ private func run(_ values: [String]) async -> Int32 {
     }
 
     guard let output = arguments.output else { return 2 }
-    let options = SupportedModelSource.installOptions(
+    let source: ModelSource
+    do {
+        source = try SupportedModelSource.resolve(modelID: arguments.model)
+    } catch ModelSelectionError.unknownID(let id, let validIDs) {
+        // An unrecognized id is a bad argument, same class as an unknown flag.
+        printError("error: unknown model id \"\(id)\"; valid ids: "
+            + "\(validIDs.joined(separator: ", "))\n\n\(usage)")
+        return 2
+    } catch {
+        // A cataloged-but-blocked id (e.g. Laguna) is a runtime rejection,
+        // not a malformed invocation, so it takes the same exit path as
+        // "install failed" rather than the argument-parsing one.
+        printError("install failed: \(error)")
+        return 1
+    }
+    let options = source.installOptions(
         outputDirectory: URL(fileURLWithPath: output),
         overwrite: arguments.overwrite,
         token: ProcessInfo.processInfo.environment["HF_TOKEN"],
         resume: arguments.resume)
     do {
         let result = try await RemoteStreamingRepacker(options: options).run()
-        print("Installed \(SupportedModelSource.displayName)")
+        print("Installed \(source.displayName)")
         print("Source revision: \(result.resolvedCommit)")
         print("Model: \(result.outputDir)")
         return 0

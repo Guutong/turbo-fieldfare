@@ -10,7 +10,8 @@ public enum AppModelInstallationStatus: Equatable, Sendable {
 public enum AppModelInstallationProbe {
     public static func status(
         at directory: URL,
-        descriptor: AppModelInstallDescriptor = .default
+        descriptor: AppModelInstallDescriptor = .default,
+        architecture: ArchConfig = .gemma4_26B_A4B
     ) -> AppModelInstallationStatus {
         let directory = directory.standardizedFileURL
         let manifestURL = directory.appendingPathComponent("manifest.json")
@@ -19,7 +20,8 @@ public enum AppModelInstallationProbe {
         }
 
         do {
-            let manifest = try ManifestReader.load(directoryURL: directory, expecting: .gemma4_26B_A4B)
+            let manifest = try ManifestReader.load(directoryURL: directory,
+                                                   expecting: architecture)
             let expectedSource = "sha256:" + descriptor.sourceIndexSHA256
             guard manifest.sourceSnapshotHash == expectedSource else {
                 return .partial("installed checkpoint does not match \(descriptor.displayName)")

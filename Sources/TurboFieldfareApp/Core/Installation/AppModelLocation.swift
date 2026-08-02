@@ -1,7 +1,19 @@
 import Foundation
+import TurboFieldfareRepackCore
 
 enum AppModelLocation {
-    static func defaultURL() -> URL {
+    /// Install directory name for a model.
+    ///
+    /// Gemma keeps `gemma4.gturbo` because installs predate the catalog and
+    /// renaming would orphan a ~14 GB directory on every existing machine.
+    /// Everything else is named from its catalog id.
+    static func directoryName(for source: ModelSource) -> String {
+        source.id == SupportedModelSource.gemma4_26B_A4B.id
+            ? "gemma4.gturbo"
+            : "\(source.id).gturbo"
+    }
+
+    static func defaultURL(for source: ModelSource = SupportedModelSource.default) -> URL {
         let fileManager = FileManager.default
         let applicationSupport = (try? fileManager.url(
             for: .applicationSupportDirectory,
@@ -14,30 +26,33 @@ enum AppModelLocation {
             currentDirectoryURL: URL(fileURLWithPath: fileManager.currentDirectoryPath,
                                      isDirectory: true),
             applicationSupportURL: applicationSupport,
-            fileExists: fileManager.fileExists(atPath:))
+            fileExists: fileManager.fileExists(atPath:),
+            directoryName: directoryName(for: source))
     }
 
     static func resolve(explicitURL: URL?,
                         executableURL: URL?,
                         currentDirectoryURL: URL,
                         applicationSupportURL: URL,
-                        fileExists: (String) -> Bool) -> URL {
+                        fileExists: (String) -> Bool,
+                        directoryName: String =
+                            directoryName(for: SupportedModelSource.default)) -> URL {
         if let explicitURL {
             return absoluteURL(explicitURL, relativeTo: currentDirectoryURL)
         }
         if let executableURL,
            let root = packageRoot(startingAt: executableURL.deletingLastPathComponent(),
                                   fileExists: fileExists) {
-            return root.appendingPathComponent("scratch/gemma4.gturbo", isDirectory: true)
+            return root.appendingPathComponent("scratch/\(directoryName)", isDirectory: true)
                 .standardizedFileURL
         }
         if let root = packageRoot(startingAt: currentDirectoryURL, fileExists: fileExists) {
-            return root.appendingPathComponent("scratch/gemma4.gturbo", isDirectory: true)
+            return root.appendingPathComponent("scratch/\(directoryName)", isDirectory: true)
                 .standardizedFileURL
         }
         return applicationSupportURL
             .appendingPathComponent("TurboFieldfare", isDirectory: true)
-            .appendingPathComponent("gemma4.gturbo", isDirectory: true)
+            .appendingPathComponent(directoryName, isDirectory: true)
             .standardizedFileURL
     }
 

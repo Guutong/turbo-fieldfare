@@ -15,7 +15,13 @@ public enum AppContextLengthOption: Int, CaseIterable, Identifiable, Sendable {
     }
 
     public var fp16KVBytes: UInt64 {
-        let architecture = ArchConfig.gemma4_26B_A4B
+        fp16KVBytes(for: .gemma4_26B_A4B)
+    }
+
+    /// KV-cache footprint at this context length for a given architecture.
+    /// Sliding layers only ever hold `slidingWindow` rows plus one prefill
+    /// chunk; full-attention layers hold the whole context.
+    public func fp16KVBytes(for architecture: ArchConfig) -> UInt64 {
         let fullLayers = architecture.fullAttentionLayerMask.reduce(0) {
             $0 + ($1 == 0 ? 0 : 1)
         }

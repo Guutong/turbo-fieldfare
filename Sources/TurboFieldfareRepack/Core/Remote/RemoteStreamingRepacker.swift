@@ -570,23 +570,65 @@ public final class RemoteStreamingRepacker {
             router: 8,
             sharedExpert: 8,
             routedExpert: 4)
-        for e in plan.resident.entries {
-            if e.name == "language_model.model.embed_tokens.weight", let s = e.quantSpec {
-                bits.embedding = s.bits
-            }
-            if e.name.hasSuffix(".self_attn.q_proj.weight"), let s = e.quantSpec {
-                bits.attention = s.bits
-            }
-            if e.name.hasSuffix(".router.proj.weight"), let s = e.quantSpec {
-                bits.router = s.bits
-            }
-            if e.name.hasSuffix(".mlp.gate_proj.weight"), let s = e.quantSpec {
-                bits.sharedExpert = s.bits
+        // Each slot resolves across *all* matching entries rather than by
+        // last-write-wins, so a checkpoint that quantizes one slot at several
+        // bit widths is refused instead of silently recorded as whichever
+        // tensor came last. See `RepackPlanner.uniformBits`.
+        func observations(where matches: (String) -> Bool) -> [(name: String, bits: Int)] {
+            plan.resident.entries.compactMap { e in
+                guard matches(e.name), let s = e.quantSpec else { return nil }
+                return (e.name, s.bits)
             }
         }
-        if let layer = plan.layers.first(where: { !$0.subTensors.isEmpty }),
-           let routedBits = layer.subTensors.first?.bitsForWeights {
-            bits.routedExpert = routedBits
+        // Both known families spell the embedding tensor identically;
+        // RepackPlanner owns that name so it isn't duplicated here.
+        if let b = try RepackPlanner.uniformBits(
+            slot: "embedding",
+            observations: observations { $0 == RepackPlanner.embedTokensWeightName }) {
+            bits.embedding = b
+        }
+        if let b = try RepackPlanner.uniformBits(
+            slot: "attention",
+            observations: observations { $0.hasSuffix(".self_attn.q_proj.weight") }) {
+            bits.attention = b
+        }
+        if let b = try RepackPlanner.uniformBits(
+            slot: "router",
+            observations: observations {
+                RepackPlanner.routerProbeSuffixes.contains(where: $0.hasSuffix)
+            }) {
+            bits.router = b
+        }
+        // The shared-expert probe additionally has to pick *which* suffix
+        // identifies the slot, because the table's entries overlap: Laguna's
+        // dense layer-0 `.mlp.gate_proj.weight` matches the generic probe
+        // while its real shared expert matches the qualified
+        // `.mlp.shared_expert.gate_proj.weight`. Scanning the table in order
+        // and stopping at the first suffix any entry matches keeps the dense
+        // layer from standing in for the shared expert; uniformity is then
+        // checked across every entry matching that chosen suffix.
+        for probe in RepackPlanner.sharedExpertProbeSuffixes {
+            let matching = observations { $0.hasSuffix(probe) }
+            guard !matching.isEmpty else { continue }
+            if let b = try RepackPlanner.uniformBits(slot: "sharedExpert",
+                                                     observations: matching) {
+                bits.sharedExpert = b
+            }
+            break
+        }
+        // Same uniformity rule for the routed path, across every layer and
+        // role rather than the first slice of the first layer. Both known
+        // families are uniformly 4-bit here, so this is a guard against a
+        // future checkpoint rather than a fix for a present one.
+        let routedObservations: [(name: String, bits: Int)] = plan.layers.flatMap { layer in
+            layer.subTensors.compactMap { slice in
+                guard let b = slice.bitsForWeights else { return nil }
+                return ("layer \(layer.layerIndex) \(slice.role)", b)
+            }
+        }
+        if let b = try RepackPlanner.uniformBits(slot: "routedExpert",
+                                                 observations: routedObservations) {
+            bits.routedExpert = b
         }
         let files = audit.outputFiles.map {
             ($0.relativePath, GTurboJSON.FileEntry(size: $0.size, sha256: $0.sha256))

@@ -28,6 +28,47 @@ struct RepackCLITests {
         #expect(result.stderr.contains("no resumable install state exists"))
     }
 
+    @Test func unknownModelIDIsRejectedBeforeAnyNetworkWork() throws {
+        let output = temporaryOutput("unknown-model")
+        defer { clean(output) }
+        let result = try run([
+            "--output", output,
+            "--model", "not-a-real-model",
+        ])
+
+        #expect(result.status == 2)
+        #expect(result.stderr.contains("unknown model id"))
+        #expect(result.stderr.contains("not-a-real-model"))
+        // The valid-id list must be in the message so the user can self-correct.
+        #expect(result.stderr.contains("gemma4-26b-a4b"))
+    }
+
+    @Test func notYetInstallableModelIDIsRejectedWithItsBlockedReason() throws {
+        let output = temporaryOutput("blocked-model")
+        defer { clean(output) }
+        let result = try run([
+            "--output", output,
+            "--model", "laguna-s-2-1",
+        ])
+
+        #expect(result.status == 1)
+        #expect(result.stderr.contains("laguna-s-2-1"))
+        #expect(result.stderr.contains("not installable"))
+    }
+
+    @Test func modelFlagIsRejectedOutsideInstallMode() throws {
+        let output = temporaryOutput("model-with-discard")
+        defer { clean(output) }
+        let result = try run([
+            "--discard-partial",
+            "--output", output,
+            "--model", "gemma4-26b-a4b",
+        ])
+
+        #expect(result.status == 2)
+        #expect(result.stderr.contains("--discard-partial only accepts --output"))
+    }
+
     @Test func discardWithoutStateReportsAnError() throws {
         let output = temporaryOutput("missing-discard")
         defer { clean(output) }

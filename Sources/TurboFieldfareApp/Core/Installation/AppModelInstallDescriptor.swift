@@ -3,6 +3,8 @@ import TurboFieldfareRepackCore
 
 public struct AppModelInstallDescriptor: Equatable, Sendable {
     public let displayName: String
+    /// Compact label for space-constrained UI. Defaults to `displayName`.
+    public var shortDisplayName: String
     public let repoID: String
     public let revision: String
     public let sourceIndexSHA256: String
@@ -12,6 +14,7 @@ public struct AppModelInstallDescriptor: Equatable, Sendable {
     public let reserveBytes: UInt64
 
     public init(displayName: String,
+                shortDisplayName: String? = nil,
                 repoID: String,
                 revision: String,
                 sourceIndexSHA256: String,
@@ -20,6 +23,7 @@ public struct AppModelInstallDescriptor: Equatable, Sendable {
                 rangeStagingBytes: UInt64,
                 reserveBytes: UInt64) {
         self.displayName = displayName
+        self.shortDisplayName = shortDisplayName ?? displayName
         self.repoID = repoID
         self.revision = revision
         self.sourceIndexSHA256 = sourceIndexSHA256
@@ -33,15 +37,47 @@ public struct AppModelInstallDescriptor: Equatable, Sendable {
         installedBytes + rangeStagingBytes + reserveBytes
     }
 
+    /// Derived from the catalog rather than restated. These literals used to
+    /// be duplicated here, so a revision bump in `SupportedModelSource` left
+    /// the app pinning the previous one.
+    public init(source: ModelSource,
+                rangeStagingBytes: UInt64 = UInt64(RemoteChunkPolicy.defaultBytes)) {
+        self.init(displayName: source.displayName,
+                  shortDisplayName: source.shortDisplayName,
+                  repoID: source.repoID,
+                  revision: source.revision,
+                  sourceIndexSHA256: source.sourceIndexSHA256,
+                  approximateDownloadBytes: source.approximateDownloadBytes,
+                  installedBytes: source.installedBytes,
+                  rangeStagingBytes: rangeStagingBytes,
+                  reserveBytes: source.reserveBytes)
+    }
+
     public static let `default` = AppModelInstallDescriptor(
-        displayName: "Gemma 4 26B-A4B IT 4-bit",
-        repoID: "mlx-community/gemma-4-26b-a4b-it-4bit",
-        revision: "0d77464eeb233a2da68ebf9d7dc4edaac7db956d",
-        sourceIndexSHA256: "bf198c9f5ea6462addca1966e5dd669c407537a876e82cf06db9084c5c850b13",
-        approximateDownloadBytes: 14_620_479_420,
-        installedBytes: 14_291_921_884,
-        rangeStagingBytes: UInt64(RemoteChunkPolicy.defaultBytes),
-        reserveBytes: 1_073_741_824)
+        source: SupportedModelSource.default)
+}
+
+/// A catalog entry the runtime can't install yet, plus why. Exposed so UI
+/// can make the gap legible without depending on `TurboFieldfareRepackCore`
+/// types directly — the Mac target only links `TurboFieldfareAppCore`.
+public struct AppUnavailableModelInfo: Equatable, Sendable, Identifiable {
+    public let id: String
+    public let displayName: String
+    public let reason: String?
+}
+
+extension AppModelInstallDescriptor {
+    /// Catalog entries with `isInstallable == false`, for surfacing what's
+    /// coming without offering it for install.
+    public static var unavailableCatalogEntries: [AppUnavailableModelInfo] {
+        SupportedModelSource.all
+            .filter { !$0.isInstallable }
+            .map {
+                AppUnavailableModelInfo(id: $0.id,
+                                        displayName: $0.displayName,
+                                        reason: $0.installBlockedReason)
+            }
+    }
 }
 
 public struct AppModelInstallRequirement: Equatable, Sendable {

@@ -25,6 +25,11 @@ public enum RepackError: Error, CustomStringConvertible {
     case indexJsonInvalid(path: String, detail: String)
     case configJsonInvalid(path: String, detail: String)
     case quantOverrideCountMismatch(expected: Int, actual: Int, sample: [String])
+    /// A manifest quant slot holds exactly one bit width, so a checkpoint that
+    /// quantizes that slot's tensors at more than one width cannot be
+    /// described by it. Refusing is the point: the alternative is a manifest
+    /// that loads cleanly and misdescribes every tensor but the one probed.
+    case quantSlotNotUniform(slot: String, bits: [Int], sample: [String])
 
     case missingTensor(name: String)
     case unknownTensorPrefix(name: String)
@@ -86,6 +91,9 @@ public enum RepackError: Error, CustomStringConvertible {
         case .configJsonInvalid(let p, let d): return "config.json \(p) invalid: \(d)"
         case .quantOverrideCountMismatch(let exp, let got, let sample):
             return "config.json quantization overrides: expected \(exp), got \(got); sample=\(sample.prefix(5))"
+        case .quantSlotNotUniform(let slot, let bits, let sample):
+            return "quant slot \"\(slot)\" mixes bit widths \(bits.sorted()) across tensors, "
+                + "but the manifest records one bit width per slot; sample=\(sample.prefix(4))"
         case .missingTensor(let n): return "expected tensor missing: \(n)"
         case .unknownTensorPrefix(let n): return "unknown tensor prefix: \(n)"
         case .missingScalesCompanion(let n): return "quantized tensor \(n) missing .scales companion"
