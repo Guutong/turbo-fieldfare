@@ -139,13 +139,28 @@ public struct Model {
     /// Writer emits the shared-expert FFN as `.mlp.{gate,up,down}_proj.weight`
     /// without a `.shared_expert.` segment.
     public func sharedExpertGate(layer L: Int) throws -> TensorView {
-        try resident(name: "language_model.model.layers.\(L).mlp.gate_proj.weight")
+        let name = "language_model.model.layers.\(L).mlp.shared_expert.gate_proj.weight"
+        if residentIndex.entries[name] != nil {
+            return try resident(name: name)
+        }
+        return try resident(name: "language_model.model.layers.\(L).mlp.gate_proj.weight")
     }
     public func sharedExpertUp(layer L: Int) throws -> TensorView {
-        try resident(name: "language_model.model.layers.\(L).mlp.up_proj.weight")
+        let name = "language_model.model.layers.\(L).mlp.shared_expert.up_proj.weight"
+        if residentIndex.entries[name] != nil {
+            return try resident(name: name)
+        }
+        return try resident(name: "language_model.model.layers.\(L).mlp.up_proj.weight")
     }
     public func sharedExpertDown(layer L: Int) throws -> TensorView {
-        try resident(name: "language_model.model.layers.\(L).mlp.down_proj.weight")
+        let name = "language_model.model.layers.\(L).mlp.shared_expert.down_proj.weight"
+        if residentIndex.entries[name] != nil {
+            return try resident(name: name)
+        }
+        return try resident(name: "language_model.model.layers.\(L).mlp.down_proj.weight")
+    }
+    public func gProj(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).self_attn.g_proj.weight")
     }
     public func inputNorm(layer L: Int) throws -> TensorView {
         try resident(name: "language_model.model.layers.\(L).input_layernorm.weight")

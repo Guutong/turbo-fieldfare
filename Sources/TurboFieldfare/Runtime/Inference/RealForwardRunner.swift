@@ -170,6 +170,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     private let prefillEmbed: PrefillEmbedLookupInt4
     private let prefillRMS: PrefillRMSNorm
     private let prefillQMM: PrefillInt4QMM
+    private let dequantInt5: DequantInt5GEMV
+    private let dequantInt8: DequantInt8GEMV
     private let prefillMPPAffineInt4: MPPPrefillInt4QMM?
     private let prefillQKVEpilogue: PrefillQKVEpilogue
     private let prefillAttention: PrefillAttention
@@ -291,6 +293,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         self.prefillEmbed = try PrefillEmbedLookupInt4(context: context)
         self.prefillRMS = try PrefillRMSNorm(context: context)
         self.prefillQMM = try PrefillInt4QMM(context: context)
+        self.dequantInt5 = try DequantInt5GEMV(context: context)
+        self.dequantInt8 = try DequantInt8GEMV(context: context)
         self.prefillMPPAffineInt4 = MPPPrefillInt4QMM(context: context)
         self.prefillQKVEpilogue = try PrefillQKVEpilogue(context: context)
         self.prefillAttention = try PrefillAttention(context: context)
@@ -307,7 +311,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
 
         let device = context.device
         let D = cfg.hiddenSize
-        let F = cfg.intermediateSize
+        let F = max(cfg.intermediateSize, cfg.denseMLPIntermediateSize)
         let maxQ = cfg.numHeads * max(cfg.headDim, cfg.fullHeadDim)
 
         func buf(_ count: Int, _ stride: Int = MemoryLayout<Float16>.size) throws -> MTLBuffer {
@@ -658,66 +662,122 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         let t = tokens.count
         let emb = model.embedding
 
-        func encodeInt4Projection(commandBuffer: MTLCommandBuffer,
-                                  family: PrefillProjectionFamily,
-                                  weights: TensorView,
-                                  x: MTLBuffer,
-                                  y: MTLBuffer,
-                                  rows: Int,
-                                  columns: Int,
-                                  tokenCount: Int,
-                                  xStrideElements: Int,
-                                  yStrideElements: Int) {
-            if tokenCount >= 32,
-               family == .q || family == .kv || family == .o,
-               let candidate = prefillMPPAffineInt4 {
-                let path = candidate.encode(
-                    commandBuffer: commandBuffer,
-                    weights: weights.buffer,
-                    weightsOffset: Int(weights.offset),
-                    scales: weights.buffer,
-                    scalesOffset: Int(weights.scaleOffset),
-                    biases: weights.buffer,
-                    biasesOffset: Int(weights.biasOffset),
-                    x: x,
-                    y: y,
-                    m: tokenCount,
-                    n: rows,
-                    k: columns)
-                if path == .affineThreadgroupF16 {
+        func encodeAttentionProjection(commandBuffer: MTLCommandBuffer,
+                                       family: PrefillProjectionFamily,
+                                       layer: Int,
+                                       weights: TensorView,
+                                       x: MTLBuffer,
+                                       y: MTLBuffer,
+                                       rows: Int,
+                                       columns: Int,
+                                       tokenCount: Int,
+                                       xStrideElements: Int,
+                                       yStrideElements: Int) {
+            let (weightBits, groupSize) = attentionQuantByLayer[layer]
+            if weightBits == 4 && groupSize == 64 {
+                if tokenCount >= 32,
+                   family == .q || family == .kv || family == .o,
+                   let candidate = prefillMPPAffineInt4 {
+                    let path = candidate.encode(
+                        commandBuffer: commandBuffer,
+                        weights: weights.buffer,
+                        weightsOffset: Int(weights.offset),
+                        scales: weights.buffer,
+                        scalesOffset: Int(weights.scaleOffset),
+                        biases: weights.buffer,
+                        biasesOffset: Int(weights.biasOffset),
+                        x: x,
+                        y: y,
+                        m: tokenCount,
+                        n: rows,
+                        k: columns)
+                    if path == .affineThreadgroupF16 {
+                        return
+                    }
+                }
+                if PrefillProjectionDispatchPolicy.selectedDispatch(for: family,
+                                                                    chunkTokens: tokenCount) == .qmm {
+                    prefillQMM.encode(commandBuffer: commandBuffer,
+                                      weights: weights.buffer,
+                                      weightsOffset: Int(weights.offset),
+                                      scales: weights.buffer,
+                                      scalesOffset: Int(weights.scaleOffset),
+                                      biases: weights.buffer,
+                                      biasesOffset: Int(weights.biasOffset),
+                                      x: x,
+                                      y: y,
+                                      t: tokenCount,
+                                      n: rows,
+                                      k: columns)
                     return
                 }
-            }
-            if PrefillProjectionDispatchPolicy.selectedDispatch(for: family,
-                                                                chunkTokens: tokenCount) == .qmm {
-                prefillQMM.encode(commandBuffer: commandBuffer,
-                                  weights: weights.buffer,
-                                  weightsOffset: Int(weights.offset),
-                                  scales: weights.buffer,
-                                  scalesOffset: Int(weights.scaleOffset),
-                                  biases: weights.buffer,
-                                  biasesOffset: Int(weights.biasOffset),
-                                  x: x,
-                                  y: y,
-                                  t: tokenCount,
-                                  n: rows,
-                                  k: columns)
-                return
-            }
-            for row in 0..<tokenCount {
-                int4.encode(commandBuffer: commandBuffer,
-                            weights: weights.buffer,
-                            weightsOffset: Int(weights.offset),
-                            scales: weights.buffer,
-                            scalesOffset: Int(weights.scaleOffset),
-                            biases: weights.buffer,
-                            biasesOffset: Int(weights.biasOffset),
-                            x: x,
-                            xOffset: row * xStrideElements * MemoryLayout<Float16>.stride,
-                            y: y,
-                            yOffset: row * yStrideElements * MemoryLayout<Float16>.stride,
-                            m: UInt32(rows),
-                            n: UInt32(columns))
+                for row in 0..<tokenCount {
+                    int4.encode(commandBuffer: commandBuffer,
+                                weights: weights.buffer,
+                                weightsOffset: Int(weights.offset),
+                                scales: weights.buffer,
+                                scalesOffset: Int(weights.scaleOffset),
+                                biases: weights.buffer,
+                                biasesOffset: Int(weights.biasOffset),
+                                x: x,
+                                xOffset: row * xStrideElements * MemoryLayout<Float16>.stride,
+                                y: y,
+                                yOffset: row * yStrideElements * MemoryLayout<Float16>.stride,
+                                m: UInt32(rows),
+                                n: UInt32(columns))
+                }
+            } else if weightBits == 4 {
+                for row in 0..<tokenCount {
+                    int4.encode(commandBuffer: commandBuffer,
+                                weights: weights.buffer,
+                                weightsOffset: Int(weights.offset),
+                                scales: weights.buffer,
+                                scalesOffset: Int(weights.scaleOffset),
+                                biases: weights.buffer,
+                                biasesOffset: Int(weights.biasOffset),
+                                x: x,
+                                xOffset: row * xStrideElements * MemoryLayout<Float16>.stride,
+                                y: y,
+                                yOffset: row * yStrideElements * MemoryLayout<Float16>.stride,
+                                m: UInt32(rows),
+                                n: UInt32(columns),
+                                groupSize: groupSize)
+                }
+            } else if weightBits == 5 {
+                for row in 0..<tokenCount {
+                    dequantInt5.encode(commandBuffer: commandBuffer,
+                                       weights: weights.buffer,
+                                       weightsOffset: Int(weights.offset),
+                                       scales: weights.buffer,
+                                       scalesOffset: Int(weights.scaleOffset),
+                                       biases: weights.buffer,
+                                       biasesOffset: Int(weights.biasOffset),
+                                       x: x,
+                                       xOffset: row * xStrideElements * MemoryLayout<Float16>.stride,
+                                       y: y,
+                                       yOffset: row * yStrideElements * MemoryLayout<Float16>.stride,
+                                       m: UInt32(rows),
+                                       n: UInt32(columns),
+                                       groupSize: UInt32(groupSize))
+                }
+            } else if weightBits == 8 {
+                for row in 0..<tokenCount {
+                    dequantInt8.encode(commandBuffer: commandBuffer,
+                                       weights: weights.buffer,
+                                       weightsOffset: Int(weights.offset),
+                                       scales: weights.buffer,
+                                       scalesOffset: Int(weights.scaleOffset),
+                                       biases: weights.buffer,
+                                       biasesOffset: Int(weights.biasOffset),
+                                       x: x,
+                                       xOffset: row * xStrideElements * MemoryLayout<Float16>.stride,
+                                       y: y,
+                                       yOffset: row * yStrideElements * MemoryLayout<Float16>.stride,
+                                       m: UInt32(rows),
+                                       n: UInt32(columns))
+                }
+            } else {
+                preconditionFailure("unsupported prefill attention weightBits \(weightBits) for layer \(layer)")
             }
         }
 
@@ -819,36 +879,39 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                    t: UInt32(t),
                                    d: UInt32(D),
                                    eps: eps)
-            encodeInt4Projection(commandBuffer: cb,
-                                 family: .q,
-                                 weights: views.q,
-                                 x: scratch.normed,
-                                 y: scratch.q,
-                                 rows: qDim,
-                                 columns: D,
-                                 tokenCount: t,
-                                 xStrideElements: D,
-                                 yStrideElements: qDim)
-            encodeInt4Projection(commandBuffer: cb,
-                                 family: .kv,
-                                 weights: views.k,
-                                 x: scratch.normed,
-                                 y: scratch.kStage,
-                                 rows: kvDim,
-                                 columns: D,
-                                 tokenCount: t,
-                                 xStrideElements: D,
-                                 yStrideElements: kvDim)
-            encodeInt4Projection(commandBuffer: cb,
-                                 family: .kv,
-                                 weights: views.v,
-                                 x: scratch.normed,
-                                 y: scratch.vStage,
-                                 rows: kvDim,
-                                 columns: D,
-                                 tokenCount: t,
-                                 xStrideElements: D,
-                                 yStrideElements: kvDim)
+            encodeAttentionProjection(commandBuffer: cb,
+                                       family: .q,
+                                       layer: L,
+                                       weights: views.q,
+                                       x: scratch.normed,
+                                       y: scratch.q,
+                                       rows: qDim,
+                                       columns: D,
+                                       tokenCount: t,
+                                       xStrideElements: D,
+                                       yStrideElements: qDim)
+            encodeAttentionProjection(commandBuffer: cb,
+                                       family: .kv,
+                                       layer: L,
+                                       weights: views.k,
+                                       x: scratch.normed,
+                                       y: scratch.kStage,
+                                       rows: kvDim,
+                                       columns: D,
+                                       tokenCount: t,
+                                       xStrideElements: D,
+                                       yStrideElements: kvDim)
+            encodeAttentionProjection(commandBuffer: cb,
+                                       family: .kv,
+                                       layer: L,
+                                       weights: views.v,
+                                       x: scratch.normed,
+                                       y: scratch.vStage,
+                                       rows: kvDim,
+                                       columns: D,
+                                       tokenCount: t,
+                                       xStrideElements: D,
+                                       yStrideElements: kvDim)
 
             let rotatedPairs = isFull
                 ? UInt32(Double(cfg.fullHeadDim) * cfg.partialRotaryFactor / 2.0)
@@ -914,16 +977,17 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 throw PrefillError.chunkedUnsupported(
                     "chunked prefill attention requires FP16 KV")
             }
-            encodeInt4Projection(commandBuffer: cb,
-                                     family: .o,
-                                     weights: views.o,
-                                     x: scratch.attentionOutput,
-                                     y: scratch.h1,
-                                     rows: D,
-                                     columns: qDim,
-                                     tokenCount: t,
-                                     xStrideElements: qDim,
-                                     yStrideElements: D)
+            encodeAttentionProjection(commandBuffer: cb,
+                                       family: .o,
+                                       layer: L,
+                                       weights: views.o,
+                                       x: scratch.attentionOutput,
+                                       y: scratch.h1,
+                                       rows: D,
+                                       columns: qDim,
+                                       tokenCount: t,
+                                       xStrideElements: qDim,
+                                       yStrideElements: D)
             prefillPostAttention.encode(commandBuffer: cb,
                                             hidden: scratch.hidden,
                                             attn: scratch.h1,

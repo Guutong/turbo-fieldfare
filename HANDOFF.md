@@ -413,9 +413,7 @@ fail.
 
 In rough dependency order:
 
-1. **Prefill.** `PrefillAttention` / `PrefillInt4QMM` still assume 4-bit. Decode now
-   selects per layer; prefill does not, so a mixed checkpoint would decode correctly
-   and prefill wrong. Same treatment needed.
+1. **Prefill (done).** `RealForwardRunner` prefill attention projections (`Q`, `K`, `V`, `O`) now resolve quantization `(weightBits, groupSize)` per layer via `attentionQuantByLayer[L]`. Standard 4-bit group-64 layers retain the 4-bit fast path (`prefillQMM` / `DequantInt4GEMV`), while non-4-bit or group-128 layers (e.g., 5-bit or 8-bit attention projections) dispatch via per-row sub-byte GEMV encoders (`DequantInt5GEMV` / `DequantInt8GEMV` / `DequantInt4GEMVGeneric`). Verified with `PrefillAttentionQuantTests`.
 2. **8-bit at group 128 for `sharedExpert`**, plus 8-bit `embedding` and the 4-bit
    `router` default. Each is a manifest-guard widening that must land with its kernel.
    With `perLayer` in place these can also be expressed per layer where they vary.
