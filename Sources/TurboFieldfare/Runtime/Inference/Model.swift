@@ -35,6 +35,37 @@ public struct Model {
     public var sourceSnapshotHash: String? { manifest.sourceSnapshotHash }
     public var sharedExpertWeightBits: Int { manifest.quant?.sharedExpert.weightBits ?? 8 }
 
+    /// Quantization of this layer's attention projections.
+    ///
+    /// Per layer rather than per model because some checkpoints vary it:
+    /// Laguna-S-2.1 uses 5-bit attention on 20 layers and 8-bit on the other
+    /// 28. Uniform checkpoints answer the same thing at every layer, so
+    /// callers do not need to know which kind they have.
+    ///
+    /// Falls back to Gemma's 4-bit group-64 when a manifest carries no quant
+    /// block at all — the same default the rest of this type uses for that
+    /// case, and the reason the 4-bit dispatch stays untouched for it.
+    public func attentionQuant(atLayer layer: Int) -> (weightBits: Int, groupSize: Int) {
+        Model.attentionQuant(manifest.quant?.attention, atLayer: layer)
+    }
+
+    /// The resolution rule on its own, so the fallback can be tested without
+    /// standing up a whole `Model` — the case that matters here is a manifest
+    /// with no quant block, which is awkward to construct and easy to get
+    /// wrong by asserting on the fixture instead of the behaviour.
+    static func attentionQuant(_ slot: ManifestQuantSlot?,
+                               atLayer layer: Int) -> (weightBits: Int, groupSize: Int) {
+        guard let slot else { return (4, Quantization.groupSize) }
+        return slot.resolved(atLayer: layer)
+    }
+
+    /// Every distinct attention quantization the model uses, so a runner can
+    /// build exactly the pipelines it needs up front instead of discovering
+    /// them mid-decode.
+    public var distinctAttentionQuants: [(weightBits: Int, groupSize: Int)] {
+        manifest.quant?.attention.distinctConfigurations ?? [(4, Quantization.groupSize)]
+    }
+
     let residentBuffer: ResidentBuffer
     let residentIndex: ResidentIndex
     let packedExpertsLayout: PackedExpertsLayout

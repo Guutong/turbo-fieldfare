@@ -375,18 +375,47 @@ bound is exercised. Two further mutations confirm the 8-bit path is really reach
 really group-generic: instantiating the 8-bit kernel at `BITS=5`, and hardcoding the
 element loop to 64, both fail.
 
-Not yet done: `RealForwardRunner` still calls `FusedQKVGEMV` unconditionally.
+### Per-layer QKV dispatch in decode (done)
+
+This is the first change on this branch that touches Gemma's hot path, so the shape of
+it matters more than usual.
+
+- `Model.attentionQuant(atLayer:)` resolves a layer's `(weightBits, groupSize)` from
+  the manifest, falling back to 4-bit group 64 when there is no `quant` block at all.
+  The rule itself is a static `Model.attentionQuant(_:atLayer:)` so it can be tested
+  without standing up a whole `Model` — the no-quant-block case is awkward to construct
+  and it is easy to write a test that only asserts on the fixture. An earlier version
+  of that test did exactly that and was rewritten.
+- `RealForwardRunner` resolves all layers once at init into `attentionQuantByLayer`,
+  rather than re-walking the override table inside the decode loop.
+- It builds one `FusedQKVGEMVGeneric` per **distinct non-4-bit width** the model uses.
+  A uniformly 4-bit checkpoint builds none, so it pays nothing for the capability; a
+  mixed one gets its PSOs up front instead of stalling mid-decode to compile one.
+  An unimplemented width throws at init with a named error, not at first use.
+- The dispatch branches on `weightBits != 4`, and **the 4-bit branch is the original
+  call unchanged** — so a uniformly 4-bit checkpoint encodes exactly what it did before.
+
+**One hazard worth knowing about, because the first version had it.** Writing the
+branch as `if bits != 4, let wide = table[bits]` falls through to the 4-bit encoder
+when the lookup misses, which would read 5-bit bytes as nibbles and produce numbers
+that look plausible and are entirely wrong. It is now a `guard ... else {
+preconditionFailure }`. The invariant that makes the miss unreachable lives in `init`;
+relying on it silently is the trap this codebase keeps setting.
+
+`AttentionQuantSelectionTests` covers uniform slots, Laguna's real 20/28 split, the
+no-quant-block fallback, and that `distinctConfigurations` (what init builds) is a
+superset of what `resolved(atLayer:)` (what dispatch asks for) can return — a
+disagreement between those two is precisely what would trip the precondition at decode
+time. Mutation-checked: ignoring per-layer overrides, and a wrong fallback width, both
+fail.
 
 ## What still blocks Laguna
 
 In rough dependency order:
 
-1. **Per-layer dispatch in the forward pass.** Both widths Laguna's attention needs now
-   exist as kernels, but `RealForwardRunner` picks `FusedQKVGEMV` unconditionally.
-   It has to select per layer from `ManifestQuantSlot.resolved(atLayer:)` instead, and
-   prefill (`PrefillAttention`) needs the same treatment. This is now wiring, not
-   kernel work — and it is the first item where Gemma's hot path gets touched, so keep
-   the 4-bit dispatch bit-identical when `perLayer` is nil.
+1. **Prefill.** `PrefillAttention` / `PrefillInt4QMM` still assume 4-bit. Decode now
+   selects per layer; prefill does not, so a mixed checkpoint would decode correctly
+   and prefill wrong. Same treatment needed.
 2. **8-bit at group 128 for `sharedExpert`**, plus 8-bit `embedding` and the 4-bit
    `router` default. Each is a manifest-guard widening that must land with its kernel.
    With `perLayer` in place these can also be expressed per layer where they vary.
@@ -428,7 +457,7 @@ so the catalog is reached through a thin projection
   `config.json`; the routed path had been uniformly 4-bit the whole time. One `curl`
   of a 106 KB config would have caught it at any point. Fetching config/index metadata
   is cheap and does not require downloading the 64 GB of weights.
-- The repo has a real test suite (611 tests as of this writing, all green). Run
+- The repo has a real test suite (616 tests as of this writing, all green). Run
   `swift test`, and do not reach green by relaxing an assertion — if a test genuinely
   encodes the old single-model assumption, change it deliberately and say so.
 - Metal kernels do not fail loudly on the errors that matter here. Out-of-range

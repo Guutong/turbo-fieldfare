@@ -152,6 +152,15 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     private let moe: MoE
     private let fusionHead: LMHeadChainInt4
     private let fusedQKVGEMV: FusedQKVGEMV
+    /// Wider-than-4-bit QKV projections, keyed by width. Empty for every
+    /// checkpoint whose attention is uniformly 4-bit — which is every
+    /// checkpoint that runs today — so this costs nothing to carry and the
+    /// 4-bit dispatch below is reached by exactly the same path it always was.
+    private let fusedQKVGEMVWide: [Int: FusedQKVGEMVGeneric]
+    /// Attention `(weightBits, groupSize)` per layer, resolved once at init.
+    /// Looking it up per token would re-walk the manifest's override table
+    /// inside the decode loop for no benefit.
+    private let attentionQuantByLayer: [(weightBits: Int, groupSize: Int)]
     private let fusedQKVEpilogue: FusedQKVEpilogue
     private let fusedPostAttentionSetup: FusedPostAttentionSetup
     private let fusedTail: FusedLayerTail
@@ -260,6 +269,22 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                               maxD: cfg.hiddenSize,
                                               maxVocab: cfg.vocabSize)
         self.fusedQKVGEMV = try FusedQKVGEMV(context: context)
+        self.attentionQuantByLayer = (0..<cfg.numLayers).map(model.attentionQuant(atLayer:))
+        // Build one pipeline per width the model actually uses. A uniformly
+        // 4-bit checkpoint builds none of these, so it pays nothing for the
+        // capability; a mixed one gets its PSOs up front rather than stalling
+        // mid-decode to compile one.
+        var wide: [Int: FusedQKVGEMVGeneric] = [:]
+        for quant in model.distinctAttentionQuants where quant.weightBits != 4 {
+            guard let bits = FusedQKVGEMVGeneric.Bits(rawValue: quant.weightBits) else {
+                throw ModelError.indexCorrupt(
+                    detail: "no attention kernel for \(quant.weightBits)-bit weights")
+            }
+            if wide[quant.weightBits] == nil {
+                wide[quant.weightBits] = try FusedQKVGEMVGeneric(context: context, bits: bits)
+            }
+        }
+        self.fusedQKVGEMVWide = wide
         self.fusedQKVEpilogue = try FusedQKVEpilogue(context: context)
         self.fusedPostAttentionSetup = try FusedPostAttentionSetup(context: context)
         self.fusedTail = try FusedLayerTail(context: context)
@@ -1366,7 +1391,41 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                 d: D, eps: eps)
             }
 
+            let attnQuant = attentionQuantByLayer[L]
             let gQKV: (MTLCommandBuffer) -> Void = { [self] cb in
+                // Anything other than 4-bit goes to the generic wrapper. The
+                // 4-bit branch is the original call, unchanged, so a uniformly
+                // 4-bit checkpoint encodes exactly what it did before.
+                if attnQuant.weightBits != 4 {
+                    guard let wide = fusedQKVGEMVWide[attnQuant.weightBits] else {
+                        // init builds a pipeline for every distinct non-4-bit
+                        // width or throws, so this is unreachable. Trap rather
+                        // than fall through: the 4-bit encoder would happily
+                        // read these bytes as nibbles and produce numbers that
+                        // look plausible and are entirely wrong.
+                        preconditionFailure(
+                            "no QKV pipeline for \(attnQuant.weightBits)-bit attention at layer \(L)")
+                    }
+                    wide.encode(commandBuffer: cb,
+                                qWeights: q.buffer, qWeightsOffset: Int(q.offset),
+                                qScales: q.buffer, qScalesOffset: Int(q.scaleOffset),
+                                qBiases: q.buffer, qBiasesOffset: Int(q.biasOffset),
+                                kWeights: k.buffer, kWeightsOffset: Int(k.offset),
+                                kScales: k.buffer, kScalesOffset: Int(k.scaleOffset),
+                                kBiases: k.buffer, kBiasesOffset: Int(k.biasOffset),
+                                vWeights: vProj.buffer, vWeightsOffset: Int(vProj.offset),
+                                vScales: vProj.buffer, vScalesOffset: Int(vProj.scaleOffset),
+                                vBiases: vProj.buffer, vBiasesOffset: Int(vProj.biasOffset),
+                                x: normed,
+                                qOut: qScratch,
+                                kOut: kSlot.buffer, kOutOffset: kSlot.offset,
+                                vOut: vSlot.buffer, vOutOffset: vSlot.offset,
+                                qRows: qDim,
+                                kvRows: kvDim,
+                                n: UInt32(D),
+                                groupSize: UInt32(attnQuant.groupSize))
+                    return
+                }
                 fusedQKVGEMV.encode(commandBuffer: cb,
                                     qWeights: q.buffer, qWeightsOffset: Int(q.offset),
                                     qScales: q.buffer, qScalesOffset: Int(q.scaleOffset),
