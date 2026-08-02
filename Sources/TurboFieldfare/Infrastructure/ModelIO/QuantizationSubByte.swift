@@ -232,6 +232,48 @@ public enum QuantizationSubByte {
         return dequantizeAffineCodes(codes: codes, scales: r.scales, biases: r.biases, groupSize: r.groupSize)
     }
 
+    // MARK: - INT8 affine, group-generic
+
+    /// MLX `affine` 8-bit row with a caller-supplied group size.
+    ///
+    /// `Quantization.quantizeInt8Affine` already covers 8-bit, but hardcodes
+    /// group 64 — as does the kernel it was written for. Laguna needs 8-bit at
+    /// group 128 (its shared experts), so the group-generic path needs a
+    /// group-generic reference to be checked against.
+    ///
+    /// At 8 bits the "sub-byte" bitstream degenerates to one byte per code, so
+    /// this produces byte-for-byte the same `packed` layout as the fixed-group
+    /// version. `int8ReferencesAgreeAtGroup64` pins that equivalence rather
+    /// than leaving it as a claim.
+    public struct Int8AffineRow {
+        public let packed: [UInt8]   // N bytes
+        public let scales: [UInt16]  // N / groupSize BF16 bits
+        public let biases: [UInt16]  // N / groupSize BF16 bits
+        public let groupSize: Int
+
+        public init(packed: [UInt8], scales: [UInt16], biases: [UInt16], groupSize: Int) {
+            self.packed = packed
+            self.scales = scales
+            self.biases = biases
+            self.groupSize = groupSize
+        }
+    }
+
+    /// Affine 8-bit quantize: `q ∈ [0..255]`, `w ≈ q * scale + bias`.
+    public static func quantizeInt8Affine(_ row: [Float], groupSize: Int) -> Int8AffineRow {
+        let (codes, scales, biases) = quantizeAffineCodes(row, groupSize: groupSize, bits: 8, maxQ: 255)
+        let packed = packBits(codes, bits: 8)
+        return Int8AffineRow(packed: packed, scales: scales, biases: biases, groupSize: groupSize)
+    }
+
+    public static func dequantizeInt8Affine(_ r: Int8AffineRow, n: Int) -> [Float] {
+        precondition(n % r.groupSize == 0, "n \(n) is not a multiple of groupSize \(r.groupSize)")
+        precondition(r.packed.count == n,
+                     "packed.count \(r.packed.count) != expected \(n)")
+        let codes = unpackBits(r.packed, count: n, bits: 8)
+        return dequantizeAffineCodes(codes: codes, scales: r.scales, biases: r.biases, groupSize: r.groupSize)
+    }
+
     // MARK: - INT6 affine
 
     /// MLX `affine` 6-bit row. Packed unsigned 6-bit codes (continuous
