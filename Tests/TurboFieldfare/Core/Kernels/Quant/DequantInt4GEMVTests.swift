@@ -38,11 +38,22 @@ import TurboFieldfareValidationSupport
     /// leave a 2-aligned-but-not-4-aligned weight offset) — the exact alignment
     /// the vectorized `ushort` load depends on and the offset-0 parity tests
     /// never touch (R2).
+    ///
+    /// `groupSize` defaults to 64 (the hand-vectorized fast path); pass 128 to
+    /// exercise the generic strided-loop kernel used for oQ4e's routed experts.
+    /// Returns the raw kernel output so callers that need bit-exact comparisons
+    /// (not just tolerance-vs-reference) can inspect it directly.
+    @discardableResult
     private static func runAndCompare(m: Int, n: Int, seed: UInt64,
-                                      weightByteOffset: Int = 0) throws {
-        precondition(n % Quantization.groupSize == 0)
-        // Keep the offset-zero fixtures stable when adding non-zero offset cases.
-        let baseKey = "int4-gemv-kernel-m\(m)-n\(n)"
+                                      weightByteOffset: Int = 0,
+                                      groupSize: Int = Quantization.groupSize) throws -> [Float] {
+        precondition(n % groupSize == 0)
+        // Keep the existing offset-0/group-64 fixtures' RNG streams stable
+        // (bit-for-bit) when adding non-zero-offset or non-64-groupSize cases:
+        // only append a suffix when a case actually deviates from the
+        // original default, so old test keys are untouched.
+        var baseKey = "int4-gemv-kernel-m\(m)-n\(n)"
+        if groupSize != Quantization.groupSize { baseKey += "-g\(groupSize)" }
         let rngKey = weightByteOffset == 0 ? baseKey : "\(baseKey)-off\(weightByteOffset)"
         var rng = SeedTree(seed).key(rngKey)
 
@@ -50,7 +61,7 @@ import TurboFieldfareValidationSupport
         rows.reserveCapacity(m)
         for _ in 0..<m {
             let raw = (0..<n).map { _ in rng.uniform(-0.5, 0.5) }
-            rows.append(Quantization.quantizeInt4Affine(raw))
+            rows.append(Quantization.quantizeInt4Affine(raw, groupSize: groupSize))
         }
         let (packed, scales, biases) = packWeights(rows)
 
@@ -76,27 +87,29 @@ import TurboFieldfareValidationSupport
                 options: .storageModeShared),
               let xBuf = Fp16Buffer.make(ctx.device, halves: xFp16),
               let yBuf = Fp16Buffer.make(ctx.device, count: m) else {
-            Issue.record("Failed to allocate buffers"); return
+            Issue.record("Failed to allocate buffers"); return []
         }
 
         guard let cmd = ctx.queue.makeCommandBuffer() else {
-            Issue.record("Failed to make command buffer"); return
+            Issue.record("Failed to make command buffer"); return []
         }
         kernel.encode(commandBuffer: cmd,
                       weights: wBuf, weightsOffset: weightByteOffset,
                       scales: sBuf, biases: bBuf,
                       x: xBuf, y: yBuf,
-                      m: UInt32(m), n: UInt32(n))
+                      m: UInt32(m), n: UInt32(n),
+                      groupSize: groupSize)
         cmd.commit()
         cmd.waitUntilCompleted()
 
-        let ref = DequantInt4GemvRef.apply(weightRows: rows, x: xRef, n: n)
+        let ref = DequantInt4GemvRef.apply(weightRows: rows, x: xRef, n: n, groupSize: groupSize)
         let actual = Fp16Buffer.read(yBuf, count: m)
 
         let rel = RelError.compute(actual: actual, reference: ref)
         let maxAbs = RelError.maxAbsDiff(actual, ref)
         #expect(rel < Tolerance.fp16Reduction,
-                "M=\(m) N=\(n): rel=\(rel) maxAbs=\(maxAbs)")
+                "M=\(m) N=\(n) groupSize=\(groupSize): rel=\(rel) maxAbs=\(maxAbs)")
+        return actual
     }
 
     @Test func gemv_d128_n128() throws {
@@ -125,5 +138,68 @@ import TurboFieldfareValidationSupport
     func gemv_sweep(m: Int, n: Int) throws {
         let seed: UInt64 = UInt64(m) &* 0x9E37 &+ UInt64(n)
         try Self.runAndCompare(m: m, n: n, seed: seed)
+    }
+
+    // MARK: - Group size 64 regression proof
+    //
+    // `encode`'s groupSize parameter defaults to `Quantization.groupSize`
+    // (64) and only diverts to the generic kernel when the caller passes a
+    // different value (see `useGeneric` in DequantInt4GEMV.encode). This test
+    // pins that: an explicit `groupSize: 64` must dispatch through the exact
+    // same code path as omitting the parameter, and the two runs must produce
+    // bit-identical FP16 output, not merely output within tolerance. Widening
+    // FP16 -> Float32 (`Fp16Buffer.read`) is lossless, so exact `Float`
+    // equality here is exact `Float16` bit equality.
+    @Test func gemv_group64_explicitMatchesDefaultBitIdentical() throws {
+        let m = 128, n = 2816, seed: UInt64 = 0xC5
+        let withDefault = try Self.runAndCompare(m: m, n: n, seed: seed)
+        let withExplicit = try Self.runAndCompare(m: m, n: n, seed: seed,
+                                                   groupSize: Quantization.groupSize)
+        #expect(withDefault == withExplicit,
+                "explicit groupSize:64 must match the default dispatch bit-for-bit")
+    }
+
+    // MARK: - Group size 128 (oQ4e routed experts)
+    //
+    // Exercises `dequant_int4_gemv_generic`, the strided-loop kernel used for
+    // any groupSize other than 64. N=256 (2 groups) is not a multiple of 4
+    // groups and N=512 (4 groups) is — the group-64 fast path's block/
+    // remainder split doesn't exist in the generic kernel, but both group
+    // counts are covered anyway since the "wrong group stride" mutation class
+    // (see task's mutation-testing note) can misbehave differently depending
+    // on how many groups a row has.
+
+    @Test func gemv_group128_n128_oneGroup() throws {
+        try Self.runAndCompare(m: 64, n: 128, seed: 0xD1, groupSize: 128)
+    }
+
+    @Test func gemv_group128_n256_twoGroups() throws {
+        try Self.runAndCompare(m: 64, n: 256, seed: 0xD2, groupSize: 128)
+    }
+
+    @Test func gemv_group128_n512_fourGroups() throws {
+        try Self.runAndCompare(m: 96, n: 512, seed: 0xD3, groupSize: 128)
+    }
+
+    @Test func gemv_group128_n2816_notMultipleOfFourGroups() throws {
+        // 2816 / 128 = 22 groups: not a multiple of 4, and the real routed-
+        // expert intermediate dimension.
+        try Self.runAndCompare(m: 128, n: 2816, seed: 0xD4, groupSize: 128)
+    }
+
+    /// Reproduces the resident-layout 2-aligned-but-not-4-aligned weight
+    /// offset (see `gemv_weightsAt2AlignedNot4AlignedOffset`) with groupSize
+    /// 128, since the generic kernel's byte indexing (`idx >> 1`) must stay
+    /// correct at a non-zero base too.
+    @Test func gemv_group128_weightsAt2AlignedNot4AlignedOffset() throws {
+        try Self.runAndCompare(m: 64, n: 2816, seed: 0xD5,
+                               weightByteOffset: 2, groupSize: 128)
+    }
+
+    @Test(arguments: [64, 65, 128, 129] as [Int],
+                     OffByMultiples.multiplesOfGroup.filter { $0 % 128 == 0 })
+    func gemv_group128_sweep(m: Int, n: Int) throws {
+        let seed: UInt64 = UInt64(m) &* 0x9E37 &+ UInt64(n) &* 0x85EB
+        try Self.runAndCompare(m: m, n: n, seed: seed, groupSize: 128)
     }
 }

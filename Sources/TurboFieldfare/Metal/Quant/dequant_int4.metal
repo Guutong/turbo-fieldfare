@@ -191,6 +191,83 @@ kernel void dequant_int4_gemv_simd(
 }
 
 
+// Generic INT4 GEMV body: one SIMD group (32 threads) per output row, each
+// lane strides across a group's elements by 32 — the same strided pattern as
+// dequant_subbyte_gemv_body, so this works for any groupSize that's a
+// multiple of 32 (in practice 64 and 128). Unlike
+// dequant_int4_gemv_simd_body above (hand-vectorized 4-group/128-byte blocks,
+// fixed at kGroupSize=64), this trades peak throughput for an obviously
+// correct loop: nibble parity and byte index both come from the row-global
+// element index `idx`, so it needs no block/remainder split and no
+// assumption about how many groups fit in a block. groupSize even (true for
+// 64 and 128) keeps every group byte-aligned, matching the packing in
+// Quantization.swift. Used for group sizes other than 64 (currently 128,
+// from oQ4e's routed-expert quantization); dequant_int4_gemv_simd_body and
+// its kernel are untouched, so the group-64 fast path is unaffected.
+static inline void dequant_int4_gemv_generic_body(
+    device const uint8_t* W,
+    device const bfloat*  scales,
+    device const bfloat*  biases,
+    device const half*    x,
+    device half*          y,
+    uint                  M,
+    uint                  N,
+    uint                  groupSize,
+    uint                  rows_per_tg,
+    uint                  tg_idx,
+    uint                  sg_idx,
+    uint                  lane
+) {
+    const uint row = tg_idx * rows_per_tg + sg_idx;
+    if (row >= M) return;
+    const uint n_groups  = N / groupSize;
+    const uint row_bytes = N / 2;
+    device const uint8_t* W_row = W      + uint(row) * row_bytes;
+    device const bfloat*  s_row = scales + uint(row) * n_groups;
+    device const bfloat*  b_row = biases + uint(row) * n_groups;
+
+    float acc = 0.0f;
+    for (uint g = 0; g < n_groups; ++g) {
+        const float s = float(s_row[g]);
+        const float b = float(b_row[g]);
+        const uint group_base = g * groupSize;
+        float dot = 0.0f;
+        float sum = 0.0f;
+        for (uint elem = lane; elem < groupSize; elem += 32u) {
+            const uint idx  = group_base + elem;
+            const uint8_t byte = W_row[idx >> 1];
+            const uint q = (idx & 1u) ? nib_hi(byte) : nib_lo(byte);
+            const float xv = float(x[idx]);
+            dot = fma(float(q), xv, dot);
+            sum += xv;
+        }
+        acc = fma(s, dot, acc);
+        acc = fma(b, sum, acc);
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) {
+        y[row] = half(acc);
+    }
+}
+
+kernel void dequant_int4_gemv_generic(
+    device const uint8_t* W         [[buffer(0)]],
+    device const bfloat*  scales    [[buffer(1)]],
+    device const bfloat*  biases    [[buffer(2)]],
+    device const half*    x         [[buffer(3)]],
+    device half*          y         [[buffer(4)]],
+    constant uint&        M         [[buffer(5)]],
+    constant uint&        N         [[buffer(6)]],
+    constant uint&        groupSize [[buffer(7)]],
+    uint                  tg_idx    [[threadgroup_position_in_grid]],
+    uint                  sg_idx    [[simdgroup_index_in_threadgroup]],
+    uint                  lane      [[thread_index_in_simdgroup]]
+) {
+    constexpr uint rows_per_tg = 8;
+    dequant_int4_gemv_generic_body(W, scales, biases, x, y, M, N, groupSize,
+                                    rows_per_tg, tg_idx, sg_idx, lane);
+}
+
 kernel void dequant_int4_qkv_gemv_simd(
     device const uint8_t* qW      [[buffer(0)]],
     device const bfloat*  qScales [[buffer(1)]],

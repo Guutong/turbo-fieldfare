@@ -2,7 +2,7 @@
 using namespace metal;
 
 constant constexpr uint kMoEGroupSize = 64;
-constant constexpr uint kMaxStreamedExperts = 8;
+constant constexpr uint kMoEMaxTopK = 16;
 constant constexpr float kGeluSqrt2OverPi = 0.7978845608028654f;
 constant constexpr float kGeluCubicCoeff = 0.044715f;
 
@@ -30,6 +30,14 @@ static inline uint router_fc_d(constant uint& D) {
             is_function_constant_defined(FC_ROUTER_D))
         ? FC_ROUTER_D
         : D;
+}
+
+static inline uint router_fc_top_k(constant uint& top_k) {
+    return (is_function_constant_defined(FC_ROUTER_USE_FC) &&
+            FC_ROUTER_USE_FC &&
+            is_function_constant_defined(FC_ROUTER_TOP_K))
+        ? FC_ROUTER_TOP_K
+        : top_k;
 }
 
 static inline uint moe_fc_d(constant uint& D) {
@@ -72,7 +80,7 @@ struct ExpertOffsets {
 };
 
 struct RoutedBlobs {
-    device const uint8_t* blob[kMaxStreamedExperts];
+    device const uint8_t* blob[kMoEMaxTopK];
 };
 
 static inline void router_gemv_gemma4_body(
@@ -132,35 +140,42 @@ kernel void router_gemv_gemma4_r4(
                             out_logits, num_experts, D, 4, tg_idx, sg_idx, lane);
 }
 
-kernel void router_topk_select_k8(
+kernel void router_topk_select(
     device const float* logits [[buffer(0)]],
     device const bfloat* per_expert_scale [[buffer(1)]],
     device uint* out_indices [[buffer(2)]],
     device half* out_weights [[buffer(3)]],
     constant uint& num_experts [[buffer(4)]],
+    constant uint& top_k [[buffer(5)]],
     uint tid [[thread_position_in_threadgroup]]
 ) {
     if (tid != 0) return;
+    const uint K = min(router_fc_top_k(top_k), kMoEMaxTopK);
     const uint NE = router_fc_num_experts(num_experts);
-    uint top_idx[8];
-    float top_score[8];
-    for (uint i = 0; i < 8; ++i) {
+
+    // Sized at the compile-time maximum: Metal has no variable-length arrays,
+    // so K bounds the loops rather than the storage.
+    uint top_idx[kMoEMaxTopK];
+    float top_score[kMoEMaxTopK];
+    for (uint i = 0; i < K; ++i) {
         top_idx[i] = 0u;
         top_score[i] = -INFINITY;
     }
 
+    // Selection loop: maintain top-K scores in descending order.
     for (uint e = 0; e < NE; ++e) {
         const float s = logits[e];
-        if (s <= top_score[7]) continue;
-        uint pos = 8u;
-        for (uint i = 0; i < 8; ++i) {
+        if (s <= top_score[K - 1]) continue;
+        uint pos = K;
+        for (uint i = 0; i < K; ++i) {
             if (s > top_score[i] || (s == top_score[i] && e < top_idx[i])) {
                 pos = i;
                 break;
             }
         }
-        if (pos >= 8u) continue;
-        for (uint i = 7; i > pos; --i) {
+        if (pos >= K) continue;
+        // Shift down from the last slot, which drops the current K-1 entry.
+        for (uint i = K - 1; i > pos; --i) {
             top_idx[i] = top_idx[i - 1];
             top_score[i] = top_score[i - 1];
         }
@@ -168,15 +183,16 @@ kernel void router_topk_select_k8(
         top_score[pos] = s;
     }
 
+    // Softmax over the selected top-K.
     const float max_s = top_score[0];
     float sum_exp = 0.0f;
-    float exps[8];
-    for (uint i = 0; i < 8; ++i) {
+    float exps[kMoEMaxTopK];
+    for (uint i = 0; i < K; ++i) {
         const float ex = fast::exp(top_score[i] - max_s);
         exps[i] = ex;
         sum_exp += ex;
     }
-    for (uint i = 0; i < 8; ++i) {
+    for (uint i = 0; i < K; ++i) {
         const uint expert_idx = top_idx[i];
         const float weight = exps[i] / sum_exp;
         out_indices[i] = expert_idx;
@@ -239,6 +255,56 @@ static inline float moe_int4_gemv_row_simd_dev_vec(
         dot = fma(float(uint(byte >> 4)), x1, dot);
         acc = fma(s, dot, acc);
         acc = fma(b, x0 + x1, acc);
+    }
+    return simd_sum(acc);
+}
+
+// Group-size-agnostic counterpart to moe_int4_gemv_row_simd_dev_vec above.
+// That function hand-vectorizes four 64-element groups per 128-byte block,
+// splitting the 32 lanes 8-per-group via `lane >> 3` — a mapping baked to
+// kMoEGroupSize == 64. At group 128 a 128-byte block spans only two groups,
+// so the mapping would have to become `lane >> 4` with different block
+// accounting entirely; getting that wrong yields plausible-but-wrong numbers
+// with no Metal-level fault. Rather than re-derive the block geometry for a
+// second group size, this mirrors dequant_int4_gemv_generic_body /
+// dequant_subbyte_gemv_body: each lane strides across a group's elements by
+// 32, so correctness does not depend on how many groups fit in a block —
+// there is no block. Used for groupSize != kMoEGroupSize (currently only
+// 128, for Laguna's routed experts); moe_int4_gemv_row_simd_dev_vec is
+// untouched, so the group-64 fast path (Gemma) is unaffected.
+static inline float moe_int4_gemv_row_simd_dev_vec_generic(
+    device const uint8_t* W,
+    device const bfloat* S,
+    device const bfloat* B,
+    device const half* x,
+    uint row,
+    uint N,
+    uint groupSize,
+    uint lane
+) {
+    const uint n_groups = N / groupSize;
+    const uint row_bytes = N / 2;
+    device const uint8_t* W_row = W + uint(row) * row_bytes;
+    device const bfloat* s_row = S + uint(row) * n_groups;
+    device const bfloat* b_row = B + uint(row) * n_groups;
+
+    float acc = 0.0f;
+    for (uint g = 0; g < n_groups; ++g) {
+        const float s = float(s_row[g]);
+        const float b = float(b_row[g]);
+        const uint group_base = g * groupSize;
+        float dot = 0.0f;
+        float sum = 0.0f;
+        for (uint elem = lane; elem < groupSize; elem += 32u) {
+            const uint idx = group_base + elem;
+            const uint8_t byte = W_row[idx >> 1];
+            const float q = float((idx & 1u) ? uint(byte >> 4) : uint(byte & 0x0Fu));
+            const float xv = float(x[idx]);
+            dot = fma(q, xv, dot);
+            sum += xv;
+        }
+        acc = fma(s, dot, acc);
+        acc = fma(b, sum, acc);
     }
     return simd_sum(acc);
 }
@@ -328,6 +394,64 @@ static inline float2 moe_int4_gate_up_rows_simd_dev_vec_u16load(
         g_dot = fma(float(uint(gbv >> 4)), x1, g_dot);
         float u_dot = fma(float(uint(ubv & 0x0Fu)), x0, 0.0f);
         u_dot = fma(float(uint(ubv >> 4)), x1, u_dot);
+        g_acc = fma(gs, g_dot, g_acc);
+        g_acc = fma(gb, sum, g_acc);
+        u_acc = fma(us, u_dot, u_acc);
+        u_acc = fma(ub, sum, u_acc);
+    }
+    return float2(simd_sum(g_acc), simd_sum(u_acc));
+}
+
+// Group-size-agnostic counterpart to
+// moe_int4_gate_up_rows_simd_dev_vec_u16load above, same rationale as
+// moe_int4_gemv_row_simd_dev_vec_generic: strided-lane loop instead of the
+// 4-group/128-byte block split that only makes sense at kMoEGroupSize == 64.
+// Used for groupSize != kMoEGroupSize (currently only 128).
+static inline float2 moe_int4_gate_up_rows_simd_dev_vec_u16load_generic(
+    device const uint8_t* gateW,
+    device const bfloat* gateS,
+    device const bfloat* gateB,
+    device const uint8_t* upW,
+    device const bfloat* upS,
+    device const bfloat* upB,
+    device const half* x,
+    uint row,
+    uint N,
+    uint groupSize,
+    uint lane
+) {
+    const uint n_groups = N / groupSize;
+    const uint row_bytes = N / 2;
+    device const uint8_t* gW_row = gateW + uint(row) * row_bytes;
+    device const uint8_t* uW_row = upW + uint(row) * row_bytes;
+    device const bfloat* gS_row = gateS + uint(row) * n_groups;
+    device const bfloat* gB_row = gateB + uint(row) * n_groups;
+    device const bfloat* uS_row = upS + uint(row) * n_groups;
+    device const bfloat* uB_row = upB + uint(row) * n_groups;
+
+    float g_acc = 0.0f;
+    float u_acc = 0.0f;
+    for (uint g = 0; g < n_groups; ++g) {
+        const float gs = float(gS_row[g]);
+        const float gb = float(gB_row[g]);
+        const float us = float(uS_row[g]);
+        const float ub = float(uB_row[g]);
+        const uint group_base = g * groupSize;
+        float g_dot = 0.0f;
+        float u_dot = 0.0f;
+        float sum = 0.0f;
+        for (uint elem = lane; elem < groupSize; elem += 32u) {
+            const uint idx = group_base + elem;
+            const bool hi = (idx & 1u) != 0u;
+            const uint8_t gbyte = gW_row[idx >> 1];
+            const uint8_t ubyte = uW_row[idx >> 1];
+            const float gq = float(hi ? uint(gbyte >> 4) : uint(gbyte & 0x0Fu));
+            const float uq = float(hi ? uint(ubyte >> 4) : uint(ubyte & 0x0Fu));
+            const float xv = float(x[idx]);
+            g_dot = fma(gq, xv, g_dot);
+            u_dot = fma(uq, xv, u_dot);
+            sum += xv;
+        }
         g_acc = fma(gs, g_dot, g_acc);
         g_acc = fma(gb, sum, g_acc);
         u_acc = fma(us, u_dot, u_acc);
@@ -443,7 +567,122 @@ kernel void moe_phase1_gate_up_act_subset_u16load(
         tg_idx, sg_idx, lane);
 }
 
-kernel void moe_phase2_down_reduce_k8(
+// Generic-groupSize counterparts of the two phase-1 bodies above, calling
+// the strided-lane gate/up function instead of the group-64 block-vectorized
+// one. No function-constant specialization: the specialized pipelines exist
+// only to shortcut Gemma's fixed group-64 shapes, and nothing routes through
+// here except groupSize != kMoEGroupSize, which Gemma never uses.
+static inline void moe_phase1_gate_up_act_u16load_generic_body(
+    device const RoutedBlobs& routed,
+    constant ExpertOffsets& routed_offsets,
+    device const half* x,
+    device half* acts,
+    uint D,
+    uint F,
+    uint top_k,
+    uint groupSize,
+    uint rows_per_tg,
+    uint tg_idx,
+    uint sg_idx,
+    uint lane
+) {
+    const uint rowg = tg_idx * rows_per_tg + sg_idx;
+    if (rowg >= top_k * F) return;
+    const uint slot = rowg / F;
+    const uint f = rowg % F;
+
+    device const uint8_t* base = routed.blob[slot];
+    const ExpertOffsets re = routed_offsets;
+    device const uint8_t* gW = base + re.gate_W_off;
+    device const uint8_t* uW = base + re.up_W_off;
+    device const bfloat* gS = (device const bfloat*)(base + re.gate_s_off);
+    device const bfloat* uS = (device const bfloat*)(base + re.up_s_off);
+    device const bfloat* gB = (device const bfloat*)(base + re.gate_b_off);
+    device const bfloat* uB = (device const bfloat*)(base + re.up_b_off);
+
+    const float2 gu = moe_int4_gate_up_rows_simd_dev_vec_u16load_generic(
+        gW, gS, gB, uW, uS, uB, x, f, D, groupSize, lane);
+    if (lane == 0) acts[slot * F + f] = half(gelu_pytorch_tanh(gu.x) * gu.y);
+}
+
+static inline void moe_phase1_gate_up_act_subset_u16load_generic_body(
+    device const RoutedBlobs& routed,
+    constant ExpertOffsets& routed_offsets,
+    device const half* x,
+    device half* acts,
+    device const uint* active_slots,
+    uint active_count,
+    uint D,
+    uint F,
+    uint top_k,
+    uint groupSize,
+    uint rows_per_tg,
+    uint tg_idx,
+    uint sg_idx,
+    uint lane
+) {
+    const uint rowg = tg_idx * rows_per_tg + sg_idx;
+    if (rowg >= active_count * F) return;
+    const uint active_idx = rowg / F;
+    const uint slot = active_slots[active_idx];
+    if (slot >= top_k) return;
+    const uint f = rowg % F;
+
+    device const uint8_t* base = routed.blob[slot];
+    const ExpertOffsets re = routed_offsets;
+    device const uint8_t* gW = base + re.gate_W_off;
+    device const uint8_t* uW = base + re.up_W_off;
+    device const bfloat* gS = (device const bfloat*)(base + re.gate_s_off);
+    device const bfloat* uS = (device const bfloat*)(base + re.up_s_off);
+    device const bfloat* gB = (device const bfloat*)(base + re.gate_b_off);
+    device const bfloat* uB = (device const bfloat*)(base + re.up_b_off);
+
+    const float2 gu = moe_int4_gate_up_rows_simd_dev_vec_u16load_generic(
+        gW, gS, gB, uW, uS, uB, x, f, D, groupSize, lane);
+    if (lane == 0) acts[slot * F + f] = half(gelu_pytorch_tanh(gu.x) * gu.y);
+}
+
+kernel void moe_phase1_gate_up_act_u16load_generic(
+    device const RoutedBlobs& routed [[buffer(0)]],
+    constant ExpertOffsets& routed_offsets [[buffer(1)]],
+    device const half* x [[buffer(2)]],
+    device half* acts [[buffer(3)]],
+    constant uint& D [[buffer(4)]],
+    constant uint& F [[buffer(5)]],
+    constant uint& top_k [[buffer(6)]],
+    constant uint& groupSize [[buffer(7)]],
+    uint tg_idx [[threadgroup_position_in_grid]],
+    uint sg_idx [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint rows_per_tg = 8;
+    moe_phase1_gate_up_act_u16load_generic_body(
+        routed, routed_offsets, x, acts, D, F, top_k, groupSize,
+        rows_per_tg, tg_idx, sg_idx, lane);
+}
+
+kernel void moe_phase1_gate_up_act_subset_u16load_generic(
+    device const RoutedBlobs& routed [[buffer(0)]],
+    constant ExpertOffsets& routed_offsets [[buffer(1)]],
+    device const half* x [[buffer(2)]],
+    device half* acts [[buffer(3)]],
+    constant uint& D [[buffer(4)]],
+    constant uint& F [[buffer(5)]],
+    constant uint& top_k [[buffer(6)]],
+    device const uint* active_slots [[buffer(7)]],
+    constant uint& active_count [[buffer(8)]],
+    constant uint& groupSize [[buffer(9)]],
+    uint tg_idx [[threadgroup_position_in_grid]],
+    uint sg_idx [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint rows_per_tg = 8;
+    moe_phase1_gate_up_act_subset_u16load_generic_body(
+        routed, routed_offsets, x, acts, active_slots, active_count,
+        D, F, top_k, groupSize, rows_per_tg, tg_idx, sg_idx, lane);
+}
+
+kernel void moe_phase2_down_reduce(
     device const RoutedBlobs& routed [[buffer(0)]],
     constant ExpertOffsets& routed_offsets [[buffer(1)]],
     device const half* acts [[buffer(2)]],
@@ -452,31 +691,91 @@ kernel void moe_phase2_down_reduce_k8(
     device half* y [[buffer(5)]],
     constant uint& D [[buffer(6)]],
     constant uint& F [[buffer(7)]],
+    constant uint& top_k [[buffer(8)]],
     uint d [[threadgroup_position_in_grid]],
     uint sg_idx [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]
 ) {
-    threadgroup float partial[8];
+    const uint K = min(moe_fc_top_k(top_k), kMoEMaxTopK);
+    threadgroup float partial[kMoEMaxTopK];
     const uint DD = moe_fc_d(D);
     const uint FF = moe_fc_f(F);
     if (d >= DD) return;
+    // The host dispatches exactly K simdgroups, but guard anyway: a threadgroup
+    // wider than K would otherwise read past the routed blob array.
+    const bool active = sg_idx < K;
+    if (lane == 0 && !active) partial[sg_idx] = 0.0f;
 
-    device const uint8_t* base = routed.blob[sg_idx];
-    const ExpertOffsets re = routed_offsets;
-    device const uint8_t* dW = base + re.down_W_off;
-    device const bfloat* dS = (device const bfloat*)(base + re.down_s_off);
-    device const bfloat* dB = (device const bfloat*)(base + re.down_b_off);
-    device const half* act_slot = acts + sg_idx * FF;
+    if (active) {
+        device const uint8_t* base = routed.blob[sg_idx];
+        const ExpertOffsets re = routed_offsets;
+        device const uint8_t* dW = base + re.down_W_off;
+        device const bfloat* dS = (device const bfloat*)(base + re.down_s_off);
+        device const bfloat* dB = (device const bfloat*)(base + re.down_b_off);
+        device const half* act_slot = acts + sg_idx * FF;
 
-    const float value = moe_int4_gemv_row_simd_dev_vec(
-        dW, dS, dB, act_slot, d, FF, lane);
-    if (lane == 0) partial[sg_idx] = float(routing_w[sg_idx]) * value;
+        const float value = moe_int4_gemv_row_simd_dev_vec(
+            dW, dS, dB, act_slot, d, FF, lane);
+        if (lane == 0) partial[sg_idx] = float(routing_w[sg_idx]) * value;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (sg_idx == 0 && lane == 0) {
         float acc = float(residual[d]);
-        acc += partial[0]; acc += partial[1]; acc += partial[2]; acc += partial[3];
-        acc += partial[4]; acc += partial[5]; acc += partial[6]; acc += partial[7];
+        for (uint i = 0; i < K; ++i) {
+            acc += partial[i];
+        }
+        y[d] = half(acc);
+    }
+}
+
+// Generic-groupSize counterpart of moe_phase2_down_reduce above, calling the
+// strided-lane down-projection GEMV instead of the group-64 block-vectorized
+// one. No function-constant specialization, same rationale as the phase-1
+// generic kernels: Gemma always dispatches the group-64 specialized
+// pipeline, so nothing exercises this path at a fixed shape worth baking in.
+kernel void moe_phase2_down_reduce_generic(
+    device const RoutedBlobs& routed [[buffer(0)]],
+    constant ExpertOffsets& routed_offsets [[buffer(1)]],
+    device const half* acts [[buffer(2)]],
+    device const half* routing_w [[buffer(3)]],
+    device const half* residual [[buffer(4)]],
+    device half* y [[buffer(5)]],
+    constant uint& D [[buffer(6)]],
+    constant uint& F [[buffer(7)]],
+    constant uint& top_k [[buffer(8)]],
+    constant uint& groupSize [[buffer(9)]],
+    uint d [[threadgroup_position_in_grid]],
+    uint sg_idx [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint K = min(top_k, kMoEMaxTopK);
+    threadgroup float partial[kMoEMaxTopK];
+    if (d >= D) return;
+    // The host dispatches exactly K simdgroups, but guard anyway: a threadgroup
+    // wider than K would otherwise read past the routed blob array.
+    const bool active = sg_idx < K;
+    if (lane == 0 && !active) partial[sg_idx] = 0.0f;
+
+    if (active) {
+        device const uint8_t* base = routed.blob[sg_idx];
+        const ExpertOffsets re = routed_offsets;
+        device const uint8_t* dW = base + re.down_W_off;
+        device const bfloat* dS = (device const bfloat*)(base + re.down_s_off);
+        device const bfloat* dB = (device const bfloat*)(base + re.down_b_off);
+        device const half* act_slot = acts + sg_idx * F;
+
+        const float value = moe_int4_gemv_row_simd_dev_vec_generic(
+            dW, dS, dB, act_slot, d, F, groupSize, lane);
+        if (lane == 0) partial[sg_idx] = float(routing_w[sg_idx]) * value;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sg_idx == 0 && lane == 0) {
+        float acc = float(residual[d]);
+        for (uint i = 0; i < K; ++i) {
+            acc += partial[i];
+        }
         y[d] = half(acc);
     }
 }

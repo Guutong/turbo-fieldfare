@@ -47,7 +47,22 @@ public enum Quantization {
     /// Affine 4-bit quantize: `q ∈ [0..15]`, `w ≈ q * scale + bias`.
     /// Scale and bias are computed from per-group min/max, then rounded to BF16.
     /// Test-fixture only — the runtime importer never calls this.
+    ///
+    /// Kept as a distinct overload (not a defaulted parameter) rather than
+    /// `groupSize: Int = groupSize`: several call sites pass this function by
+    /// reference (e.g. `values.map(Quantization.quantizeInt4Affine)`), which
+    /// binds to a single-arity function type and does not see defaulted
+    /// parameters — a default would silently break those call sites' overload
+    /// resolution.
     public static func quantizeInt4Affine(_ row: [Float]) -> Int4AffineRow {
+        quantizeInt4Affine(row, groupSize: groupSize)
+    }
+
+    /// `groupSize`-parameterized variant of `quantizeInt4Affine(_:)`; the
+    /// module-wide default (64) is the only size the one working model uses
+    /// today, callers exercising group-128 (oQ4e's routed experts) pass 128
+    /// explicitly.
+    public static func quantizeInt4Affine(_ row: [Float], groupSize: Int) -> Int4AffineRow {
         precondition(row.count % groupSize == 0,
                      "row length \(row.count) is not a multiple of \(groupSize)")
 
@@ -101,7 +116,7 @@ public enum Quantization {
         return Int4AffineRow(packed: packed, scales: scales, biases: biases)
     }
 
-    public static func dequantizeInt4Affine(_ r: Int4AffineRow, n: Int) -> [Float] {
+    public static func dequantizeInt4Affine(_ r: Int4AffineRow, n: Int, groupSize: Int = groupSize) -> [Float] {
         precondition(n == r.packed.count * 2)
         var out = [Float](repeating: 0, count: n)
         let nGroups = n / groupSize
