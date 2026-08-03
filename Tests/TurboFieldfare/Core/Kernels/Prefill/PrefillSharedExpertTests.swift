@@ -215,6 +215,8 @@ import TurboFieldfareValidationSupport
                               down: downProj,
                               y: yRef,
                               yOffset: row * yStride * halfBytes,
+                              scratchGate: scratchGate,
+                              scratchUp: scratchUp,
                               scratchAct: scratchAct)
         }
         refCB.commit()
