@@ -351,6 +351,13 @@ public final class RemoteStreamingRepacker {
             let rel = "packed_experts/" + (layer.path as NSString).lastPathComponent
             try recordOutputFile(relativePath: rel, path: layer.path, progress: progress)
         }
+        // 0-expert placeholder files — record them so the manifest lists every
+        // layer file the layout references.
+        for layer in plan.layers where layer.expertsPerLayer == 0 {
+            try Task.checkCancellation()
+            let rel = "packed_experts/" + (layer.path as NSString).lastPathComponent
+            try recordOutputFile(relativePath: rel, path: layer.path, progress: progress)
+        }
 
         let layoutPath = ((paths.partialDirectory as NSString)
             .appendingPathComponent("packed_experts") as NSString)
@@ -457,6 +464,15 @@ public final class RemoteStreamingRepacker {
             try Task.checkCancellation()
             let descriptor = try Posix.openCreateRW(layer.path)
             try Posix.ftruncate(descriptor, path: layer.path, size: layer.fileSize)
+            try Posix.fsync(descriptor, path: layer.path)
+            close(descriptor)
+        }
+        // Dense-MLP layers keep a 0-byte placeholder so the layout's layer
+        // indexing stays valid without special-casing sparse layers at runtime.
+        for layer in plan.layers where layer.expertsPerLayer == 0 {
+            try Task.checkCancellation()
+            let descriptor = try Posix.openCreateRW(layer.path)
+            // 0-byte file — create then truncate is a no-op, fsync is enough.
             try Posix.fsync(descriptor, path: layer.path)
             close(descriptor)
         }

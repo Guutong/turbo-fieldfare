@@ -315,6 +315,10 @@ enum RepackPlanner {
             // Synthetic snapshots may legitimately have no routed experts.
             guard let gName = bundle["gate"], let uName = bundle["up"], let dName = bundle["down"] else {
                 if bundle.isEmpty {
+                    // Dense-MLP layer (Laguna layer 0) — no routed experts.
+                    // The layout keeps an entry with 0 experts so indexing by
+                    // layer number stays trivial; an empty placeholder file is
+                    // written alongside the real expert files.
                     layerPlans.append(LayerFilePlan(layerIndex: layer,
                                                     path: (layersDir as NSString).appendingPathComponent("layer_\(String(format: "%02d", layer)).bin"),
                                                     expertsPerLayer: 0,
