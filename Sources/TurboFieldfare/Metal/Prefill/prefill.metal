@@ -16,6 +16,8 @@ constant constexpr uint kPrefillMaxTileExperts = 16;
 constant constexpr float kPrefillGeluSqrt2OverPi = 0.7978845608028654f;
 constant constexpr float kPrefillGeluCubicCoeff = 0.044715f;
 constant uint FC_PREFILL_KV_RING_CAP [[function_constant(76)]];
+// FC_USE_SILU (function_constant 87) is declared once in dequant_int8.metal,
+// the first module of the combined library, and shared by every activation site.
 
 static inline float prefill_gelu_pytorch_tanh(float x) {
     const float x3 = x * x * x;
@@ -730,7 +732,7 @@ kernel void prefill_grouped_routed_moe_batched_phase1(
     gate_up_act_scratch[index] = half(gate);
     gate_up_act_scratch[row_elements + index] = half(up);
     gate_up_act_scratch[2u * row_elements + index] =
-        half(prefill_gelu_pytorch_tanh(gate) * up);
+        half( ((is_function_constant_defined(FC_USE_SILU) && FC_USE_SILU) ? silu(gate) : prefill_gelu_pytorch_tanh(gate)) * up );
 }
 
 kernel void prefill_grouped_routed_moe_batched_down(

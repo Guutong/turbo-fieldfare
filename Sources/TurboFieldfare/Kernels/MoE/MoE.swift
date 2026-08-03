@@ -71,8 +71,10 @@ final class MoE {
     private let routedArgEncoder: MTLArgumentEncoder
     private let reusableRoutedArgBuffer: MTLBuffer
 
-    init(context: MetalContext) throws {
+    init(context: MetalContext, useSilu: Bool = false) throws {
         let routerName = "router_gemv_gemma4_r4"
+        let siluConst: [MetalFunctionConstant] =
+            useSilu ? [MetalFunctionConstant(index: 87, value: .bool(true))] : []
         self.routerGemvPSO = try context.pipeline(
             routerName,
             constants: [],
@@ -85,22 +87,28 @@ final class MoE {
         self.routerSelectSpecializedPSO = try context.pipeline(
             "router_topk_select",
             constants: Self.realDecodeRouterConstants)
-        self.phase1U16PSO = try context.pipeline("moe_phase1_gate_up_act_u16load")
+        self.phase1U16PSO = try context.pipeline(
+            "moe_phase1_gate_up_act_u16load",
+            constants: siluConst)
         self.phase1U16SpecializedPSO = try context.pipeline(
             "moe_phase1_gate_up_act_u16load",
-            constants: Self.realDecodeMoEConstants)
-        self.phase1SubsetU16PSO = try context.pipeline("moe_phase1_gate_up_act_subset_u16load")
+            constants: Self.realDecodeMoEConstants + siluConst)
+        self.phase1SubsetU16PSO = try context.pipeline(
+            "moe_phase1_gate_up_act_subset_u16load",
+            constants: siluConst)
         self.phase1SubsetU16SpecializedPSO = try context.pipeline(
             "moe_phase1_gate_up_act_subset_u16load",
-            constants: Self.realDecodeMoEConstants)
+            constants: Self.realDecodeMoEConstants + siluConst)
         self.phase2ReducePSO = try context.pipeline("moe_phase2_down_reduce")
         self.phase2ReduceSpecializedPSO = try context.pipeline(
             "moe_phase2_down_reduce",
             constants: Self.realDecodeMoEConstants)
         self.phase1U16GenericPSO = try context.pipeline(
-            "moe_phase1_gate_up_act_u16load_generic")
+            "moe_phase1_gate_up_act_u16load_generic",
+            constants: siluConst)
         self.phase1SubsetU16GenericPSO = try context.pipeline(
-            "moe_phase1_gate_up_act_subset_u16load_generic")
+            "moe_phase1_gate_up_act_subset_u16load_generic",
+            constants: siluConst)
         self.phase2ReduceGenericPSO = try context.pipeline(
             "moe_phase2_down_reduce_generic")
 

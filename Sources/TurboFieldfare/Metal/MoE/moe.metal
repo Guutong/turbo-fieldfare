@@ -15,6 +15,8 @@ constant uint FC_MOE_D [[function_constant(0)]];
 constant uint FC_MOE_F [[function_constant(1)]];
 constant uint FC_MOE_TOP_K [[function_constant(2)]];
 constant bool FC_MOE_USE_FC [[function_constant(3)]];
+// FC_USE_SILU (function_constant 87) is declared once in dequant_int8.metal,
+// the first module of the combined library, and shared by every activation site.
 
 static inline uint router_fc_num_experts(constant uint& num_experts) {
     return (is_function_constant_defined(FC_ROUTER_USE_FC) &&
@@ -489,7 +491,7 @@ static inline void moe_phase1_gate_up_act_u16load_body(
 
     const float2 gu = moe_int4_gate_up_rows_simd_dev_vec_u16load(
         gW, gS, gB, uW, uS, uB, x, f, D, lane);
-    if (lane == 0) acts[slot * F + f] = half(gelu_pytorch_tanh(gu.x) * gu.y);
+    if (lane == 0) acts[slot * F + f] = half( ((is_function_constant_defined(FC_USE_SILU) && FC_USE_SILU) ? silu(gu.x) : gelu_pytorch_tanh(gu.x)) * gu.y );
 }
 
 static inline void moe_phase1_gate_up_act_subset_u16load_body(
@@ -525,7 +527,7 @@ static inline void moe_phase1_gate_up_act_subset_u16load_body(
 
     const float2 gu = moe_int4_gate_up_rows_simd_dev_vec_u16load(
         gW, gS, gB, uW, uS, uB, x, f, D, lane);
-    if (lane == 0) acts[slot * F + f] = half(gelu_pytorch_tanh(gu.x) * gu.y);
+    if (lane == 0) acts[slot * F + f] = half( ((is_function_constant_defined(FC_USE_SILU) && FC_USE_SILU) ? silu(gu.x) : gelu_pytorch_tanh(gu.x)) * gu.y );
 }
 
 kernel void moe_phase1_gate_up_act_u16load(
@@ -602,7 +604,7 @@ static inline void moe_phase1_gate_up_act_u16load_generic_body(
 
     const float2 gu = moe_int4_gate_up_rows_simd_dev_vec_u16load_generic(
         gW, gS, gB, uW, uS, uB, x, f, D, groupSize, lane);
-    if (lane == 0) acts[slot * F + f] = half(gelu_pytorch_tanh(gu.x) * gu.y);
+    if (lane == 0) acts[slot * F + f] = half( ((is_function_constant_defined(FC_USE_SILU) && FC_USE_SILU) ? silu(gu.x) : gelu_pytorch_tanh(gu.x)) * gu.y );
 }
 
 static inline void moe_phase1_gate_up_act_subset_u16load_generic_body(
@@ -639,7 +641,7 @@ static inline void moe_phase1_gate_up_act_subset_u16load_generic_body(
 
     const float2 gu = moe_int4_gate_up_rows_simd_dev_vec_u16load_generic(
         gW, gS, gB, uW, uS, uB, x, f, D, groupSize, lane);
-    if (lane == 0) acts[slot * F + f] = half(gelu_pytorch_tanh(gu.x) * gu.y);
+    if (lane == 0) acts[slot * F + f] = half( ((is_function_constant_defined(FC_USE_SILU) && FC_USE_SILU) ? silu(gu.x) : gelu_pytorch_tanh(gu.x)) * gu.y );
 }
 
 kernel void moe_phase1_gate_up_act_u16load_generic(

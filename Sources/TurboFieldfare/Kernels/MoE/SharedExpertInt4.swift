@@ -21,10 +21,12 @@ public enum SharedExpertError: Error, CustomStringConvertible {
 public final class SharedExpertInt4 {
     private let int4: DequantInt4GEMV
     private let geluMulPSO: MTLComputePipelineState
+    private let useSilu: Bool
 
-    public init(context: MetalContext) throws {
+    public init(context: MetalContext, useSilu: Bool = false) throws {
         self.int4 = try DequantInt4GEMV(context: context)
         self.geluMulPSO = try context.pipeline("gelu_mul_fp16")
+        self.useSilu = useSilu
     }
 
     public func encode(commandBuffer cb: MTLCommandBuffer,
@@ -79,6 +81,8 @@ public final class SharedExpertInt4 {
         encoder.setBuffer(scratchAct, offset: scratchActOffset, index: 2)
         var count = UInt32(intermediate)
         encoder.setBytes(&count, length: MemoryLayout<UInt32>.size, index: 3)
+        var siluFlag = useSilu
+        encoder.setBytes(&siluFlag, length: MemoryLayout<Bool>.size, index: 4)
         let width = min(geluMulPSO.maxTotalThreadsPerThreadgroup, 256)
         encoder.dispatchThreads(MTLSize(width: intermediate, height: 1, depth: 1),
                                 threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1))
@@ -103,11 +107,11 @@ public final class SharedExpertRuntime {
     private let implementation: Implementation
     public let weightBits: Int
 
-    public init(context: MetalContext, weightBits: Int) throws {
+    public init(context: MetalContext, weightBits: Int, useSilu: Bool = false) throws {
         self.weightBits = weightBits
         switch weightBits {
-        case 4: self.implementation = .int4(try SharedExpertInt4(context: context))
-        case 8: self.implementation = .int8(try SharedExpertInt8(context: context))
+        case 4: self.implementation = .int4(try SharedExpertInt4(context: context, useSilu: useSilu))
+        case 8: self.implementation = .int8(try SharedExpertInt8(context: context, useSilu: useSilu))
         default: throw SharedExpertError.unsupportedWeightBits(weightBits)
         }
     }

@@ -15,12 +15,10 @@ public struct SharedExpertProjection {
     public let biasesOffset:  Int
     public let rows: UInt32
     public let cols: UInt32
-    public let groupSize: Int
 
     public init(weights: MTLBuffer, scales: MTLBuffer, biases: MTLBuffer,
                 weightsOffset: Int = 0, scalesOffset: Int = 0, biasesOffset: Int = 0,
-                rows: UInt32, cols: UInt32,
-                groupSize: Int = Quantization.groupSize) {
+                rows: UInt32, cols: UInt32) {
         self.weights       = weights
         self.scales        = scales
         self.biases        = biases
@@ -29,7 +27,6 @@ public struct SharedExpertProjection {
         self.biasesOffset  = biasesOffset
         self.rows          = rows
         self.cols          = cols
-        self.groupSize     = groupSize
     }
 }
 
@@ -53,17 +50,20 @@ enum SharedExpertInt8Error: Error, CustomStringConvertible {
 ///
 ///     y = down(gelu_pytorch_tanh(gate(x)) * up(x))
 ///
-/// The gate, up, and activation work is fused for group-64 weights. The caller
-/// provides scratch activation buffer of length F, which can be reused across layers.
+/// The gate, up, and activation work is fused. The caller provides one FP16
+/// activation buffer of length F, which can be reused across layers.
 final class SharedExpertInt8 {
     private let int8: DequantInt8GEMV
     private let fusedGateUpActPSO: MTLComputePipelineState
     private let specializedFusedGateUpActPSO: MTLComputePipelineState?
-    private let geluMulPSO: MTLComputePipelineState
 
-    init(context: MetalContext) throws {
+    init(context: MetalContext, useSilu: Bool = false) throws {
         self.int8 = try DequantInt8GEMV(context: context)
-        self.fusedGateUpActPSO = try context.pipeline("shared_int8_gate_up_act_simd")
+        let siluConst: [MetalFunctionConstant] =
+            useSilu ? [MetalFunctionConstant(index: 87, value: .bool(true))] : []
+        self.fusedGateUpActPSO = try context.pipeline(
+            "shared_int8_gate_up_act_simd",
+            constants: siluConst)
         self.specializedFusedGateUpActPSO = try? context.pipeline(
             "shared_int8_gate_up_act_simd",
             constants: [
@@ -71,8 +71,7 @@ final class SharedExpertInt8 {
                 MetalFunctionConstant(index: 71, value: .uint32(2816)),
                 MetalFunctionConstant(index: 72, value: .bool(true)),
                 MetalFunctionConstant(index: 73, value: .uint32(8)),
-            ])
-        self.geluMulPSO = try context.pipeline("gelu_mul_fp16")
+            ] + siluConst)
     }
 
     func encode(commandBuffer cb: MTLCommandBuffer,
@@ -81,8 +80,6 @@ final class SharedExpertInt8 {
                        up:   SharedExpertInt8Proj,
                        down: SharedExpertInt8Proj,
                        y: MTLBuffer, yOffset: Int = 0,
-                       scratchGate: MTLBuffer? = nil, scratchGateOffset: Int = 0,
-                       scratchUp: MTLBuffer? = nil, scratchUpOffset: Int = 0,
                        scratchAct:  MTLBuffer, scratchActOffset:  Int = 0) throws {
         guard gate.rows == up.rows, gate.cols == up.cols else {
             throw SharedExpertInt8Error.dimensionMismatch(
@@ -113,10 +110,6 @@ final class SharedExpertInt8 {
                          xOffset: xOffset,
                          gate: gate,
                          up: up,
-                         scratchGate: scratchGate,
-                         scratchGateOffset: scratchGateOffset,
-                         scratchUp: scratchUp,
-                         scratchUpOffset: scratchUpOffset,
                          scratchAct: scratchAct,
                          scratchActOffset: scratchActOffset)
 
@@ -133,10 +126,6 @@ final class SharedExpertInt8 {
                              xOffset: Int = 0,
                              gate: SharedExpertInt8Proj,
                              up: SharedExpertInt8Proj,
-                             scratchGate: MTLBuffer? = nil,
-                             scratchGateOffset: Int = 0,
-                             scratchUp: MTLBuffer? = nil,
-                             scratchUpOffset: Int = 0,
                              scratchAct: MTLBuffer,
                              scratchActOffset: Int = 0) throws {
         guard gate.rows == up.rows, gate.cols == up.cols else {
@@ -154,52 +143,13 @@ final class SharedExpertInt8 {
                 "x offset \(xOffset) + needed \(inputBytes) exceeds length \(x.length)")
         }
 
-        if gate.groupSize == Quantization.groupSize && up.groupSize == Quantization.groupSize {
-            try encodeFusedGateUpAct(commandBuffer: cb,
-                                     x: x,
-                                     xOffset: xOffset,
-                                     gate: gate,
-                                     up: up,
-                                     scratchAct: scratchAct,
-                                     scratchActOffset: scratchActOffset)
-        } else {
-            guard let scratchGate = scratchGate, let scratchUp = scratchUp else {
-                throw SharedExpertInt8Error.scratchTooSmall(
-                    "scratchGate and scratchUp required for group size \(gate.groupSize)")
-            }
-            guard scratchGateOffset >= 0, scratchGateOffset + needBytes <= scratchGate.length,
-                  scratchUpOffset >= 0, scratchUpOffset + needBytes <= scratchUp.length else {
-                throw SharedExpertInt8Error.scratchTooSmall("need \(needBytes) bytes per intermediate buffer")
-            }
-            int8.encode(commandBuffer: cb,
-                        weights: gate.weights, weightsOffset: gate.weightsOffset,
-                        scales: gate.scales, scalesOffset: gate.scalesOffset,
-                        biases: gate.biases, biasesOffset: gate.biasesOffset,
-                        x: x, xOffset: xOffset,
-                        y: scratchGate, yOffset: scratchGateOffset,
-                        m: gate.rows, n: gate.cols,
-                        groupSize: gate.groupSize)
-            int8.encode(commandBuffer: cb,
-                        weights: up.weights, weightsOffset: up.weightsOffset,
-                        scales: up.scales, scalesOffset: up.scalesOffset,
-                        biases: up.biases, biasesOffset: up.biasesOffset,
-                        x: x, xOffset: xOffset,
-                        y: scratchUp, yOffset: scratchUpOffset,
-                        m: up.rows, n: up.cols,
-                        groupSize: up.groupSize)
-
-            guard let encoder = cb.makeComputeCommandEncoder() else { return }
-            encoder.setComputePipelineState(geluMulPSO)
-            encoder.setBuffer(scratchGate, offset: scratchGateOffset, index: 0)
-            encoder.setBuffer(scratchUp, offset: scratchUpOffset, index: 1)
-            encoder.setBuffer(scratchAct, offset: scratchActOffset, index: 2)
-            var count = gate.rows
-            encoder.setBytes(&count, length: MemoryLayout<UInt32>.size, index: 3)
-            let width = min(geluMulPSO.maxTotalThreadsPerThreadgroup, 256)
-            encoder.dispatchThreads(MTLSize(width: Int(gate.rows), height: 1, depth: 1),
-                                    threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1))
-            encoder.endEncoding()
-        }
+        try encodeFusedGateUpAct(commandBuffer: cb,
+                                 x: x,
+                                 xOffset: xOffset,
+                                 gate: gate,
+                                 up: up,
+                                 scratchAct: scratchAct,
+                                 scratchActOffset: scratchActOffset)
     }
 
     func encodeDown(commandBuffer cb: MTLCommandBuffer,
@@ -224,8 +174,7 @@ final class SharedExpertInt8 {
                     biases:  down.biases,  biasesOffset:  down.biasesOffset,
                     x: scratchAct, xOffset: scratchActOffset,
                     y: y, yOffset: yOffset,
-                    m: down.rows, n: down.cols,
-                    groupSize: down.groupSize)
+                    m: down.rows, n: down.cols)
     }
 
     private func encodeFusedGateUpAct(commandBuffer cb: MTLCommandBuffer,

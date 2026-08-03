@@ -285,9 +285,11 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         self.rms       = try RMSNorm(context: context)
         self.int4      = try DequantInt4GEMV(context: context)
         self.attention = try Attention(context: context, config: cfg)
+        let useSilu = cfg.hiddenActivation == "silu"
         self.shared    = try SharedExpertRuntime(context: context,
-                                                  weightBits: model.sharedExpertWeightBits)
-        self.moe       = try MoE(context: context)
+                                                  weightBits: model.sharedExpertWeightBits,
+                                                  useSilu: useSilu)
+        self.moe       = try MoE(context: context, useSilu: useSilu)
         self.fusionHead = try LMHeadChainInt4(context: context,
                                               maxD: cfg.hiddenSize,
                                               maxVocab: cfg.vocabSize)
@@ -323,8 +325,10 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         self.prefillRouter = try PrefillRouter(context: context)
         self.prefillSharedExpert = try PrefillSharedExpert(
             context: context,
-            weightBits: model.sharedExpertWeightBits)
-        self.prefillGroupedMoE = try PrefillGroupedRoutedMoE(context: context)
+            weightBits: model.sharedExpertWeightBits,
+            useSilu: useSilu)
+        self.prefillGroupedMoE = try PrefillGroupedRoutedMoE(context: context,
+                                                             useSilu: useSilu)
         self.prefillMoE = try PrefillMoE(context: context)
         self.prefillLayerTail = try PrefillLayerTail(context: context)
         self.prefillFinalRowHead = try PrefillFinalRowHeadInt4(context: context,
