@@ -221,7 +221,8 @@ final class SharedExpertInt8 {
                     biases:  down.biases,  biasesOffset:  down.biasesOffset,
                     x: scratchAct, xOffset: scratchActOffset,
                     y: y, yOffset: yOffset,
-                    m: down.rows, n: down.cols)
+                    m: down.rows, n: down.cols,
+                    groupSize: down.groupSize)
     }
 
     private func encodeFusedGateUpAct(commandBuffer cb: MTLCommandBuffer,
