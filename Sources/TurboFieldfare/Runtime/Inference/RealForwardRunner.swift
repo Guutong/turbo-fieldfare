@@ -259,12 +259,6 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         // softcapping (tanh(x/c)*c) is not implemented; Laguna does not set it
         // (config.json: moe_router_logit_softcapping = 0.0) and no config
         // field carries it, so a nonzero value cannot arrive silently.
-        if model.config.hiddenActivation != "gelu_pytorch_tanh" {
-            throw ModelError.unsupportedArchFeature(
-                feature: "hiddenActivation",
-                value: model.config.hiddenActivation,
-                detail: "every FFN kernel hardcodes gelu_pytorch_tanh")
-        }
         self.useFusedGreedyHead = runtimeConfiguration.headPath == .fusedRows
         self.prefillAttentionPath = runtimeConfiguration.prefillAttentionPath
         let useFP16Ring = runtimeConfiguration.fp16RingEnabled

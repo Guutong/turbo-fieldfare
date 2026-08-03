@@ -15,10 +15,12 @@ public struct SharedExpertProjection {
     public let biasesOffset:  Int
     public let rows: UInt32
     public let cols: UInt32
+    public let groupSize: Int
 
     public init(weights: MTLBuffer, scales: MTLBuffer, biases: MTLBuffer,
                 weightsOffset: Int = 0, scalesOffset: Int = 0, biasesOffset: Int = 0,
-                rows: UInt32, cols: UInt32) {
+                rows: UInt32, cols: UInt32,
+                groupSize: Int = Quantization.groupSize) {
         self.weights       = weights
         self.scales        = scales
         self.biases        = biases
@@ -27,6 +29,7 @@ public struct SharedExpertProjection {
         self.biasesOffset  = biasesOffset
         self.rows          = rows
         self.cols          = cols
+        self.groupSize     = groupSize
     }
 }
 
