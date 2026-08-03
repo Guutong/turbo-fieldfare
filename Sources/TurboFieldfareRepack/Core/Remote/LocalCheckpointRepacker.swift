@@ -31,7 +31,9 @@ enum LocalCheckpointRepacker {
         let arch = try ArchInfo.load(configPath: dstConfig)
 
         // Build RemoteFileInfo for each shard by stat-ing the local file.
-        let dummyCommit = "local-checkpoint-\(checkpointPath.hashValue)"
+        // Synthesize a 40-char hex commit so checkpoint identity validation
+        // passes (RemoteInstallCheckpoint.validate requires exactly 40 chars).
+        let dummyCommit = String(repeating: "0", count: 40)
         var files: [String: RemoteFileInfo] = [:]
         var headers: [Safetensors.Header] = []
         headers.reserveCapacity(metadata.shardFilenames.count)
