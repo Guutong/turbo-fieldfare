@@ -20,6 +20,9 @@ enum GTurboJSON {
         var router: Int
         var sharedExpert: Int
         var routedExpert: Int
+        /// Per-slot group size when it differs from plan.baseGroupSize
+        /// (Laguna: attention/embedding/router are g64 while base is 128).
+        var slotGroupSizes: [String: Int] = [:]
         /// Per-layer overrides for slots that vary by layer (Laguna attention).
         /// Keyed by slot name: "attention", "sharedExpert", etc.
         var perLayer: [String: [(layer: Int, weightBits: Int, groupSize: Int)]]?
@@ -97,11 +100,13 @@ enum GTurboJSON {
             // When perLayer overrides exist, derive the scalar groupSize from
             // them (all overrides should share the same groupSize when they
             // exist; if mixed, the first one defines the scalar). Otherwise
-            // use the plan's base group size.
+            // use any slot-specific override or the plan's base group size.
             let perLayer = bitWidths.perLayer?[slot] ?? []
             let slotGroupSize: Int
             if let first = perLayer.first {
                 slotGroupSize = first.groupSize
+            } else if let override = bitWidths.slotGroupSizes[slot] {
+                slotGroupSize = override
             } else {
                 slotGroupSize = plan.baseGroupSize
             }

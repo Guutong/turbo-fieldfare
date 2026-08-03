@@ -65,7 +65,7 @@ enum IndexLoader {
                         path: configPath,
                         detail: "quantization override \(k) group_size \(g) unsupported")
                 }
-                overrides[k] = QuantSpec(bits: bits)
+                overrides[k] = QuantSpec(bits: bits, groupSize: g)
             }
         } catch let e as RepackError {
             throw e
@@ -96,6 +96,6 @@ enum IndexLoader {
             ? String(name.dropLast(".weight".count))
             : name
         if let o = meta.bitsOverrides[stripped] { return o }
-        return QuantSpec(bits: meta.baseBits)
+        return QuantSpec(bits: meta.baseBits, groupSize: meta.baseGroupSize)
     }
 }

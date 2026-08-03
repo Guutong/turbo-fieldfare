@@ -676,46 +676,60 @@ public final class RemoteStreamingRepacker {
         // last-write-wins, so a checkpoint that quantizes one slot at several
         // bit widths is refused instead of silently recorded as whichever
         // tensor came last. See `RepackPlanner.uniformBits`.
-        func observations(where matches: (String) -> Bool) -> [(name: String, bits: Int)] {
+        func observations(where matches: (String) -> Bool) -> [(name: String, bits: Int, groupSize: Int)] {
             plan.resident.entries.compactMap { e in
                 guard matches(e.name), let s = e.quantSpec else { return nil }
-                return (e.name, s.bits)
+                return (e.name, s.bits, s.groupSize)
             }
         }
         // Both known families spell the embedding tensor identically;
         // RepackPlanner owns that name so it isn't duplicated here.
+        // Derive correct groupSize for each slot from observed quant specs;
+        // plan.baseGroupSize is the model-wide default (128 for Laguna) but
+        // individual slots may differ (embedding/router/attention are g64).
+        func slotGroupSize(_ obs: [(name: String, bits: Int, groupSize: Int)]) -> Int? {
+            guard let gs = obs.first?.groupSize, gs != plan.baseGroupSize else { return nil }
+            return gs
+        }
+
+        let embeddingObs = observations { $0 == RepackPlanner.embedTokensWeightName }
         if let b = try RepackPlanner.uniformBits(
             slot: "embedding",
-            observations: observations { $0 == RepackPlanner.embedTokensWeightName }) {
+            observations: embeddingObs.map { ($0.name, $0.bits) }) {
             bits.embedding = b
+            if let gs = slotGroupSize(embeddingObs) { bits.slotGroupSizes["embedding"] = gs }
         }
         // Attention may vary per layer (Laguna: 5-bit on 20 layers, 8-bit on
         // 28). When it does, emit perLayer overrides so the runtime can select
         // per layer; when uniform, keep the scalar path unchanged.
-        let attentionObservations = observations { $0.hasSuffix(".self_attn.q_proj.weight") }
+        let attentionObs = observations { $0.hasSuffix(".self_attn.q_proj.weight") }
         let attentionByLayer = RepackPlanner.perLayerAttentionBits(
-            observations: attentionObservations)
+            observations: attentionObs.map { ($0.name, $0.bits) })
+        let attnGroupSize = attentionObs.first?.groupSize ?? 64
         if let perLayer = attentionByLayer {
-            let distinct = Set(perLayer.map(\.weightBits))
-            // Majority width becomes the slot default; minority layers get
-            // perLayer overrides in the manifest.
             let counts = Dictionary(grouping: perLayer) { $0.weightBits }.mapValues { $0.count }
             let defaultBits = counts.max(by: { $0.value < $1.value })!.key
             bits.attention = defaultBits
+            if attnGroupSize != plan.baseGroupSize { bits.slotGroupSizes["attention"] = attnGroupSize }
             var overrides = bits.perLayer ?? [:]
-            overrides["attention"] = perLayer.filter { $0.weightBits != defaultBits }
+            overrides["attention"] = perLayer
+                .map { (layer: $0.layer, weightBits: $0.weightBits, groupSize: attnGroupSize) }
+                .filter { $0.weightBits != defaultBits }
             bits.perLayer = overrides
         } else if let b = try RepackPlanner.uniformBits(
             slot: "attention",
-            observations: attentionObservations) {
+            observations: attentionObs.map { ($0.name, $0.bits) }) {
             bits.attention = b
+            if attnGroupSize != plan.baseGroupSize { bits.slotGroupSizes["attention"] = attnGroupSize }
+        }
+        let routerObs = observations {
+            RepackPlanner.routerProbeSuffixes.contains(where: $0.hasSuffix)
         }
         if let b = try RepackPlanner.uniformBits(
             slot: "router",
-            observations: observations {
-                RepackPlanner.routerProbeSuffixes.contains(where: $0.hasSuffix)
-            }) {
+            observations: routerObs.map { ($0.name, $0.bits) }) {
             bits.router = b
+            if let gs = slotGroupSize(routerObs) { bits.slotGroupSizes["router"] = gs }
         }
         // The shared-expert probe additionally has to pick *which* suffix
         // identifies the slot, because the table's entries overlap: Laguna's
@@ -729,7 +743,7 @@ public final class RemoteStreamingRepacker {
             let matching = observations { $0.hasSuffix(probe) }
             guard !matching.isEmpty else { continue }
             if let b = try RepackPlanner.uniformBits(slot: "sharedExpert",
-                                                     observations: matching) {
+                                                     observations: matching.map { ($0.name, $0.bits) }) {
                 bits.sharedExpert = b
             }
             break
