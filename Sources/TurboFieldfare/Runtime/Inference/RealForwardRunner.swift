@@ -1245,7 +1245,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                             numExperts: UInt32(cfg.numExperts),
                             d: UInt32(D),
                             topK: UInt32(cfg.topKExperts),
-                            hiddenStrideElements: UInt32(D))
+                            hiddenStrideElements: UInt32(D),
+                            groupSize: UInt32(model.routerGroupSize))
             } else {
                 guard let routerPerExpertScale = views.routerPerExpertScale else {
                     throw ModelError.tensorNotFound(
@@ -1270,7 +1271,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                             d: UInt32(D),
                             topK: UInt32(cfg.topKExperts),
                             hiddenStrideElements: UInt32(D),
-                            groupSize: UInt32(Quantization.groupSize))
+                            groupSize: UInt32(model.routerGroupSize))
             }
 
                     cb.commit()
@@ -1861,7 +1862,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                         selectionBias: selectionBias.buffer,
                         selectionBiasOffset: Int(selectionBias.offset),
                         outIndices: outIndices, outWeights: outWeights,
-                        numExperts: UInt32(cfg.numExperts), d: D, topK: UInt32(cfg.topKExperts))
+                        numExperts: UInt32(cfg.numExperts), d: D, topK: UInt32(cfg.topKExperts),
+                        groupSize: UInt32(model.routerGroupSize))
                 } else {
                     guard let perExpertScale else { return }
                     moe.encodeRouterGemma4(commandBuffer: cb,
@@ -1873,7 +1875,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                         perExpertScale: perExpertScale.buffer,
                         perExpertScaleOffset: Int(perExpertScale.offset),
                         outIndices: outIndices, outWeights: outWeights,
-                        numExperts: UInt32(cfg.numExperts), d: D, topK: UInt32(cfg.topKExperts))
+                        numExperts: UInt32(cfg.numExperts), d: D, topK: UInt32(cfg.topKExperts),
+                        groupSize: UInt32(model.routerGroupSize))
                 }
             }
 
