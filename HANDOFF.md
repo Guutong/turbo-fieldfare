@@ -27,9 +27,9 @@ Laguna differs from Gemma in almost every dimension that was hardcoded:
 | Layer 0 MLP | MoE | dense |
 | Quantization | 4-bit, group 64 | mixed 4/5/6/8-bit, group 128 |
 
-Laguna is **not runnable yet**. See "What still blocks Laguna" below. It is listed in
-the model catalog with `isInstallable: false` so the gap is visible in one place
-rather than implied by absence.
+Laguna is **not runnable yet**. It now repacks to `.gturbo` and gets as far as
+`RealForwardRunner.init`, where it stops on a block-topology difference that no
+amount of format work will close — see "The real remaining blocker" below.
 
 ## What is done
 
@@ -411,6 +411,9 @@ fail.
 
 ## What still blocks Laguna
 
+All seven items below are done. They are **not** the whole list — see "The real
+remaining blocker" after them, which is what actually stops Laguna today.
+
 In rough dependency order:
 
 1. **Prefill (done).** `RealForwardRunner` prefill attention projections (`Q`, `K`, `V`, `O`) now resolve quantization `(weightBits, groupSize)` per layer via `attentionQuantByLayer[L]`. Standard 4-bit group-64 layers retain the 4-bit fast path (`prefillQMM` / `DequantInt4GEMV`), while non-4-bit or group-128 layers (e.g., 5-bit or 8-bit attention projections) dispatch via per-row sub-byte GEMV encoders (`DequantInt5GEMV` / `DequantInt8GEMV` / `DequantInt4GEMVGeneric`). Verified with `PrefillAttentionQuantTests`.
@@ -419,6 +422,125 @@ In rough dependency order:
 4. **YaRoP (done).** Implemented YaRN RoPE frequency scaling in `rope.metal`, `prefill.metal`, `fused.metal`, and `RoPE.swift` CPU reference, passing per-layer `ropeScaling` and `attentionFactor` score scaling in `RealForwardRunner`. Verified with `YaRoPTests.swift`.
 5. **Dense layer 0 (done).** Forward pass in `RealForwardRunner` branches on `cfg.isDenseMLP(L)`, dispatching dense MLP projections (`gate_proj`, `up_proj`, `down_proj`) for dense layers, sizing scratch buffers to `max(config.intermediateSize, config.denseMLPIntermediateSize)`, and skipping MoE routing. Verified with `DenseMLPLayerTests.swift`.
 6 & 7. **Catalog completion & fingerprinting (done).** Catalog entry `lagunaS2_1` in `SupportedModelSource.swift` is now pinned with revision `d785a9349850807a34ac0ac1c22c66b718e77881` and `sourceIndexSHA256` (`45709bf61be0398b4b34ed68845c80f8d2bab75f1f16d19e63c95e15571f0cc2`), with `isInstallable: true`. Verified with `SupportedModelSourceTests.swift`.
+
+## The real remaining blocker: Laguna's decoder block is a different shape
+
+The seven items above were the whole list, and they are all done — but the list was
+written before anyone got a Laguna checkpoint far enough to *load*. Doing that
+(see "Repacking from a local checkpoint" below) surfaced a blocker that was never on
+it: the runtime's per-layer topology is Gemma's sandwich-norm block, and Laguna is a
+plain pre-norm block. This is not a naming mismatch that an alias can paper over —
+the two blocks compute different things.
+
+Gemma 4, as `RealForwardRunner` implements it:
+
+```
+h1 = rmsnorm(dense(pre_feedforward_layernorm(x)),   post_feedforward_layernorm_1)
+h2 = rmsnorm(routed(pre_feedforward_layernorm_2(x)), post_feedforward_layernorm_2)
+h  = x + layer_scalar * rmsnorm(h1 + h2, post_feedforward_layernorm)
+```
+
+Laguna (`LagunaDecoderLayer.forward`, `modeling_laguna.py:490`):
+
+```
+h = x + attn(input_layernorm(x))
+h = h + mlp(post_attention_layernorm(h))
+```
+
+where `mlp` is `shared_expert(u) + 2.5 * routed(u)` on a *single* normed input `u`,
+or a plain dense MLP on layer 0. Note that Laguna's `post_attention_layernorm` is
+Qwen-convention: it normalizes the *residual before the MLP*, not the attention
+output. Gemma's same-named tensor normalizes the attention output. Do not assume the
+names line up.
+
+Eight per-layer tensors the runtime demands do not exist in the checkpoint at all —
+verified against `model.safetensors.index.json`, not inferred:
+
+```
+pre_feedforward_layernorm[.weight]     post_feedforward_layernorm[_1,_2][.weight]
+router.scale                           router.per_expert_scale
+layer_scalar
+```
+
+`Model.postFFN1` is the accessor that actually throws first
+(`no IndexEntry named ...post_feedforward_layernorm_1.weight`), from
+`RealForwardRunner.init` building `sharedExpertProjections`.
+
+Two more divergences sit behind that one and will not announce themselves — they
+produce plausible wrong numbers rather than an error:
+
+- **Router scoring.** `router_topk_gemma4` does softmax over top-k and applies
+  `per_expert_scale`. `LagunaTopKRouter` (`modeling_laguna.py:169`) does **sigmoid**
+  over all experts, adds `e_score_correction_bias` *for selection only*, then
+  renormalizes the unbiased gathered weights (`norm_topk_prob: true`). The repacker
+  already packs `mlp.gate.e_score_correction_bias` (`RepackPlanner.swift:618`); the
+  runtime has no consumer for it and no sigmoid path.
+- **Activation.** Every activation in `Sources/TurboFieldfare/Metal/` is hardcoded
+  `gelu_pytorch_tanh` (`moe.metal`, `prefill.metal`, `dequant_int8.metal`,
+  `utility.metal`). Laguna uses **silu**. Worse, the manifest currently *says* gelu:
+  `ArchInfo.swift:177` reads `hidden_activation` then `hidden_act`, and Laguna's
+  `config.json` carries neither — `silu` is a Python-side default in
+  `configuration_laguna.py:147`. So `hiddenActivation` is carried and validated but
+  never reaches a kernel, and its value is wrong for Laguna besides.
+
+### Suggested shape of the fix
+
+Laguna's block maps onto the existing kernel slots cleanly if the norms can be
+*skipped* rather than substituted — a unit-weight tensor is not equivalent, since
+RMSNorm still divides by the RMS:
+
+| Gemma slot | Laguna |
+|---|---|
+| `post_attention_layernorm` (on attn out) | skip |
+| `pre_feedforward_layernorm`, `_2` | both = `post_attention_layernorm` |
+| `post_feedforward_layernorm`, `_1`, `_2` | skip |
+| `layer_scalar` | 1.0 |
+| routed branch | scale by `routedScalingFactor` (2.5, already in arch) |
+
+So the work is a norm-topology flag on `ArchConfig` (`sandwich` vs `preNorm`) driving
+function-constant variants of the four fused kernels — `FusedPostAttentionSetup`,
+`FusedLayerTail`, and their prefill twins `PrefillPostAttentionSetup` /
+`PrefillLayerTail` — plus a sigmoid router variant in decode and prefill, plus silu
+variants of the four activation sites. Gemma must stay bit-identical, so the flag
+defaults to `sandwich` and the existing kernels must be reachable unchanged.
+
+## Repacking from a local checkpoint
+
+`TurboFieldfareRepack --local-checkpoint <dir>` repacks from an already-downloaded HF
+snapshot instead of streaming from the Hub, which is what made the above reachable
+without re-downloading 65 GB per attempt.
+
+`LocalCheckpointRepacker` supplies the two things the pipeline gets from HTTP: a
+`RemoteSnapshot` (metadata copied from disk, shard headers parsed with `pread`) and a
+`SourceByteProvider` that `pread`s ranges from local shards. `RepackPlanner`,
+`RangeCopyPlanner`, and `WriterCore` are untouched — `SourceByteProvider` was already
+the right seam. `resolvedCommit` is synthesized as 40 zeros because
+`RemoteInstallCheckpoint.validate` requires exactly 40 hex chars.
+
+Getting Laguna through the repacker turned up a run of format bugs, all fixed:
+
+- `QuantSpec` carried only `bits`, so `writeManifest` fell back to
+  `plan.baseGroupSize` (128) for every slot. Laguna's attention, embedding, and router
+  tensors are group **64** while the base is 128. `QuantSpec` now carries `groupSize`
+  and the manifest emits it per slot.
+- Laguna's attention bit width varies by layer (5-bit and 8-bit). The uniformity
+  refusal became `perLayer` override emission.
+- `validateQuant` admitted only 4-bit attention and 4-bit group-64 router.
+- Layer 0 is dense, so it has no expert file. `layout.json` keeps a 0-expert entry so
+  `layers` stays indexable by layer number, and a 0-byte placeholder file is written
+  beside the real ones; readers and both validators treat an empty expert list as the
+  dense marker.
+- `layout.json` is 47 x 256 x 8 entries and outgrew the 16 MB metadata cap. It now has
+  its own 128 MB cap and is written compact (it is machine-read only), and its
+  top-level `expertsPerLayer` is taken from the first layer that has experts rather
+  than from layer 0, which has none.
+
+### Reclaiming disk space between attempts
+
+Each failed repack leaves an APFS Time Machine local snapshot that `df` does not
+report, so `df` will claim tens of GB less free than the Finder does. `diskutil info`
+lists them; `sudo tmutil deletelocalsnapshots /` reclaims them. This bit several
+attempts in a row before it was diagnosed.
 
 ## App / UI layer (done)
 
