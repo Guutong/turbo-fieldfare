@@ -117,18 +117,12 @@ public enum SupportedModelSource {
         displayName: "Laguna-S-2.1 4-bit",
         shortDisplayName: "Laguna-S 2.1",
         repoID: "mlx-community/Laguna-S-2.1-oQ4e",
-        revision: "",
-        sourceIndexSHA256: "",
+        revision: "d785a9349850807a34ac0ac1c22c66b718e77881",
+        sourceIndexSHA256:
+            "45709bf61be0398b4b34ed68845c80f8d2bab75f1f16d19e63c95e15571f0cc2",
         approximateDownloadBytes: 64_130_000_000,
         installedBytes: 64_130_000_000,
-        isInstallable: false,
-        installBlockedReason:
-            "Not yet runnable: the routed-expert path handles this checkpoint's "
-            + "group-128 4-bit weights and the manifest can now describe its "
-            + "per-layer quantization, but no attention kernel decodes the "
-            + "5-bit weights it uses on 20 layers. Per-head attention gating "
-            + "and YaRoP scaling are also unwired, and no revision or source "
-            + "fingerprint has been pinned.")
+        isInstallable: true)
 
     public static let all: [ModelSource] = [gemma4_26B_A4B, lagunaS2_1]
 

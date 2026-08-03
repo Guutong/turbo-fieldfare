@@ -240,11 +240,10 @@ public enum ManifestReader {
         let defaultGroup: Set<Int> = [Quantization.groupSize]
         let int4GenericGroups: Set<Int> = [Quantization.groupSize, 128]
         let slots: [(String, ManifestQuantSlot, Set<Int>, Set<Int>)] = [
-            ("embedding", quant.embedding, [4], int4GenericGroups),
+            ("embedding", quant.embedding, [4, 8], int4GenericGroups),
             ("attention", quant.attention, [4], int4GenericGroups),
-            ("router", quant.router, [8], defaultGroup),
-            // sharedExpert still feeds the group-64-only shared-MLP kernel.
-            ("sharedExpert", quant.sharedExpert, [4, 8], defaultGroup),
+            ("router", quant.router, [4, 8], defaultGroup),
+            ("sharedExpert", quant.sharedExpert, [4, 8], int4GenericGroups),
             ("routedExpert", quant.routedExpert, [4], int4GenericGroups),
         ]
         for (name, slot, allowedBits, allowedGroupSizes) in slots {

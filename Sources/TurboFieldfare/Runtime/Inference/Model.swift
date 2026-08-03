@@ -34,6 +34,7 @@ public struct Model {
     public var modelID: String { manifest.modelID }
     public var sourceSnapshotHash: String? { manifest.sourceSnapshotHash }
     public var sharedExpertWeightBits: Int { manifest.quant?.sharedExpert.weightBits ?? 8 }
+    public var sharedExpertGroupSize: Int { manifest.quant?.sharedExpert.groupSize ?? Quantization.groupSize }
 
     /// Quantization of this layer's attention projections.
     ///

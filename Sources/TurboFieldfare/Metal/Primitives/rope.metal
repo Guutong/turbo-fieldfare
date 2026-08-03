@@ -29,16 +29,43 @@ static inline uint rope_rotated_pairs(constant uint& runtime_value) {
         : runtime_value;
 }
 
+struct RopeScalingParams {
+    uint enabled;
+    float factor;
+    float original_max_position_embeddings;
+    float beta_fast;
+    float beta_slow;
+};
+
+static inline float compute_rope_freq(
+    uint pair,
+    uint frequency_divisor,
+    float theta,
+    RopeScalingParams scaling
+) {
+    const float exponent = -float(2u * pair) / float(frequency_divisor);
+    const float base_freq = pow(theta, exponent);
+    if (scaling.enabled == 0u || scaling.factor <= 1.0f || scaling.original_max_position_embeddings <= 0.0f) {
+        return base_freq;
+    }
+    const float two_pi = 6.28318530717958647692f;
+    const float wavelength_ratio = two_pi / (base_freq * scaling.original_max_position_embeddings);
+    const float gamma = clamp((wavelength_ratio - scaling.beta_fast) / (scaling.beta_slow - scaling.beta_fast), 0.0f, 1.0f);
+    const float alpha = (1.0f - gamma) + (gamma / scaling.factor);
+    return base_freq * alpha;
+}
+
 static inline void apply_neox_pair(
     device half* head,
     uint pair,
     uint half_dim,
     uint frequency_divisor,
     float position,
-    float theta
+    float theta,
+    RopeScalingParams scaling
 ) {
-    const float exponent = -float(2u * pair) / float(frequency_divisor);
-    const float angle = position * pow(theta, exponent);
+    const float freq = compute_rope_freq(pair, frequency_divisor, theta, scaling);
+    const float angle = position * freq;
     const float cosine = cos(angle);
     const float sine = sin(angle);
     const uint lower = pair;
@@ -55,6 +82,7 @@ kernel void rope_default_neox(
     constant uint& head_dim [[buffer(2)]],
     constant uint& num_heads [[buffer(3)]],
     constant float& theta [[buffer(4)]],
+    constant RopeScalingParams& scaling [[buffer(5)]],
     uint3 gid [[thread_position_in_grid]]
 ) {
     const uint pair = gid.x;
@@ -69,7 +97,7 @@ kernel void rope_default_neox(
         + token_index * heads * dimension
         + head_index * dimension;
     apply_neox_pair(head, pair, half_dimension, dimension,
-                    float(position), theta);
+                    float(position), theta, scaling);
 }
 
 kernel void rope_proportional_neox(
@@ -79,6 +107,7 @@ kernel void rope_proportional_neox(
     constant uint& num_heads [[buffer(3)]],
     constant float& theta [[buffer(4)]],
     constant uint& rotated_pairs [[buffer(5)]],
+    constant RopeScalingParams& scaling [[buffer(6)]],
     uint3 gid [[thread_position_in_grid]]
 ) {
     const uint pair = gid.x;
@@ -94,5 +123,6 @@ kernel void rope_proportional_neox(
         + token_index * heads * dimension
         + head_index * dimension;
     apply_neox_pair(head, pair, half_dimension, dimension,
-                    float(position), theta);
+                    float(position), theta, scaling);
 }
+

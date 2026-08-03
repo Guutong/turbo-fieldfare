@@ -362,7 +362,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                  scalesOffset: Int(view.scaleOffset),
                                  biasesOffset: Int(view.biasOffset),
                                  rows: rows,
-                                 cols: cols)
+                                 cols: cols,
+                                 groupSize: model.sharedExpertGroupSize)
         }
         var sharedViews: [LayerSharedExpertProjections] = []
         sharedViews.reserveCapacity(cfg.numLayers)
@@ -370,10 +371,13 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             let gate = try model.sharedExpertGate(layer: L)
             let up = try model.sharedExpertUp(layer: L)
             let down = try model.sharedExpertDown(layer: L)
+            let layerF = cfg.isDenseMLP(atLayer: L)
+                ? (cfg.denseMLPIntermediateSize > 0 ? cfg.denseMLPIntermediateSize : cfg.intermediateSize)
+                : cfg.intermediateSize
             sharedViews.append(LayerSharedExpertProjections(
-                gate: sharedProj(gate, rows: UInt32(F), cols: UInt32(D)),
-                up: sharedProj(up, rows: UInt32(F), cols: UInt32(D)),
-                down: sharedProj(down, rows: UInt32(D), cols: UInt32(F)),
+                gate: sharedProj(gate, rows: UInt32(layerF), cols: UInt32(D)),
+                up: sharedProj(up, rows: UInt32(layerF), cols: UInt32(D)),
+                down: sharedProj(down, rows: UInt32(D), cols: UInt32(layerF)),
                 postF1: try model.postFFN1(layer: L)))
         }
         self.sharedExpertProjections = sharedViews
@@ -386,18 +390,20 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         let invSqrtD = Float(1.0) / Float(D).squareRoot()
         let dInts = D
         for L in 0..<cfg.numLayers {
-            let scaleView = try model.routerScale(layer: L)
             guard let buf = device.makeBuffer(length: dInts * MemoryLayout<UInt16>.size,
                                               options: .storageModeShared) else {
                 throw ModelError.residentBufferWrapFailed
             }
-            let src = scaleView.buffer.contents()
-                .advanced(by: Int(scaleView.offset))
-                .assumingMemoryBound(to: UInt16.self)
-            let dst = buf.contents().assumingMemoryBound(to: UInt16.self)
-            for i in 0..<dInts {
-                let v = Quantization.bf16ToFloat(src[i]) * invSqrtD
-                dst[i] = Quantization.bf16Bits(v)
+            if !cfg.isDenseMLP(atLayer: L) {
+                let scaleView = try model.routerScale(layer: L)
+                let src = scaleView.buffer.contents()
+                    .advanced(by: Int(scaleView.offset))
+                    .assumingMemoryBound(to: UInt16.self)
+                let dst = buf.contents().assumingMemoryBound(to: UInt16.self)
+                for i in 0..<dInts {
+                    let v = Quantization.bf16ToFloat(src[i]) * invSqrtD
+                    dst[i] = Quantization.bf16Bits(v)
+                }
             }
             buf.label = "effective_scale.L\(L)"
             perLayer.append(buf)
@@ -626,12 +632,13 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             let layerScalar: TensorView
             let qNorm: TensorView
             let kNorm: TensorView
-            let router: TensorView
-            let routerPerExpertScale: TensorView
+            let router: TensorView?
+            let routerPerExpertScale: TensorView?
         }
 
         let layerViews = try (0..<cfg.numLayers).map { L in
             let isFull = cfg.fullAttentionLayerMask[L] != 0
+            let isDense = cfg.isDenseMLP(atLayer: L)
             return LayerPrefillQKVViews(
                 inputNorm: try model.inputNorm(layer: L),
                 q: try model.qProj(layer: L),
@@ -646,8 +653,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 layerScalar: try model.layerScalar(layer: L),
                 qNorm: try model.qNorm(layer: L),
                 kNorm: try model.kNorm(layer: L),
-                router: try model.router(layer: L),
-                routerPerExpertScale: try model.routerPerExpertScale(layer: L))
+                router: isDense ? nil : (try model.router(layer: L)),
+                routerPerExpertScale: isDense ? nil : (try model.routerPerExpertScale(layer: L)))
         }
 
         let tokenIDs = tokens.map { UInt32(bitPattern: $0) }
@@ -863,7 +870,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                             outScale: sqrtHidden)
 
         for L in 0..<cfg.numLayers {
-            model.beginOpeningRoutedExpertStreamer(layer: L)
+            if !cfg.isDenseMLP(atLayer: L) {
+                model.beginOpeningRoutedExpertStreamer(layer: L)
+            }
             let views = layerViews[L]
             let isFull = cfg.fullAttentionLayerMask[L] != 0
             let headDim = isFull ? cfg.fullHeadDim : cfg.headDim
@@ -913,6 +922,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                        xStrideElements: D,
                                        yStrideElements: kvDim)
 
+            let scaling = cfg.ropeScaling(atLayer: L)
             let rotatedPairs = isFull
                 ? UInt32(Double(cfg.fullHeadDim) * cfg.partialRotaryFactor / 2.0)
                 : UInt32(headDim / 2)
@@ -933,7 +943,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                        kvTokenStrideElements: UInt32(kvDim),
                                        theta: isFull ? Float(cfg.fullRopeTheta) : Float(cfg.ropeTheta),
                                        rotatedPairs: rotatedPairs,
-                                       eps: eps)
+                                       eps: eps,
+                                       scaling: scaling)
 
             if let kv {
                 let bytes = t * kvDim * MemoryLayout<Float16>.stride
@@ -946,6 +957,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                          valueSource: scratch.vStage,
                                          bytesPerToken: bytes / t)
             }
+            let attnScale = isFull ? Float(scaling?.attentionFactor ?? 1.0) : 1.0
             let params = PrefillAttentionParams(
                     startPosition: UInt32(startPosition),
                     queryCount: UInt32(t),
@@ -957,7 +969,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     kvTokenStrideElements: UInt32(kvDim),
                     qTokenStrideElements: UInt32(qDim),
                     oTokenStrideElements: UInt32(qDim),
-                    scale: 1.0)
+                    scale: attnScale)
             if let kv {
                     let keyBuffer = kv.keyBuffer(layer: L, validTokenCount: startPosition + t)
                     let valueBuffer = kv.valueBuffer(layer: L, validTokenCount: startPosition + t)
@@ -1008,18 +1020,103 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                             routedStrideElements: UInt32(D),
                                             routerStrideElements: UInt32(D),
                                             eps: eps)
+
+            if cfg.isDenseMLP(atLayer: L) {
+                cb.commit()
+                waitForCompletion(cb)
+                if let error = cb.error {
+                    throw error
+                }
+
+                guard let sharedCB = ctx.queue.makeCommandBuffer() else {
+                    throw ModelError.residentBufferWrapFailed
+                }
+                let sharedProj = sharedExpertProjections[L]
+                let layerF = cfg.isDenseMLP(atLayer: L)
+                    ? (cfg.denseMLPIntermediateSize > 0 ? cfg.denseMLPIntermediateSize : cfg.intermediateSize)
+                    : cfg.intermediateSize
+                try prefillSharedExpert.encodeBlock(commandBuffer: sharedCB,
+                                                    x: scratch.denseX,
+                                                    y: scratch.h1,
+                                                    gate: sharedProj.gate,
+                                                    up: sharedProj.up,
+                                                    down: sharedProj.down,
+                                                    scratchGate: scratch.sharedGateScratch,
+                                                    scratchUp: scratch.sharedUpScratch,
+                                                    scratchAct: scratch.sharedActScratch,
+                                                    queryCount: t,
+                                                    d: D,
+                                                    intermediate: layerF,
+                                                    xStrideElements: D,
+                                                    yStrideElements: D)
+                prefillRMS.encodeBF16W(commandBuffer: sharedCB,
+                                       x: scratch.h1,
+                                       weight: sharedProj.postF1.buffer,
+                                       weightOffset: Int(sharedProj.postF1.offset),
+                                       out: scratch.h1,
+                                       t: UInt32(t),
+                                       d: UInt32(D),
+                                       eps: eps)
+                sharedCB.commit()
+                waitForCompletion(sharedCB)
+                if let error = sharedCB.error {
+                    throw error
+                }
+
+                guard let tailCB = ctx.queue.makeCommandBuffer() else {
+                    throw ModelError.residentBufferWrapFailed
+                }
+                if let blit = tailCB.makeBlitCommandEncoder() {
+                    blit.fill(buffer: scratch.h2, range: 0..<(t * D * MemoryLayout<Float16>.stride), value: 0)
+                    blit.endEncoding()
+                }
+                let scalarBits = views.layerScalar.buffer.contents()
+                    .advanced(by: Int(views.layerScalar.offset))
+                    .assumingMemoryBound(to: UInt16.self)[0]
+                prefillLayerTail.encode(commandBuffer: tailCB,
+                                        h2: scratch.h2,
+                                        h1: scratch.h1,
+                                        hidden: scratch.hidden,
+                                        postFFN2Weight: views.postFFN2.buffer,
+                                        postFFN2WeightOffset: Int(views.postFFN2.offset),
+                                        postFFNWeight: views.postFFN.buffer,
+                                        postFFNWeightOffset: Int(views.postFFN.offset),
+                                        queryCount: UInt32(t),
+                                        d: UInt32(D),
+                                        h2StrideElements: UInt32(D),
+                                        h1StrideElements: UInt32(D),
+                                        hiddenStrideElements: UInt32(D),
+                                        eps: eps,
+                                        layerScalar: Quantization.bf16ToFloat(scalarBits))
+                tailCB.commit()
+                waitForCompletion(tailCB)
+                if let error = tailCB.error {
+                    throw error
+                }
+                if L + 1 < cfg.numLayers {
+                    guard let nextCB = ctx.queue.makeCommandBuffer() else {
+                        throw ModelError.residentBufferWrapFailed
+                    }
+                    cb = nextCB
+                }
+                continue
+            }
+
+            guard let router = views.router, let routerPerExpertScale = views.routerPerExpertScale else {
+                throw ModelError.tensorNotFound(name: "language_model.model.layers.\(L).router.proj.weight")
+            }
             prefillRouter.encodeGemma4Block(
                         commandBuffer: cb,
-                        weights: views.router.buffer,
-                        weightsOffset: Int(views.router.offset),
-                        scales: views.router.buffer,
-                        scalesOffset: Int(views.router.scaleOffset),
-                        biases: views.router.buffer,
-                        biasesOffset: Int(views.router.biasOffset),
+                        weights: router.buffer,
+                        weightsOffset: Int(router.offset),
+                        scales: router.buffer,
+                        scalesOffset: Int(router.scaleOffset),
+                        biases: router.buffer,
+                        biasesOffset: Int(router.biasOffset),
                         hidden: scratch.routerX,
                         effectiveScale: effectiveScaleBuffers[L],
-                        perExpertScale: views.routerPerExpertScale.buffer,
-                        perExpertScaleOffset: Int(views.routerPerExpertScale.offset),
+                        perExpertScale: routerPerExpertScale.buffer,
+                        perExpertScaleOffset: Int(routerPerExpertScale.offset),
                         outIndices: scratch.routeIDs,
                         outWeights: scratch.routeWeights,
                         queryCount: UInt32(t),
@@ -1416,7 +1513,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         }
 
         for L in 0..<cfg.numLayers {
-            let isFull = cfg.fullAttentionLayerMask[L] != 0
+            let isDense  = cfg.isDenseMLP(atLayer: L)
+            let isFull   = cfg.fullAttentionLayerMask[L] != 0
             let headDimL = isFull ? cfg.fullHeadDim : cfg.headDim
             let numKVL   = isFull ? cfg.numFullKVHeads : cfg.numKVHeads
             let qDim     = UInt32(cfg.numHeads * headDimL)
@@ -1439,8 +1537,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             let sharedProj = sharedExpertProjections[L]
             let postF2   = try model.postFFN2(layer: L)
             let postF    = try model.postFFN(layer: L)
-            let routerW  = try model.router(layer: L)
-            let perExpertScale = try model.routerPerExpertScale(layer: L)
+            let routerW  = isDense ? nil : (try model.router(layer: L))
+            let perExpertScale = isDense ? nil : (try model.routerPerExpertScale(layer: L))
             let layerScalarView = try model.layerScalar(layer: L)
 
             let tCb1Start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
@@ -1509,6 +1607,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                     n: D)
             }
 
+            let scaling = cfg.ropeScaling(atLayer: L)
             let gQKVEpilogue: (MTLCommandBuffer) -> Void = { [self] cb in
                 let rotated = isFull
                     ? UInt32(Double(cfg.fullHeadDim) * cfg.partialRotaryFactor / 2.0)
@@ -1529,9 +1628,11 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                         position: UInt32(position),
                                         theta: isFull ? Float(cfg.fullRopeTheta) : Float(cfg.ropeTheta),
                                         rotatedPairs: rotated,
-                                        eps: eps)
+                                        eps: eps,
+                                        scaling: scaling)
             }
 
+            let attnScale = isFull ? Float(scaling?.attentionFactor ?? 1.0) : 1.0
             let gAttention: (MTLCommandBuffer) -> Void = { [self] cb in
                 guard kv != nil else {
                     preconditionFailure("FP16 attention requires an FP16 KV cache")
@@ -1546,7 +1647,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                          numQHeads: UInt32(cfg.numHeads),
                                          numKVHeads: UInt32(numKVL),
                                          seqLen: seqLen,
-                                         scale: 1.0)
+                                         scale: attnScale)
                 } else {
                     let ringCapacity = kv?.ringCapacity(layer: L) ?? 0
                     let activeRingCapacity = ringCapacity > 0 && Int(seqLen) > ringCapacity
@@ -1592,6 +1693,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             }
 
             let gRouter: (MTLCommandBuffer) -> Void = { [self] cb in
+                guard let routerW, let perExpertScale else { return }
                 moe.encodeRouterGemma4(commandBuffer: cb,
                     weights: routerW.buffer, weightsOffset: Int(routerW.offset),
                     scales:  routerW.buffer, scalesOffset:  Int(routerW.scaleOffset),
@@ -1611,8 +1713,76 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             gAttention(cb)
             gOProj(cb)
             gPostAttnSetup(cb)
-            gRouter(cb)
+            if !isDense {
+                gRouter(cb)
+            }
             cb.commit()
+
+            if isDense {
+                let tWait = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+                waitForCompletion(cb)
+                let waitNanos = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tWait
+                if let pending = pendingRoutedCommand {
+                    finishPendingRoutedCommand(pending, waitIfNeeded: false)
+                    pendingRoutedCommand = nil
+                }
+                totalCb1Nanos &+= clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tCb1Start - waitNanos
+
+                memset(h2Buf.contents(), 0, h2Buf.length)
+
+                let gSharedFFN: (MTLCommandBuffer) -> Void = { [self] cb in
+                    try! shared.encode(commandBuffer: cb,
+                                       x: denseX,
+                                       gate: sharedProj.gate,
+                                       up: sharedProj.up,
+                                       down: sharedProj.down,
+                                       y: h1Buf,
+                                       scratchGate: denseScratchGate,
+                                       scratchUp: denseScratchUp,
+                                       scratchAct: denseScratchAct)
+                }
+                let gSharedNorm: (MTLCommandBuffer) -> Void = { [self] cb in
+                    rms.encodeBF16W(commandBuffer: cb, x: h1Buf,
+                                    weight: sharedProj.postF1.buffer,
+                                    weightOffset: Int(sharedProj.postF1.offset),
+                                    out: h1Buf, d: D, eps: eps)
+                }
+                let sharedCB = ctx.queue.makeCommandBuffer()!
+                gSharedFFN(sharedCB)
+                gSharedNorm(sharedCB)
+                sharedCB.commit()
+
+                let scalarPtr = layerScalarView.buffer.contents()
+                    .advanced(by: Int(layerScalarView.offset))
+                    .assumingMemoryBound(to: UInt16.self)
+                let layerScalar = Quantization.bf16ToFloat(scalarPtr[0])
+
+                let gTail: (MTLCommandBuffer) -> Void = { [self] cb in
+                    fusedTail.encode(commandBuffer: cb,
+                                     h2: h2Buf,
+                                     h1: h1Buf,
+                                     hidden: hidden,
+                                     postFFN2Weight: postF2.buffer,
+                                     postFFN2WeightOffset: Int(postF2.offset),
+                                     postFFNWeight: postF.buffer,
+                                     postFFNWeightOffset: Int(postF.offset),
+                                     d: D,
+                                     eps: eps,
+                                     layerScalar: layerScalar)
+                }
+                let tCb2Start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+                let denseTailCB = ctx.queue.makeCommandBuffer()!
+                gTail(denseTailCB)
+                denseTailCB.commit()
+                precondition(pendingRoutedCommand == nil,
+                             "routed command-buffer pipeline drained before queuing the next layer")
+                pendingRoutedCommand = PendingRoutedCommand(
+                    cb: denseTailCB,
+                    sharedCB: sharedCB,
+                    phase1HitCB: nil,
+                    encodeAndCommitNanos: clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tCb2Start)
+                continue
+            }
             let tWait = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
             waitForCompletion(cb)
             let waitNanos = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tWait

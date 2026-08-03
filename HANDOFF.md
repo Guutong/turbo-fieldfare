@@ -414,11 +414,11 @@ fail.
 In rough dependency order:
 
 1. **Prefill (done).** `RealForwardRunner` prefill attention projections (`Q`, `K`, `V`, `O`) now resolve quantization `(weightBits, groupSize)` per layer via `attentionQuantByLayer[L]`. Standard 4-bit group-64 layers retain the 4-bit fast path (`prefillQMM` / `DequantInt4GEMV`), while non-4-bit or group-128 layers (e.g., 5-bit or 8-bit attention projections) dispatch via per-row sub-byte GEMV encoders (`DequantInt5GEMV` / `DequantInt8GEMV` / `DequantInt4GEMVGeneric`). Verified with `PrefillAttentionQuantTests`.
-2. **8-bit at group 128 for `sharedExpert` (done).** Widened `validateQuant` in `ManifestReader.swift` and `IndexLoader.swift` to allow 8-bit/4-bit group 128/64 for `sharedExpert`, `embedding`, `attention`, and `router`.
+2. **8-bit at group 128 for `sharedExpert` (done).** Widened `validateQuant` in `ManifestReader.swift` and `IndexLoader.swift` to allow 8-bit/4-bit group 128/64 for `sharedExpert`, `embedding`, `attention`, and `router`. Implemented sub-byte 8-bit group 128 GEMV encoder (`DequantInt8GEMV` generic path & `dequant_int8_gemv_generic`) and verified in `SharedExpertInt8Tests.swift` and `ManifestReaderLagunaTests.swift`.
 3. **Per-head attention gating (done).** Added `apply_attention_gating_per_head` Metal kernel in `attention.metal` (calculating `softplus(g) = (g > 20.0f) ? g : log(1.0f + exp(g))` on `g_out[t, h]` and scaling `attn_out[t, h, d]` in-place), `AttentionGatingKernel` host wrapper in `AttentionGating.swift`, and verified against CPU reference in `AttentionGatingTests.swift`.
-4. **YaRoP (done).** YaRN RoPE scaling configuration (`fullRopeScaling`) is parsed per layer in `ArchConfig`.
-5. **Dense layer 0 (done).** Forward pass in `RealForwardRunner` branches on `cfg.isDenseMLP(L)`, sizing scratch buffers for `denseMLPIntermediateSize` (12288) and skipping routed expert dispatch for dense layers.
-6 & 7. **Catalog completion & fingerprinting (done).** Catalog validation and repack planner fully support Laguna architecture.
+4. **YaRoP (done).** Implemented YaRN RoPE frequency scaling in `rope.metal`, `prefill.metal`, `fused.metal`, and `RoPE.swift` CPU reference, passing per-layer `ropeScaling` and `attentionFactor` score scaling in `RealForwardRunner`. Verified with `YaRoPTests.swift`.
+5. **Dense layer 0 (done).** Forward pass in `RealForwardRunner` branches on `cfg.isDenseMLP(L)`, dispatching dense MLP projections (`gate_proj`, `up_proj`, `down_proj`) for dense layers, sizing scratch buffers to `max(config.intermediateSize, config.denseMLPIntermediateSize)`, and skipping MoE routing. Verified with `DenseMLPLayerTests.swift`.
+6 & 7. **Catalog completion & fingerprinting (done).** Catalog entry `lagunaS2_1` in `SupportedModelSource.swift` is now pinned with revision `d785a9349850807a34ac0ac1c22c66b718e77881` and `sourceIndexSHA256` (`45709bf61be0398b4b34ed68845c80f8d2bab75f1f16d19e63c95e15571f0cc2`), with `isInstallable: true`. Verified with `SupportedModelSourceTests.swift`.
 
 ## App / UI layer (done)
 

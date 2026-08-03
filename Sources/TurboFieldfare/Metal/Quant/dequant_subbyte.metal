@@ -286,3 +286,21 @@ kernel void dequant_int8_qkv_gemv_simd(
                              Mq, Mkv, N, groupSize,
                              tg_idx, sg_idx, lane);
 }
+
+kernel void dequant_int8_gemv_generic(
+    device const uint8_t* W         [[buffer(0)]],
+    device const bfloat*  scales    [[buffer(1)]],
+    device const bfloat*  biases    [[buffer(2)]],
+    device const half*    x         [[buffer(3)]],
+    device half*          y         [[buffer(4)]],
+    constant uint&        M         [[buffer(5)]],
+    constant uint&        N         [[buffer(6)]],
+    constant uint&        groupSize [[buffer(7)]],
+    uint                  tg_idx    [[threadgroup_position_in_grid]],
+    uint                  sg_idx    [[simdgroup_index_in_threadgroup]],
+    uint                  lane      [[thread_index_in_simdgroup]]
+) {
+    constexpr uint rows_per_tg = 8;
+    dequant_subbyte_gemv_body<8>(W, scales, biases, x, y, M, N, groupSize,
+                                  rows_per_tg, tg_idx, sg_idx, lane);
+}

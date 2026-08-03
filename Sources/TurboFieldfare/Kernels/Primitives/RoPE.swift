@@ -31,7 +31,8 @@ final class RoPE {
                                   headDim: UInt32,
                                   numHeads: UInt32,
                                   numTokens: UInt32 = 1,
-                                  theta: Float = 10_000.0) {
+                                  theta: Float = 10_000.0,
+                                  scaling: RopeScaling? = nil) {
         precondition(headDim.isMultiple(of: 2), "head_dim must be even")
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         let pipeline = defaultPipeline(headDim: headDim, numHeads: numHeads)
@@ -41,10 +42,12 @@ final class RoPE {
         var headDimValue = headDim
         var numHeadsValue = numHeads
         var thetaValue = theta
+        var scalingParams = MetalRopeScalingParams(scaling: scaling)
         encoder.setBytes(&positionValue, length: MemoryLayout<UInt32>.size, index: 1)
         encoder.setBytes(&headDimValue, length: MemoryLayout<UInt32>.size, index: 2)
         encoder.setBytes(&numHeadsValue, length: MemoryLayout<UInt32>.size, index: 3)
         encoder.setBytes(&thetaValue, length: MemoryLayout<Float>.size, index: 4)
+        encoder.setBytes(&scalingParams, length: MemoryLayout<MetalRopeScalingParams>.size, index: 5)
         dispatch(encoder: encoder,
                  pipeline: pipeline,
                  pairs: Int(headDim) / 2,
@@ -61,7 +64,8 @@ final class RoPE {
                                        numHeads: UInt32,
                                        rotatedPairs: UInt32,
                                        numTokens: UInt32 = 1,
-                                       theta: Float = 1_000_000.0) {
+                                       theta: Float = 1_000_000.0,
+                                       scaling: RopeScaling? = nil) {
         precondition(headDim.isMultiple(of: 2), "head_dim must be even")
         precondition(rotatedPairs * 2 <= headDim,
                      "rotatedPairs * 2 must not exceed head_dim")
@@ -77,11 +81,13 @@ final class RoPE {
         var numHeadsValue = numHeads
         var thetaValue = theta
         var rotatedPairsValue = rotatedPairs
+        var scalingParams = MetalRopeScalingParams(scaling: scaling)
         encoder.setBytes(&positionValue, length: MemoryLayout<UInt32>.size, index: 1)
         encoder.setBytes(&headDimValue, length: MemoryLayout<UInt32>.size, index: 2)
         encoder.setBytes(&numHeadsValue, length: MemoryLayout<UInt32>.size, index: 3)
         encoder.setBytes(&thetaValue, length: MemoryLayout<Float>.size, index: 4)
         encoder.setBytes(&rotatedPairsValue, length: MemoryLayout<UInt32>.size, index: 5)
+        encoder.setBytes(&scalingParams, length: MemoryLayout<MetalRopeScalingParams>.size, index: 6)
         dispatch(encoder: encoder,
                  pipeline: pipeline,
                  pairs: Int(headDim) / 2,

@@ -26,6 +26,32 @@ public struct RopeScaling: Sendable, Equatable {
     }
 }
 
+/// Metal-compatible packed struct matching `RopeScalingParams` in Metal shaders.
+public struct MetalRopeScalingParams: Sendable, Equatable {
+    public var enabled: UInt32
+    public var factor: Float
+    public var originalMaxPositionEmbeddings: Float
+    public var betaFast: Float
+    public var betaSlow: Float
+
+    public init(scaling: RopeScaling?) {
+        if let s = scaling, s.factor > 1.0 {
+            self.enabled = 1
+            self.factor = Float(s.factor)
+            self.originalMaxPositionEmbeddings = Float(s.originalMaxPositionEmbeddings)
+            self.betaFast = Float(s.betaFast)
+            self.betaSlow = Float(s.betaSlow)
+        } else {
+            self.enabled = 0
+            self.factor = 1.0
+            self.originalMaxPositionEmbeddings = 1.0
+            self.betaFast = 1.0
+            self.betaSlow = 1.0
+        }
+    }
+}
+
+
 /// Gating applied to the attention output before `o_proj`.
 ///
 /// Laguna computes `gate = softplus(g_proj(hidden))` and multiplies the
@@ -179,6 +205,11 @@ public struct ArchConfig: Sendable, Equatable {
     public func isDenseMLP(layer: Int) -> Bool {
         guard layer >= 0, layer < denseMLPLayerMask.count else { return false }
         return denseMLPLayerMask[layer] == 1
+    }
+
+    /// True when `layer` uses a dense MLP instead of routed experts.
+    public func isDenseMLP(atLayer layer: Int) -> Bool {
+        return isDenseMLP(layer: layer)
     }
 
     /// Number of layers that actually carry routed experts. Expert streaming

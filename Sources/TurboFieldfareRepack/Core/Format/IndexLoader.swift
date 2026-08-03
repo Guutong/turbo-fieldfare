@@ -60,10 +60,10 @@ enum IndexLoader {
                 guard let entry = v as? [String: Any] else { continue }
                 let bits = (entry["bits"] as? Int) ?? baseBits
                 let g    = (entry["group_size"] as? Int) ?? baseGroup
-                guard g == baseGroup else {
+                guard g == 64 || g == 128 else {
                     throw RepackError.configJsonInvalid(
                         path: configPath,
-                        detail: "quantization override \(k) group_size \(g) != base \(baseGroup)")
+                        detail: "quantization override \(k) group_size \(g) unsupported")
                 }
                 overrides[k] = QuantSpec(bits: bits)
             }

@@ -131,6 +131,8 @@ public final class SharedExpertRuntime {
         case .int8(let runtime):
             try runtime.encode(commandBuffer: commandBuffer, x: x, xOffset: xOffset,
                                gate: gate, up: up, down: down, y: y, yOffset: yOffset,
+                               scratchGate: scratchGate, scratchGateOffset: scratchGateOffset,
+                               scratchUp: scratchUp, scratchUpOffset: scratchUpOffset,
                                scratchAct: scratchAct, scratchActOffset: scratchActOffset)
         }
     }

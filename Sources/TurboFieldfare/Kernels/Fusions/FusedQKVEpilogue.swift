@@ -56,7 +56,8 @@ final class FusedQKVEpilogue {
                        position: UInt32,
                        theta: Float,
                        rotatedPairs: UInt32,
-                       eps: Float) {
+                       eps: Float,
+                       scaling: RopeScaling? = nil) {
         precondition(headDim <= 512,
                      "headDim > 512 exceeds the fused QKV epilogue scratch")
         precondition(rotatedPairs * 2 <= headDim,
@@ -79,6 +80,7 @@ final class FusedQKVEpilogue {
         var thetaVar = theta
         var rotatedVar = rotatedPairs
         var epsVar = eps
+        var scalingParams = MetalRopeScalingParams(scaling: scaling)
         enc.setBytes(&headDimVar, length: MemoryLayout<UInt32>.size, index: 5)
         enc.setBytes(&numQVar,    length: MemoryLayout<UInt32>.size, index: 6)
         enc.setBytes(&numKVVar,   length: MemoryLayout<UInt32>.size, index: 7)
@@ -86,6 +88,7 @@ final class FusedQKVEpilogue {
         enc.setBytes(&thetaVar,   length: MemoryLayout<Float>.size,  index: 9)
         enc.setBytes(&rotatedVar, length: MemoryLayout<UInt32>.size, index: 10)
         enc.setBytes(&epsVar,     length: MemoryLayout<Float>.size,  index: 11)
+        enc.setBytes(&scalingParams, length: MemoryLayout<MetalRopeScalingParams>.size, index: 12)
 
         let threads = min(Int(pso.maxTotalThreadsPerThreadgroup), 256)
         let groups = Int(numQHeads + 2 * numKVHeads)

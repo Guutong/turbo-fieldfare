@@ -255,12 +255,10 @@ import Foundation
         #expect(manifest.quant?.routedExpert.groupSize == 128)
     }
 
-    /// `router` is 8-bit (`router_gemv_gemma4_r4`) and `sharedExpert` still
-    /// goes through the group-64 block-vectorized shared-MLP path. Accepting
-    /// 128 for either would load cleanly and then produce silently wrong
-    /// numbers, so the rejection is the feature. Relax a slot only in the same
-    /// change that teaches its kernel group 128.
-    @Test(arguments: ["sharedExpert", "router"])
+    /// `router` is 8-bit (`router_gemv_gemma4_r4`). Accepting 128 would load
+    /// cleanly and then produce silently wrong numbers, so the rejection is the
+    /// feature. Relax a slot only in the same change that teaches its kernel group 128.
+    @Test(arguments: ["router"])
     func productionManifestRejectsGroup128ForSlotsWhoseKernelIsGroup64(
         _ slotName: String
     ) throws {
@@ -331,18 +329,18 @@ import Foundation
         }
     }
 
-    /// Same rule for group size: `sharedExpert` is group-64-only, and an
+    /// Same rule for group size: `router` is group-64-only, and an
     /// override must not be a side door around the slot-level gate.
     @Test func perLayerOverrideCannotBypassAGroupSizeGate() throws {
         let (dir, config) = try Self.writeToyManifest(
-            ["quant": Self.quant(perLayerOverrides: ["sharedExpert": [(1, 4, 128)]])],
+            ["quant": Self.quant(perLayerOverrides: ["router": [(1, 4, 128)]])],
             config: .gemma4_26B_A4B)
         defer { try? FileManager.default.removeItem(at: dir) }
         #expect {
             _ = try ManifestReader.load(directoryURL: dir, expecting: config)
         } throws: { error in
             guard case ModelError.indexCorrupt(let detail) = error else { return false }
-            return detail.contains("sharedExpert")
+            return detail.contains("router")
         }
     }
 

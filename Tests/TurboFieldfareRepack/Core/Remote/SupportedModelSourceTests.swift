@@ -3,10 +3,10 @@ import Testing
 @testable import TurboFieldfareRepackCore
 
 @Suite struct SupportedModelSourceTests {
-    @Test func installableExcludesEntriesThatAreNotYetInstallable() {
+    @Test func installableIncludesSupportedCatalogEntries() {
         let installable = SupportedModelSource.installable
         #expect(installable.contains(SupportedModelSource.gemma4_26B_A4B))
-        #expect(!installable.contains(SupportedModelSource.lagunaS2_1))
+        #expect(installable.contains(SupportedModelSource.lagunaS2_1))
         #expect(installable.allSatisfy { $0.isInstallable })
     }
 
@@ -22,17 +22,14 @@ import Testing
         #expect(SupportedModelSource.source(id: "unknown-model") == nil)
     }
 
-    /// The doc comment on `lagunaS2_1` explains its empty revision and
-    /// fingerprint are a deliberate guard against fetching an unpinned
-    /// checkpoint — this pins that behavior so it can't regress silently.
-    @Test func notYetInstallableEntryHasNoPinnedRevisionOrFingerprint() {
-        #expect(!SupportedModelSource.lagunaS2_1.isInstallable)
-        #expect(SupportedModelSource.lagunaS2_1.revision.isEmpty)
-        #expect(SupportedModelSource.lagunaS2_1.sourceIndexSHA256.isEmpty)
+    @Test func installableEntriesHavePinnedRevisionAndFingerprint() {
+        #expect(SupportedModelSource.lagunaS2_1.isInstallable)
+        #expect(!SupportedModelSource.lagunaS2_1.revision.isEmpty)
+        #expect(!SupportedModelSource.lagunaS2_1.sourceIndexSHA256.isEmpty)
     }
 
-    @Test func notYetInstallableEntryExplainsWhy() {
-        #expect(SupportedModelSource.lagunaS2_1.installBlockedReason != nil)
+    @Test func installableEntriesHaveNoBlockedReason() {
+        #expect(SupportedModelSource.lagunaS2_1.installBlockedReason == nil)
         #expect(SupportedModelSource.gemma4_26B_A4B.installBlockedReason == nil)
     }
 
@@ -44,9 +41,11 @@ import Testing
         #expect(resolved == SupportedModelSource.gemma4_26B_A4B)
     }
 
-    @Test func resolveAcceptsAValidInstallableID() throws {
-        let resolved = try SupportedModelSource.resolve(modelID: "gemma4-26b-a4b")
-        #expect(resolved == SupportedModelSource.gemma4_26B_A4B)
+    @Test func resolveAcceptsValidInstallableIDs() throws {
+        let gemma = try SupportedModelSource.resolve(modelID: "gemma4-26b-a4b")
+        #expect(gemma == SupportedModelSource.gemma4_26B_A4B)
+        let laguna = try SupportedModelSource.resolve(modelID: "laguna-s-2-1")
+        #expect(laguna == SupportedModelSource.lagunaS2_1)
     }
 
     @Test func resolveRejectsAnUnknownID() {
@@ -54,14 +53,6 @@ import Testing
             "nonexistent-model",
             validIDs: SupportedModelSource.all.map(\.id))) {
             try SupportedModelSource.resolve(modelID: "nonexistent-model")
-        }
-    }
-
-    @Test func resolveRejectsANotYetInstallableID() {
-        #expect(throws: ModelSelectionError.notInstallable(
-            "laguna-s-2-1",
-            reason: SupportedModelSource.lagunaS2_1.installBlockedReason!)) {
-            try SupportedModelSource.resolve(modelID: "laguna-s-2-1")
         }
     }
 }

@@ -51,16 +51,42 @@ static inline uint fused_fc_rotary(constant uint& rotary) {
     return (fused_use_fc() && is_function_constant_defined(FC_FUSED_ROTARY)) ? FC_FUSED_ROTARY : rotary;
 }
 
+struct RopeScalingParams {
+    uint enabled;
+    float factor;
+    float original_max_position_embeddings;
+    float beta_fast;
+    float beta_slow;
+};
+
+static inline float fused_compute_rope_freq(
+    uint pair,
+    uint frequency_divisor,
+    float theta,
+    RopeScalingParams scaling
+) {
+    const float exponent = -float(2u * pair) / float(frequency_divisor);
+    const float base_freq = pow(theta, exponent);
+    if (scaling.enabled == 0u || scaling.factor <= 1.0f || scaling.original_max_position_embeddings <= 0.0f) {
+        return base_freq;
+    }
+    const float two_pi = 6.28318530717958647692f;
+    const float wavelength_ratio = two_pi / (base_freq * scaling.original_max_position_embeddings);
+    const float gamma = clamp((wavelength_ratio - scaling.beta_fast) / (scaling.beta_slow - scaling.beta_fast), 0.0f, 1.0f);
+    const float alpha = (1.0f - gamma) + (gamma / scaling.factor);
+    return base_freq * alpha;
+}
+
 inline void fused_rope_neox_pair(thread float& x0,
                                  thread float& x1,
                                  uint pair_index,
                                  uint head_dim,
                                  float position,
-                                 float theta_base)
+                                 float theta_base,
+                                 RopeScalingParams scaling)
 {
-    const float exponent = -float(2u * pair_index) / float(head_dim);
-    const float freq     = pow(theta_base, exponent);
-    const float angle    = position * freq;
+    const float freq = fused_compute_rope_freq(pair_index, head_dim, theta_base, scaling);
+    const float angle = position * freq;
     const float c = cos(angle);
     const float s = sin(angle);
     const float r0 = x0 * c - x1 * s;
@@ -96,6 +122,7 @@ void fused_qkv_epilogue(
     constant     float&  theta_base     [[buffer(9)]],
     constant     uint&   rotated_pairs  [[buffer(10)]],
     constant     float&  rms_eps        [[buffer(11)]],
+    constant     RopeScalingParams& scaling [[buffer(12)]],
     uint  lid              [[thread_position_in_threadgroup]],
     uint  lsize            [[threads_per_threadgroup]],
     uint  simd_lane_id     [[thread_index_in_simdgroup]],
@@ -165,12 +192,13 @@ void fused_qkv_epilogue(
         float x0 = float(head_tg[pair]);
         float x1 = float(head_tg[half_dim + pair]);
         if (pair < RP) {
-            fused_rope_neox_pair(x0, x1, pair, HD, float(position), theta_base);
+            fused_rope_neox_pair(x0, x1, pair, HD, float(position), theta_base, scaling);
         }
         dst[pair] = half(x0);
         dst[half_dim + pair] = half(x1);
     }
 }
+
 
 // ============================================================================
 // fused_layer_tail — real Gemma 4 decoder-layer tail.

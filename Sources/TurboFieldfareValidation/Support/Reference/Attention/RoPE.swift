@@ -1,5 +1,6 @@
 import Foundation
 import Accelerate
+import TurboFieldfare
 
 /// FP32 RoPE reference. Precomputes `(cos, sin)` tables for every rotation
 /// pair via `vForce.cos`/`vForce.sin`, then applies the rotation per
@@ -73,7 +74,8 @@ public enum RopeRef {
         headDim: Int,
         rotatedPairs: Int,
         position: Int,
-        theta: Float
+        theta: Float,
+        scaling: RopeScaling? = nil
     ) -> [Float] {
         precondition(input.count == numTokens * numHeads * headDim,
                      "input size mismatch")
@@ -84,7 +86,21 @@ public enum RopeRef {
         let positionF = Float(position)
         for i in 0..<rotatedPairs {
             let exponent = -Float(2 * i) / Float(headDim)
-            angles[i] = positionF * Foundation.exp(exponent * logTheta)
+            let baseFreq = Foundation.exp(exponent * logTheta)
+            let freq: Float
+            if let scaling = scaling, scaling.factor > 1.0, scaling.originalMaxPositionEmbeddings > 0 {
+                let twoPi: Float = 6.28318530717958647692
+                let wavelengthRatio = twoPi / (baseFreq * Float(scaling.originalMaxPositionEmbeddings))
+                let betaFast = Float(scaling.betaFast)
+                let betaSlow = Float(scaling.betaSlow)
+                let gammaRaw = (wavelengthRatio - betaFast) / (betaSlow - betaFast)
+                let gamma = min(max(gammaRaw, 0.0), 1.0)
+                let alpha = (1.0 - gamma) + (gamma / Float(scaling.factor))
+                freq = baseFreq * alpha
+            } else {
+                freq = baseFreq
+            }
+            angles[i] = positionF * freq
         }
         let cosTable = vForce.cos(angles)
         let sinTable = vForce.sin(angles)
@@ -108,3 +124,4 @@ public enum RopeRef {
         return out
     }
 }
+

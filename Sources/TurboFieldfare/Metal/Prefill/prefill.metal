@@ -708,16 +708,42 @@ kernel void prefill_dequant_int4_qmm_f16_block(
     Y[t * N + n] = half(acc);
 }
 
+struct RopeScalingParams {
+    uint enabled;
+    float factor;
+    float original_max_position_embeddings;
+    float beta_fast;
+    float beta_slow;
+};
+
+static inline float prefill_compute_rope_freq(
+    uint pair,
+    uint frequency_divisor,
+    float theta,
+    RopeScalingParams scaling
+) {
+    const float exponent = -float(2u * pair) / float(frequency_divisor);
+    const float base_freq = pow(theta, exponent);
+    if (scaling.enabled == 0u || scaling.factor <= 1.0f || scaling.original_max_position_embeddings <= 0.0f) {
+        return base_freq;
+    }
+    const float two_pi = 6.28318530717958647692f;
+    const float wavelength_ratio = two_pi / (base_freq * scaling.original_max_position_embeddings);
+    const float gamma = clamp((wavelength_ratio - scaling.beta_fast) / (scaling.beta_slow - scaling.beta_fast), 0.0f, 1.0f);
+    const float alpha = (1.0f - gamma) + (gamma / scaling.factor);
+    return base_freq * alpha;
+}
+
 static inline void prefill_rope_apply_neox_pair(
     device half* head_ptr,
     uint i,
     uint half_dim,
     uint freq_divisor,
     float position,
-    float theta_base
+    float theta_base,
+    RopeScalingParams scaling
 ) {
-    const float exponent = -float(2u * i) / float(freq_divisor);
-    const float freq = pow(theta_base, exponent);
+    const float freq = prefill_compute_rope_freq(i, freq_divisor, theta_base, scaling);
     const float angle = position * freq;
     const float c = cos(angle);
     const float s = sin(angle);
@@ -737,6 +763,7 @@ kernel void prefill_rope_default_neox_block(
     constant uint& num_heads           [[buffer(3)]],
     constant uint& token_stride_elems  [[buffer(4)]],
     constant float& theta_base         [[buffer(5)]],
+    constant RopeScalingParams& scaling [[buffer(6)]],
     uint3          gid                 [[thread_position_in_grid]]
 ) {
     const uint i = gid.x;
@@ -748,7 +775,7 @@ kernel void prefill_rope_default_neox_block(
 
     device half* head_ptr = data + t * token_stride_elems + h * head_dim;
     prefill_rope_apply_neox_pair(head_ptr, i, half_dim, head_dim,
-                                 float(start_position + t), theta_base);
+                                 float(start_position + t), theta_base, scaling);
 }
 
 kernel void prefill_rope_proportional_neox_block(
@@ -759,6 +786,7 @@ kernel void prefill_rope_proportional_neox_block(
     constant uint& token_stride_elems  [[buffer(4)]],
     constant float& theta_base         [[buffer(5)]],
     constant uint& rotated_pairs       [[buffer(6)]],
+    constant RopeScalingParams& scaling [[buffer(7)]],
     uint3          gid                 [[thread_position_in_grid]]
 ) {
     const uint i = gid.x;
@@ -770,8 +798,9 @@ kernel void prefill_rope_proportional_neox_block(
     const uint half_dim = head_dim / 2u;
     device half* head_ptr = data + t * token_stride_elems + h * head_dim;
     prefill_rope_apply_neox_pair(head_ptr, i, half_dim, head_dim,
-                                 float(start_position + t), theta_base);
+                                 float(start_position + t), theta_base, scaling);
 }
+
 
 struct PrefillAttentionParams {
     uint startPosition;

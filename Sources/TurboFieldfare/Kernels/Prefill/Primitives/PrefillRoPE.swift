@@ -18,7 +18,8 @@ final class PrefillRoPE {
                                   headDim: UInt32,
                                   numHeads: UInt32,
                                   tokenStrideElements: UInt32,
-                                  theta: Float = 10_000.0) {
+                                  theta: Float = 10_000.0,
+                                  scaling: RopeScaling? = nil) {
         precondition(queryCount > 0, "queryCount must be positive")
         precondition(headDim % 2 == 0, "headDim must be even")
         precondition(tokenStrideElements >= numHeads * headDim,
@@ -31,11 +32,13 @@ final class PrefillRoPE {
         var heads = numHeads
         var stride = tokenStrideElements
         var thetaVar = theta
+        var scalingParams = MetalRopeScalingParams(scaling: scaling)
         enc.setBytes(&start, length: MemoryLayout<UInt32>.size, index: 1)
         enc.setBytes(&hd, length: MemoryLayout<UInt32>.size, index: 2)
         enc.setBytes(&heads, length: MemoryLayout<UInt32>.size, index: 3)
         enc.setBytes(&stride, length: MemoryLayout<UInt32>.size, index: 4)
         enc.setBytes(&thetaVar, length: MemoryLayout<Float>.size, index: 5)
+        enc.setBytes(&scalingParams, length: MemoryLayout<MetalRopeScalingParams>.size, index: 6)
 
         let pairs = Int(headDim) / 2
         enc.dispatchThreads(
@@ -55,7 +58,8 @@ final class PrefillRoPE {
                                        numHeads: UInt32,
                                        rotatedPairs: UInt32,
                                        tokenStrideElements: UInt32,
-                                       theta: Float = 1_000_000.0) {
+                                       theta: Float = 1_000_000.0,
+                                       scaling: RopeScaling? = nil) {
         precondition(queryCount > 0, "queryCount must be positive")
         precondition(headDim % 2 == 0, "headDim must be even")
         precondition(rotatedPairs * 2 <= headDim,
@@ -71,12 +75,14 @@ final class PrefillRoPE {
         var stride = tokenStrideElements
         var thetaVar = theta
         var rp = rotatedPairs
+        var scalingParams = MetalRopeScalingParams(scaling: scaling)
         enc.setBytes(&start, length: MemoryLayout<UInt32>.size, index: 1)
         enc.setBytes(&hd, length: MemoryLayout<UInt32>.size, index: 2)
         enc.setBytes(&heads, length: MemoryLayout<UInt32>.size, index: 3)
         enc.setBytes(&stride, length: MemoryLayout<UInt32>.size, index: 4)
         enc.setBytes(&thetaVar, length: MemoryLayout<Float>.size, index: 5)
         enc.setBytes(&rp, length: MemoryLayout<UInt32>.size, index: 6)
+        enc.setBytes(&scalingParams, length: MemoryLayout<MetalRopeScalingParams>.size, index: 7)
 
         enc.dispatchThreads(
             MTLSize(width: Int(rotatedPairs), height: Int(numHeads), depth: Int(queryCount)),
