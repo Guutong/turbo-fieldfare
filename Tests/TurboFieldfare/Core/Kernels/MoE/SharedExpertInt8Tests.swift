@@ -75,6 +75,8 @@ import TurboFieldfareValidationSupport
 
         guard let xBuf = Fp16Buffer.make(ctx.device, values: xFp32),
               let yBuf = Fp16Buffer.make(ctx.device, count: Sizes.D),
+              let sg   = Fp16Buffer.make(ctx.device, count: Sizes.F),
+              let su   = Fp16Buffer.make(ctx.device, count: Sizes.F),
               let sa   = Fp16Buffer.make(ctx.device, count: Sizes.F) else {
             Issue.record("alloc failed"); return
         }
@@ -102,7 +104,7 @@ import TurboFieldfareValidationSupport
         try wrapper.encode(commandBuffer: cb,
                            x: xBuf, gate: gateProj, up: upProj, down: downProj,
                            y: yBuf,
-                           scratchAct: sa)
+                           scratchGate: sg, scratchUp: su, scratchAct: sa)
         cb.commit(); cb.waitUntilCompleted()
 
         let actual = Fp16Buffer.read(yBuf, count: Sizes.D)
