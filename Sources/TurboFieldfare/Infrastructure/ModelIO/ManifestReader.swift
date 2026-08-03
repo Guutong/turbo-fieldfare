@@ -286,7 +286,7 @@ public enum ManifestReader {
         let int4GenericGroups: Set<Int> = [Quantization.groupSize, 128]
         let slots: [(String, ManifestQuantSlot, Set<Int>, Set<Int>)] = [
             ("embedding", quant.embedding, [4, 8], int4GenericGroups),
-            ("attention", quant.attention, [4], int4GenericGroups),
+            ("attention", quant.attention, [4, 5, 8], int4GenericGroups),
             ("router", quant.router, [4, 8], defaultGroup),
             ("sharedExpert", quant.sharedExpert, [4, 8], int4GenericGroups),
             ("routedExpert", quant.routedExpert, [4], int4GenericGroups),
