@@ -734,6 +734,18 @@ layout handling. The four new Metal kernels have never executed — the build co
 them, which proves only that they parse. That is the largest gap in this branch, and
 per the note below a green suite would not have told you otherwise.
 
+## Upstream sync
+
+This branch is merged up to `origin/main` (`fcd8f78`, drumih/turbo-fieldfare) as of
+2026-08-03 — zero commits behind. The six upstream commits since the `f8abc44`
+branch point touched the OpenAI server, the Mac app, the decode service, the
+detokenizer, and benchmark docs; this branch touches runtime kernels, the repacker,
+and model IO. **The two sets share no files**, so the merge was automatic and is
+likely to stay easy. Re-merge often rather than letting it drift.
+
+The suite went 629 -> 674 tests across the merge with the same 7 failures, so
+upstream's 45 new tests pass here and nothing on this branch regressed.
+
 ## Repacking from a local checkpoint
 
 `TurboFieldfareRepack --local-checkpoint <dir>` repacks from an already-downloaded HF
