@@ -462,7 +462,7 @@ import Metal
         let manifestData = try JSONSerialization.data(withJSONObject: manifestRoot, options: [.sortedKeys, .withoutEscapingSlashes])
         try manifestData.write(to: dir.appendingPathComponent("manifest.json"))
 
-        try ModelLoaderTests.writeVerifiedInstallReceipt(directoryURL: dir, expecting: toy)
+        try ModelLoaderTests.writeVerifiedInstallReceipt(directoryURL: dir)
 
         return (dir, toy)
     }
