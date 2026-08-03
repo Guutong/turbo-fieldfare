@@ -375,3 +375,38 @@ void attention_decode_combine(
         out_row[i] = half(acc * inv_d);
     }
 }
+
+// ============================================================================
+// Per-Head Attention Gating (`AttentionGating.perHead`)
+//
+// Scales attention output in-place by softplus(g_out[t, h]):
+//   softplus(g) = (g > 20.0f) ? g : log1p(exp(g))
+// Across d in [0, head_dim) for each head h and token t.
+//
+// Layout:
+//   attn_out : [tokens, num_heads, head_dim]  FP16 in-place
+//   g_out    : [tokens, num_heads]           FP16
+// ============================================================================
+
+[[kernel]]
+void apply_attention_gating_per_head(
+    device half*       attn_out   [[buffer(0)]],
+    device const half* g_out      [[buffer(1)]],
+    constant uint&     tokens     [[buffer(2)]],
+    constant uint&     num_heads  [[buffer(3)]],
+    constant uint&     head_dim   [[buffer(4)]],
+    uint3              gid        [[thread_position_in_grid]]
+) {
+    const uint d = gid.x;
+    const uint h = gid.y;
+    const uint t = gid.z;
+
+    if (d >= head_dim || h >= num_heads || t >= tokens) {
+        return;
+    }
+
+    const float g = float(g_out[t * num_heads + h]);
+    const float softplus_g = (g > 20.0f) ? g : log(1.0f + exp(g));
+    const uint idx = (t * num_heads + h) * head_dim + d;
+    attn_out[idx] = half(float(attn_out[idx]) * softplus_g);
+}

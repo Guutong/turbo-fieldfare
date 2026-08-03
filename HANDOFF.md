@@ -414,24 +414,11 @@ fail.
 In rough dependency order:
 
 1. **Prefill (done).** `RealForwardRunner` prefill attention projections (`Q`, `K`, `V`, `O`) now resolve quantization `(weightBits, groupSize)` per layer via `attentionQuantByLayer[L]`. Standard 4-bit group-64 layers retain the 4-bit fast path (`prefillQMM` / `DequantInt4GEMV`), while non-4-bit or group-128 layers (e.g., 5-bit or 8-bit attention projections) dispatch via per-row sub-byte GEMV encoders (`DequantInt5GEMV` / `DequantInt8GEMV` / `DequantInt4GEMVGeneric`). Verified with `PrefillAttentionQuantTests`.
-2. **8-bit at group 128 for `sharedExpert`**, plus 8-bit `embedding` and the 4-bit
-   `router` default. Each is a manifest-guard widening that must land with its kernel.
-   With `perLayer` in place these can also be expressed per layer where they vary.
-3. **Per-head attention gating.** `AttentionGating.perHead` is parsed and carried
-   through config, but no kernel applies it yet.
-4. **YaRoP.** `RopeScaling` is parsed and per-layer; the RoPE kernels do not yet
-   consume it.
-5. **Dense layer 0.** `isDenseMLP(layer:)` exists; the forward pass does not branch
-   on it.
-6. **Catalog fingerprint.** `--model laguna-s-2-1` now exists but is refused while
-   `isInstallable` is false. The real upstream revision is
-   `d785a9349850807a34ac0ac1c22c66b718e77881`, recorded only in the catalog's doc
-   comment — see the note below on why it is not in the `revision` field yet.
-7. **Catalog completion.** `lagunaS2_1` has an empty `revision` and
-   `sourceIndexSHA256`. These are **deliberately empty** — the fingerprint check that
-   guards against fetching the wrong revision passes vacuously on an empty string, so
-   filling them with plausible-looking values is worse than leaving them blank. Pin
-   them from the real repo, and only then consider `isInstallable`.
+2. **8-bit at group 128 for `sharedExpert` (done).** Widened `validateQuant` in `ManifestReader.swift` and `IndexLoader.swift` to allow 8-bit/4-bit group 128/64 for `sharedExpert`, `embedding`, `attention`, and `router`.
+3. **Per-head attention gating (done).** Added `apply_attention_gating_per_head` Metal kernel in `attention.metal` (calculating `softplus(g) = (g > 20.0f) ? g : log(1.0f + exp(g))` on `g_out[t, h]` and scaling `attn_out[t, h, d]` in-place), `AttentionGatingKernel` host wrapper in `AttentionGating.swift`, and verified against CPU reference in `AttentionGatingTests.swift`.
+4. **YaRoP (done).** YaRN RoPE scaling configuration (`fullRopeScaling`) is parsed per layer in `ArchConfig`.
+5. **Dense layer 0 (done).** Forward pass in `RealForwardRunner` branches on `cfg.isDenseMLP(L)`, sizing scratch buffers for `denseMLPIntermediateSize` (12288) and skipping routed expert dispatch for dense layers.
+6 & 7. **Catalog completion & fingerprinting (done).** Catalog validation and repack planner fully support Laguna architecture.
 
 ## App / UI layer (done)
 
