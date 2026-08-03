@@ -16,6 +16,11 @@ public struct RemoteStreamingRepackOptions: Sendable {
     public let baseURL: URL
     public let rangeRetryAttempts: Int
     public let retryBaseDelayNs: UInt64
+    /// When non-nil, reads checkpoint files from this local directory instead
+    /// of streaming from Hugging Face. The directory must contain
+    /// `config.json`, `model.safetensors.index.json`, and the safetensors
+    /// shards named by the index.
+    public let localCheckpointPath: String?
 
     public init(repoID: String,
                 revision: String,
@@ -32,7 +37,8 @@ public struct RemoteStreamingRepackOptions: Sendable {
                 downloadSession: RemoteDownloadSession = RemoteDownloadSession(),
                 baseURL: URL = URL(string: "https://huggingface.co")!,
                 rangeRetryAttempts: Int = 4,
-                retryBaseDelayNs: UInt64 = 1_000_000_000) {
+                retryBaseDelayNs: UInt64 = 1_000_000_000,
+                localCheckpointPath: String? = nil) {
         self.repoID = repoID
         self.revision = revision
         self.outputDir = outputDir
@@ -49,6 +55,7 @@ public struct RemoteStreamingRepackOptions: Sendable {
         self.baseURL = baseURL
         self.rangeRetryAttempts = rangeRetryAttempts
         self.retryBaseDelayNs = retryBaseDelayNs
+        self.localCheckpointPath = localCheckpointPath
     }
 }
 
@@ -168,21 +175,30 @@ public final class RemoteStreamingRepacker {
                     detail: "saved download belongs to a different source")
             }
         }
-        let retryPolicy = RemoteRetryPolicy(attempts: options.rangeRetryAttempts,
-                                            baseDelayNs: options.retryBaseDelayNs)
-        let remote = HuggingFaceRemoteSource(repoID: options.repoID,
-                                             requestedRevision: options.revision,
-                                             resolvedCommit: saved?.resolvedCommit,
-                                             token: options.token,
-                                             downloadSession: options.downloadSession,
-                                             baseURL: options.baseURL,
-                                             tempDirectory: paths.partialDirectory,
-                                             retryPolicy: retryPolicy)
-        progress(.downloadingMetadata)
-        let snapshot = try await RemoteSnapshotLoader.load(remote: remote,
+        let snapshot: RemoteSnapshot
+        let localCheckpointPath = options.localCheckpointPath
+        if let localPath = localCheckpointPath {
+            progress(.downloadingMetadata)
+            snapshot = try LocalCheckpointRepacker.loadSnapshot(
+                checkpointPath: localPath,
+                metadataDirectory: paths.metadataDirectory)
+        } else {
+            let retryPolicy = RemoteRetryPolicy(attempts: options.rangeRetryAttempts,
+                                                baseDelayNs: options.retryBaseDelayNs)
+            let remote = HuggingFaceRemoteSource(repoID: options.repoID,
+                                                 requestedRevision: options.revision,
+                                                 resolvedCommit: saved?.resolvedCommit,
+                                                 token: options.token,
+                                                 downloadSession: options.downloadSession,
+                                                 baseURL: options.baseURL,
+                                                 tempDirectory: paths.partialDirectory,
+                                                 retryPolicy: retryPolicy)
+            progress(.downloadingMetadata)
+            snapshot = try await RemoteSnapshotLoader.load(remote: remote,
                                                            requireKnownSource: options.requireKnownSource,
                                                            metadataDirectory: paths.metadataDirectory,
                                                            audit: audit)
+        }
         try Task.checkCancellation()
         let plan = try RepackPlanner.plan(meta: snapshot.metadata,
                                           arch: snapshot.arch,
@@ -278,9 +294,26 @@ public final class RemoteStreamingRepacker {
                 parentDirectory: paths.parentDirectory)
         }
 
-        let provider = HTTPRangeSourceByteProvider(remote: remote.pinned(commit: snapshot.resolvedCommit),
+        let provider: any SourceByteProvider
+        if let localPath = localCheckpointPath {
+            provider = LocalFileSourceByteProvider(checkpointPath: localPath,
+                                                    files: snapshot.remoteFiles,
+                                                    writeTileBytes: options.writeTileBytes)
+        } else {
+            let retryPolicy = RemoteRetryPolicy(attempts: options.rangeRetryAttempts,
+                                                baseDelayNs: options.retryBaseDelayNs)
+            let remote = HuggingFaceRemoteSource(repoID: options.repoID,
+                                                 requestedRevision: options.revision,
+                                                 resolvedCommit: snapshot.resolvedCommit,
+                                                 token: options.token,
+                                                 downloadSession: options.downloadSession,
+                                                 baseURL: options.baseURL,
+                                                 tempDirectory: paths.partialDirectory,
+                                                 retryPolicy: retryPolicy)
+            provider = HTTPRangeSourceByteProvider(remote: remote,
                                                    files: snapshot.remoteFiles,
                                                    writeTileBytes: options.writeTileBytes)
+        }
         let reusedBytes = checkpoint.completedRanges.reduce(UInt64(0)) {
             $0 + $1.sourceBytes
         }
@@ -331,10 +364,29 @@ public final class RemoteStreamingRepacker {
                              progress: progress)
 
         try Task.checkCancellation()
-        try await copyRemoteMetadataSidecars(snapshot: snapshot,
-                                             remote: remote,
-                                             partialDir: paths.partialDirectory,
-                                             progress: progress)
+        if let localPath = localCheckpointPath {
+            try copyLocalMetadataSidecars(snapshot: snapshot,
+                                          checkpointPath: localPath,
+                                          partialDir: paths.partialDirectory,
+                                          progress: progress)
+        } else {
+            // Rebuild remote for sidecar download (the byte-provider remote
+            // was already consumed by copyBatch above).
+            let retryPolicy = RemoteRetryPolicy(attempts: options.rangeRetryAttempts,
+                                                baseDelayNs: options.retryBaseDelayNs)
+            let sidecarRemote = HuggingFaceRemoteSource(repoID: options.repoID,
+                                                         requestedRevision: options.revision,
+                                                         resolvedCommit: snapshot.resolvedCommit,
+                                                         token: options.token,
+                                                         downloadSession: options.downloadSession,
+                                                         baseURL: options.baseURL,
+                                                         tempDirectory: paths.partialDirectory,
+                                                         retryPolicy: retryPolicy)
+            try await copyRemoteMetadataSidecars(snapshot: snapshot,
+                                                 remote: sidecarRemote,
+                                                 partialDir: paths.partialDirectory,
+                                                 progress: progress)
+        }
         try? FileManager.default.removeItem(atPath: paths.rangeTemporaryFile)
         try? FileManager.default.removeItem(atPath: paths.metadataDirectory)
         progress(.finalizing)
@@ -557,6 +609,56 @@ public final class RemoteStreamingRepacker {
             return true
         }
         return false
+    }
+
+    /// Local-checkpoint counterpart to `copyRemoteMetadataSidecars`. Copies
+    /// `config.json` from the metadata directory and optional tokenizer files
+    /// from the checkpoint directory into the `.gturbo` tokenizer subtree.
+    private func copyLocalMetadataSidecars(snapshot: RemoteSnapshot,
+                                           checkpointPath: String,
+                                           partialDir: String,
+                                           progress: @Sendable (ModelInstallProgress) -> Void) throws {
+        let tokenizerDir = (partialDir as NSString).appendingPathComponent("tokenizer")
+        for filename in ["config.json"] {
+            let src = (snapshot.metadataDirectory as NSString).appendingPathComponent(filename)
+            guard FileManager.default.fileExists(atPath: src) else { continue }
+            try Posix.mkdirP(tokenizerDir)
+            let dst = (tokenizerDir as NSString).appendingPathComponent(filename)
+            if FileManager.default.fileExists(atPath: dst) {
+                try FileManager.default.removeItem(atPath: dst)
+            }
+            try FileManager.default.copyItem(atPath: src, toPath: dst)
+            try recordOutputFile(relativePath: "tokenizer/\(filename)",
+                                 path: dst,
+                                 progress: progress)
+        }
+
+        let tokenizerFiles: [(name: String, required: Bool)] = [
+            ("tokenizer.json", true),
+            ("tokenizer_config.json", true),
+            ("special_tokens_map.json", false),
+            ("chat_template.jinja", false),
+            ("chat_template.json", false),
+        ]
+        for file in tokenizerFiles {
+            let src = (checkpointPath as NSString).appendingPathComponent(file.name)
+            guard FileManager.default.fileExists(atPath: src) else {
+                if file.required {
+                    throw RepackError.configurationInvalid(
+                        detail: "required tokenizer file missing from checkpoint: \(file.name)")
+                }
+                continue
+            }
+            try Posix.mkdirP(tokenizerDir)
+            let dst = (tokenizerDir as NSString).appendingPathComponent(file.name)
+            if FileManager.default.fileExists(atPath: dst) {
+                try FileManager.default.removeItem(atPath: dst)
+            }
+            try FileManager.default.copyItem(atPath: src, toPath: dst)
+            try recordOutputFile(relativePath: "tokenizer/\(file.name)",
+                                 path: dst,
+                                 progress: progress)
+        }
     }
 
     private func writeManifest(plan: RepackPlan,

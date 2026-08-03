@@ -442,7 +442,9 @@ so the catalog is reached through a thin projection
   `config.json`; the routed path had been uniformly 4-bit the whole time. One `curl`
   of a 106 KB config would have caught it at any point. Fetching config/index metadata
   is cheap and does not require downloading the 64 GB of weights.
-- The repo has a real test suite (616 tests as of this writing, all green). Run
+- The repo has a real test suite (629 tests as of this writing, 6 pre-existing failures
+  in `DenseMLPLayerTests`, `AppModelInstallDescriptorTests`, and `RepackCLITests` —
+  fixture mismatches and disk-space-dependent error paths, not regressions). Run
   `swift test`, and do not reach green by relaxing an assertion — if a test genuinely
   encodes the old single-model assumption, change it deliberately and say so.
 - Metal kernels do not fail loudly on the errors that matter here. Out-of-range
