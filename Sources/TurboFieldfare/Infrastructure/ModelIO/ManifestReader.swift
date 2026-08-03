@@ -55,6 +55,46 @@ public struct ManifestRopeScaling: Decodable, Equatable, Sendable {
     }
 }
 
+extension ManifestArch {
+    /// Build the `ArchConfig` this manifest describes. The manifest's arch
+    /// block is authoritative; when no separate expected config is provided
+    /// at load time, this becomes both the actual and the expected, so the
+    /// arch-validation gate passes trivially for a correctly-written manifest.
+    var asArchConfig: ArchConfig {
+        let headsPerLayer = headsPerLayer ?? []
+        return ArchConfig(
+            hiddenSize: hiddenSize,
+            intermediateSize: ffnIntermediate,
+            moeIntermediateSize: moeIntermediateSize,
+            numHeads: numHeads,
+            numKVHeads: numKVHeads,
+            numFullKVHeads: numFullKVHeads,
+            headDim: headDim,
+            fullHeadDim: fullHeadDim,
+            vocabSize: vocabSize,
+            slidingWindow: slidingWindow,
+            finalLogitSoftcap: finalLogitSoftcap,
+            ropeTheta: ropeTheta,
+            fullRopeTheta: fullRopeTheta,
+            partialRotaryFactor: partialRotaryFactor,
+            numLayers: numLayers,
+            numExperts: numExperts,
+            topKExperts: topKExperts,
+            tieWordEmbeddings: tieWordEmbeddings,
+            attentionKEqV: attentionKEqV,
+            fullAttentionLayerMask: fullAttentionLayerMask.map { UInt8($0) },
+            hiddenActivation: hiddenActivation,
+            headsPerLayer: headsPerLayer,
+            denseMLPLayerMask: denseMLPLayerMask?.map { UInt8($0) } ?? [],
+            denseMLPIntermediateSize: denseMLPIntermediateSize ?? 0,
+            fullPartialRotaryFactor: fullPartialRotaryFactor,
+            fullRopeScaling: fullRopeScaling?.asRopeScaling,
+            attentionGating: AttentionGating(rawValue: attentionGating ?? "none") ?? .none,
+            routedScalingFactor: routedScalingFactor ?? 1.0
+        )
+    }
+}
+
 /// One layer's exception to a slot's `weightBits`/`groupSize`.
 ///
 /// Only the two fields that vary are overridable. `scheme`/`scaleType`/
@@ -150,7 +190,7 @@ public enum ManifestReader {
     ]
 
     public static func load(directoryURL: URL,
-                            expecting: ArchConfig,
+                            expecting: ArchConfig?,
                             maxBytes: UInt64 = defaultMaxBytes) throws -> Manifest {
         let manifestURL = directoryURL.appendingPathComponent("manifest.json")
         guard FileManager.default.fileExists(atPath: manifestURL.path) else {
@@ -169,7 +209,12 @@ public enum ManifestReader {
             throw ModelError.indexCorrupt(detail: "manifest.json: \(error)")
         }
 
-        try validate(manifest, against: expecting,
+        // When no external expected config is provided, use the manifest's own
+        // arch — the manifest is authoritative about what model it contains.
+        // A caller that passes a specific config (e.g. for a service that only
+        // runs one model) still gets the full archMismatch gate.
+        let expected = expecting ?? manifest.arch.asArchConfig
+        try validate(manifest, against: expected,
                      directoryURL: directoryURL)
         return manifest
     }

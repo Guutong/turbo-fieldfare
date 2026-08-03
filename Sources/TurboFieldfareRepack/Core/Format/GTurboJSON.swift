@@ -94,19 +94,27 @@ enum GTurboJSON {
         ]
         var quantDict: [String: Any] = [:]
         for (slot, bits) in quantBits {
+            // When perLayer overrides exist, derive the scalar groupSize from
+            // them (all overrides should share the same groupSize when they
+            // exist; if mixed, the first one defines the scalar). Otherwise
+            // use the plan's base group size.
+            let perLayer = bitWidths.perLayer?[slot] ?? []
+            let slotGroupSize: Int
+            if let first = perLayer.first {
+                slotGroupSize = first.groupSize
+            } else {
+                slotGroupSize = plan.baseGroupSize
+            }
             var entry: [String: Any] = [
                 "weightBits": bits,
                 "scheme": plan.baseMode,
                 "scaleType": "BF16",
                 "biasType": "BF16",
-                "groupSize": plan.baseGroupSize
+                "groupSize": slotGroupSize
             ]
-            if let perLayer = bitWidths.perLayer?[slot], !perLayer.isEmpty {
-                // Emit the per-layer overrides on the minority-width layers.
-                // The slot's scalar weightBits/groupSize is the majority
-                // (default), and overrides are sparse exceptions.
+            if !perLayer.isEmpty {
                 let overrides = perLayer.filter {
-                    $0.weightBits != bits || $0.groupSize != plan.baseGroupSize
+                    $0.weightBits != bits || $0.groupSize != slotGroupSize
                 }
                 if !overrides.isEmpty {
                     entry["perLayer"] = overrides.map { o in

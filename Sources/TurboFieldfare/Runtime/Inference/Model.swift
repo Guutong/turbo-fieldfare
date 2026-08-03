@@ -352,7 +352,7 @@ extension Model {
     /// files are verified lazily on first `routedExpert(...)` touch.
     public static func load(directoryURL: URL,
                             device: MTLDevice,
-                            expecting: ArchConfig = .gemma4_26B_A4B,
+                            expecting: ArchConfig? = nil,
                             streamingMode: ExpertStreamingMode = .pread(slotCount: 16),
                             expertCachePolicy: ExpertCachePolicy = PreadExpertStreamer.cachePolicyDefault,
                             integrityPolicy: ModelIntegrityPolicy? = nil,
@@ -448,7 +448,7 @@ extension Model {
 
         return Model(
             device: device,
-            config: expecting,
+            config: manifest.arch.asArchConfig,
             streamingMode: streamingMode,
             expertCachePolicy: expertCachePolicy,
             integrityPolicy: resolvedIntegrityPolicy,
