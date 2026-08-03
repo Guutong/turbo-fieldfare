@@ -51,6 +51,8 @@ static inline uint fused_fc_rotary(constant uint& rotary) {
     return (fused_use_fc() && is_function_constant_defined(FC_FUSED_ROTARY)) ? FC_FUSED_ROTARY : rotary;
 }
 
+#ifndef ROPE_SCALING_PARAMS_DEFINED
+#define ROPE_SCALING_PARAMS_DEFINED
 struct RopeScalingParams {
     uint enabled;
     float factor;
@@ -58,6 +60,7 @@ struct RopeScalingParams {
     float beta_fast;
     float beta_slow;
 };
+#endif
 
 static inline float fused_compute_rope_freq(
     uint pair,

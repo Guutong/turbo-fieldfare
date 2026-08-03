@@ -29,6 +29,8 @@ static inline uint rope_rotated_pairs(constant uint& runtime_value) {
         : runtime_value;
 }
 
+#ifndef ROPE_SCALING_PARAMS_DEFINED
+#define ROPE_SCALING_PARAMS_DEFINED
 struct RopeScalingParams {
     uint enabled;
     float factor;
@@ -36,6 +38,7 @@ struct RopeScalingParams {
     float beta_fast;
     float beta_slow;
 };
+#endif
 
 static inline float compute_rope_freq(
     uint pair,

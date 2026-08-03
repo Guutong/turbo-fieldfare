@@ -10,8 +10,8 @@ import Metal
         let denseMask: [UInt8] = [1, 0, 0, 0]
         let cfg = ArchConfig(
             hiddenSize: 64,
-            intermediateSize: 48,
-            moeIntermediateSize: 16,
+            intermediateSize: 64,
+            moeIntermediateSize: 64,
             numHeads: 4,
             numKVHeads: 2,
             numFullKVHeads: 1,
@@ -31,7 +31,7 @@ import Metal
             fullAttentionLayerMask: [0, 1, 0, 1],
             hiddenActivation: "gelu_pytorch_tanh",
             denseMLPLayerMask: denseMask,
-            denseMLPIntermediateSize: 96
+            denseMLPIntermediateSize: 128
         )
 
         #expect(cfg.isDenseMLP(layer: 0) == true)
@@ -46,8 +46,8 @@ import Metal
     @Test func prefillChunkScratchLayoutSizesSharedIntermediateToMax() {
         let cfg = ArchConfig(
             hiddenSize: 64,
-            intermediateSize: 48,
-            moeIntermediateSize: 16,
+            intermediateSize: 64,
+            moeIntermediateSize: 64,
             numHeads: 4,
             numKVHeads: 2,
             numFullKVHeads: 1,
@@ -67,12 +67,12 @@ import Metal
             fullAttentionLayerMask: [0, 1],
             hiddenActivation: "gelu_pytorch_tanh",
             denseMLPLayerMask: [1, 0],
-            denseMLPIntermediateSize: 96
+            denseMLPIntermediateSize: 128
         )
 
         let layout = PrefillChunkScratchLayout(config: cfg, chunkTokens: 16)
-        #expect(layout.sharedIntermediate == 96)
-        #expect(layout.sharedExpertScratchElements == 96)
+        #expect(layout.sharedIntermediate == 128)
+        #expect(layout.sharedExpertScratchElements == 128)
     }
 
     /// Build a minimal synthetic model directory where Layer 0 is dense MLP (no router)
@@ -81,8 +81,8 @@ import Metal
         let denseMask: [UInt8] = [1, 0]
         let toy = ArchConfig(
             hiddenSize: 64,
-            intermediateSize: 48,
-            moeIntermediateSize: 16,
+            intermediateSize: 64,
+            moeIntermediateSize: 64,
             numHeads: 4,
             numKVHeads: 2,
             numFullKVHeads: 1,
@@ -102,7 +102,7 @@ import Metal
             fullAttentionLayerMask: [0, 1],
             hiddenActivation: "gelu_pytorch_tanh",
             denseMLPLayerMask: denseMask,
-            denseMLPIntermediateSize: 96
+            denseMLPIntermediateSize: 128
         )
 
         let dir = FileManager.default.temporaryDirectory
@@ -188,7 +188,7 @@ import Metal
                 let biasesOffset = bytes.count
                 appendProjection(rows: projectionRows, to: &bytes, component: "biases")
                 tensors["\(prefix)_biases"] = [
-                    "offset": biasesOffset, "size": bytes.count - biasesOffset,
+                    "offset": biasesOffset, "size": biasesOffset,
                     "dtype": "BF16", "shape": [rows, cols / Quantization.groupSize],
                 ]
             }
@@ -363,11 +363,13 @@ import Metal
         }
         resData.append(contentsOf: jsonBytes)
 
-        try Data(resData).write(to: dir.appendingPathComponent("resident.bin"))
+        let resURL = dir.appendingPathComponent("resident.bin")
+        try Data(resData).write(to: resURL)
 
         // Packed experts layout & data for layer 1 (MoE)
         var layoutLayers: [[String: Any]] = []
         for L in 0..<toy.numLayers {
+            let filename = String(format: "layer_%02d.bin", L)
             if toy.isDenseMLP(atLayer: L) {
                 layoutLayers.append([
                     "layer": L,
@@ -378,7 +380,6 @@ import Metal
                 ])
                 continue
             }
-            let filename = "layer_\(L).bin"
             let blobPath = exp.appendingPathComponent(filename)
             var blobData = [UInt8]()
             var expOffsets: [[String: Any]] = []
@@ -405,12 +406,63 @@ import Metal
         }
 
         let layoutDict: [String: Any] = [
-            "version": 1,
-            "numExperts": toy.numExperts,
+            "expertStride": 16384,
+            "numLayers": toy.numLayers,
+            "expertsPerLayer": toy.numExperts,
             "layers": layoutLayers,
         ]
         let layoutData = try JSONSerialization.data(withJSONObject: layoutDict, options: [.prettyPrinted, .sortedKeys])
-        try layoutData.write(to: exp.appendingPathComponent("layout.json"))
+        let layoutURL = exp.appendingPathComponent("layout.json")
+        try layoutData.write(to: layoutURL)
+
+        // Write manifest.json
+        var files: [String: [String: Any]] = [
+            "resident.bin": ["size": resData.count, "sha256": try Sha256Verifier.hashFile(at: resURL)],
+            "packed_experts/layout.json": ["size": layoutData.count, "sha256": try Sha256Verifier.hashFile(at: layoutURL)],
+        ]
+        for L in 0..<toy.numLayers {
+            if !toy.isDenseMLP(atLayer: L) {
+                let name = String(format: "layer_%02d.bin", L)
+                let url = exp.appendingPathComponent(name)
+                files["packed_experts/\(name)"] = ["size": try Data(contentsOf: url).count, "sha256": try Sha256Verifier.hashFile(at: url)]
+            }
+        }
+
+        let archDict: [String: Any] = [
+            "hiddenSize": toy.hiddenSize, "ffnIntermediate": toy.intermediateSize,
+            "moeIntermediateSize": toy.moeIntermediateSize,
+            "numHeads": toy.numHeads, "numKVHeads": toy.numKVHeads,
+            "numFullKVHeads": toy.numFullKVHeads,
+            "headDim": toy.headDim, "fullHeadDim": toy.fullHeadDim,
+            "vocabSize": toy.vocabSize, "slidingWindow": toy.slidingWindow,
+            "finalLogitSoftcap": toy.finalLogitSoftcap,
+            "ropeTheta": toy.ropeTheta, "fullRopeTheta": toy.fullRopeTheta,
+            "partialRotaryFactor": toy.partialRotaryFactor,
+            "numLayers": toy.numLayers, "numExperts": toy.numExperts,
+            "topKExperts": toy.topKExperts,
+            "tieWordEmbeddings": toy.tieWordEmbeddings,
+            "attentionKEqV": toy.attentionKEqV,
+            "hiddenActivation": toy.hiddenActivation,
+            "fullAttentionLayerMask": toy.fullAttentionLayerMask.map { Int($0) },
+            "denseMLPLayerMask": toy.denseMLPLayerMask.map { Int($0) },
+            "denseMLPIntermediateSize": toy.denseMLPIntermediateSize,
+        ]
+        let manifestRoot: [String: Any] = [
+            "magic": "GTURBO",
+            "versionMajor": 1,
+            "versionMinor": 0,
+            "flags": ["streamingPresent": true, "turboQuantKV": false, "aneSharedExpert": false],
+            "modelID": "toy",
+            "arch": archDict,
+            "files": files,
+            "expertsPerLayer": toy.numExperts,
+            "numLayers": toy.numLayers,
+            "expertStride": 16384,
+        ]
+        let manifestData = try JSONSerialization.data(withJSONObject: manifestRoot, options: [.sortedKeys, .withoutEscapingSlashes])
+        try manifestData.write(to: dir.appendingPathComponent("manifest.json"))
+
+        try ModelLoaderTests.writeVerifiedInstallReceipt(directoryURL: dir, expecting: toy)
 
         return (dir, toy)
     }

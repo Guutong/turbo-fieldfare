@@ -708,6 +708,8 @@ kernel void prefill_dequant_int4_qmm_f16_block(
     Y[t * N + n] = half(acc);
 }
 
+#ifndef ROPE_SCALING_PARAMS_DEFINED
+#define ROPE_SCALING_PARAMS_DEFINED
 struct RopeScalingParams {
     uint enabled;
     float factor;
@@ -715,6 +717,7 @@ struct RopeScalingParams {
     float beta_fast;
     float beta_slow;
 };
+#endif
 
 static inline float prefill_compute_rope_freq(
     uint pair,
