@@ -20,6 +20,9 @@ enum GTurboJSON {
         var router: Int
         var sharedExpert: Int
         var routedExpert: Int
+        /// Per-layer overrides for slots that vary by layer (Laguna attention).
+        /// Keyed by slot name: "attention", "sharedExpert", etc.
+        var perLayer: [String: [(layer: Int, weightBits: Int, groupSize: Int)]]?
     }
 
     static func encodeManifest(plan: RepackPlan,
@@ -91,13 +94,28 @@ enum GTurboJSON {
         ]
         var quantDict: [String: Any] = [:]
         for (slot, bits) in quantBits {
-            quantDict[slot] = [
+            var entry: [String: Any] = [
                 "weightBits": bits,
                 "scheme": plan.baseMode,
                 "scaleType": "BF16",
                 "biasType": "BF16",
                 "groupSize": plan.baseGroupSize
             ]
+            if let perLayer = bitWidths.perLayer?[slot], !perLayer.isEmpty {
+                // Emit the per-layer overrides on the minority-width layers.
+                // The slot's scalar weightBits/groupSize is the majority
+                // (default), and overrides are sparse exceptions.
+                let overrides = perLayer.filter {
+                    $0.weightBits != bits || $0.groupSize != plan.baseGroupSize
+                }
+                if !overrides.isEmpty {
+                    entry["perLayer"] = overrides.map { o in
+                        ["layer": o.layer, "weightBits": o.weightBits,
+                         "groupSize": o.groupSize]
+                    }
+                }
+            }
+            quantDict[slot] = entry
         }
 
         var filesDict: [String: Any] = [:]

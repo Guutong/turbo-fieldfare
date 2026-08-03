@@ -689,9 +689,25 @@ public final class RemoteStreamingRepacker {
             observations: observations { $0 == RepackPlanner.embedTokensWeightName }) {
             bits.embedding = b
         }
-        if let b = try RepackPlanner.uniformBits(
+        // Attention may vary per layer (Laguna: 5-bit on 20 layers, 8-bit on
+        // 28). When it does, emit perLayer overrides so the runtime can select
+        // per layer; when uniform, keep the scalar path unchanged.
+        let attentionObservations = observations { $0.hasSuffix(".self_attn.q_proj.weight") }
+        let attentionByLayer = RepackPlanner.perLayerAttentionBits(
+            observations: attentionObservations)
+        if let perLayer = attentionByLayer {
+            let distinct = Set(perLayer.map(\.weightBits))
+            // Majority width becomes the slot default; minority layers get
+            // perLayer overrides in the manifest.
+            let counts = Dictionary(grouping: perLayer) { $0.weightBits }.mapValues { $0.count }
+            let defaultBits = counts.max(by: { $0.value < $1.value })!.key
+            bits.attention = defaultBits
+            var overrides = bits.perLayer ?? [:]
+            overrides["attention"] = perLayer.filter { $0.weightBits != defaultBits }
+            bits.perLayer = overrides
+        } else if let b = try RepackPlanner.uniformBits(
             slot: "attention",
-            observations: observations { $0.hasSuffix(".self_attn.q_proj.weight") }) {
+            observations: attentionObservations) {
             bits.attention = b
         }
         if let b = try RepackPlanner.uniformBits(

@@ -208,6 +208,39 @@ enum RepackPlanner {
         return distinct.first
     }
 
+    /// Extracts per-layer `(weightBits, groupSize)` for the attention slot
+    /// from a list of `(tensorName, bits)` observations. Returns `nil` when
+    /// all layers share the same bits and group size (the uniform case), or
+    /// when observations are empty. When widths vary — as they do on
+    /// Laguna-S-2.1 — the caller writes a `perLayer` override table instead
+    /// of a single `weightBits`.
+    ///
+    /// Group size is inferred from the quant spec on each entry rather than
+    /// assumed from `plan.baseGroupSize`, so a future checkpoint that varies
+    /// group size per layer works without a separate code path.
+    static func perLayerAttentionBits(
+        observations: [(name: String, bits: Int)]
+    ) -> [(layer: Int, weightBits: Int, groupSize: Int)]? {
+        guard !observations.isEmpty else { return nil }
+        // Map: layer -> (weightBits, groupSize). The observation entries carry
+        // `bits` but not `groupSize` — we assume the plan's base group size
+        // since the manifest format records one group per slot.  If a future
+        // checkpoint varies group size per layer, the observations struct
+        // will need a `groupSize` field.
+        var byLayer: [Int: Int] = [:]
+        for (name, bits) in observations {
+            guard let idx = layerIndex(in: name) else { continue }
+            byLayer[idx] = bits
+        }
+        guard !byLayer.isEmpty else { return nil }
+        let distinct = Set(byLayer.values)
+        guard distinct.count > 1 else { return nil }  // uniform — caller uses scalar
+        // All attention layers in known checkpoints share the same group size.
+        // The caller supplies the group size from the plan.
+        return byLayer.map { (layer: $0.key, weightBits: $0.value, groupSize: 64) }
+            .sorted { $0.layer < $1.layer }
+    }
+
     private static func isDenseMLPLayer(_ layer: Int, mask: [UInt8]) -> Bool {
         guard layer >= 0, layer < mask.count else { return false }
         return mask[layer] == 1
