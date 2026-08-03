@@ -37,6 +37,8 @@ public struct ManifestArch: Decodable, Equatable, Sendable {
     public let fullRopeScaling: ManifestRopeScaling?
     public let attentionGating: String?
     public let routedScalingFactor: Double?
+    public let normTopology: String?
+    public let routerScoring: String?
 }
 
 public struct ManifestRopeScaling: Decodable, Equatable, Sendable {
@@ -90,7 +92,9 @@ extension ManifestArch {
             fullPartialRotaryFactor: fullPartialRotaryFactor,
             fullRopeScaling: fullRopeScaling?.asRopeScaling,
             attentionGating: AttentionGating(rawValue: attentionGating ?? "none") ?? .none,
-            routedScalingFactor: routedScalingFactor ?? 1.0
+            routedScalingFactor: routedScalingFactor ?? 1.0,
+            normTopology: NormTopology(rawValue: normTopology ?? "sandwich") ?? .sandwich,
+            routerScoring: RouterScoring(rawValue: routerScoring ?? "softmaxTopK") ?? .softmaxTopK
         )
     }
 }
@@ -381,6 +385,12 @@ public enum ManifestReader {
         try check("routedScalingFactor",
                   a.routedScalingFactor ?? 1.0,
                   e.routedScalingFactor)
+        try check("normTopology",
+                  a.normTopology ?? NormTopology.sandwich.rawValue,
+                  e.normTopology.rawValue)
+        try check("routerScoring",
+                  a.routerScoring ?? RouterScoring.softmaxTopK.rawValue,
+                  e.routerScoring.rawValue)
 
         // Per-layer arrays, when present, must cover every layer.
         if let heads = a.headsPerLayer, !heads.isEmpty, heads.count != a.numLayers {

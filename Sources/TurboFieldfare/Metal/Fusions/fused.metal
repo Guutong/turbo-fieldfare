@@ -404,3 +404,90 @@ void fused_layer_tail(
         hidden[i] = hidden[i] * hScale;
     }
 }
+
+// ============================================================================
+// Pre-norm (Qwen/Laguna) decoder-block variants.
+//
+// These are separate kernels rather than function-constant branches inside the
+// sandwich ones so that Gemma's path is byte-for-byte the code it was before.
+// The block they implement is:
+//
+//     h = h + attn                       // no norm on the attention output
+//     u = rmsnorm(h) * w_pre_ffn         // "post_attention_layernorm"
+//     h = h + (h1 + routed_scale * h2)   // no norm on the way out
+//
+// The `_2` weight slots are absent in this topology; both FFN branches and the
+// router read the same `u`, so `fused_post_attn_setup_prenorm` writes it to all
+// three outputs rather than making every downstream consumer topology-aware.
+// ============================================================================
+
+[[kernel, max_total_threads_per_threadgroup(kFusedThreads)]]
+void fused_post_attn_setup_prenorm(
+    device       half*   hidden         [[buffer(0)]],  // [D] FP16 in-place
+    device const half*   attn           [[buffer(1)]],  // [D] FP16
+    device       half*   dense_x        [[buffer(2)]],  // [D] FP16
+    device       half*   routed_x       [[buffer(3)]],  // [D] FP16
+    device       half*   router_x       [[buffer(4)]],  // [D] FP16
+    device const bfloat* w_pre_ffn      [[buffer(5)]],  // [D] BF16
+    constant     uint&   D              [[buffer(6)]],
+    constant     float&  rms_eps        [[buffer(7)]],
+    uint  lid              [[thread_position_in_threadgroup]],
+    uint  lsize            [[threads_per_threadgroup]],
+    uint  simd_lane_id     [[thread_index_in_simdgroup]],
+    uint  simd_group_id    [[simdgroup_index_in_threadgroup]],
+    uint  simdgroups       [[simdgroups_per_threadgroup]]
+) {
+    threadgroup half  hidden_tg[kFusedMaxD];
+    threadgroup float partial[kFusedMaxSimdGroups];
+    const uint DD = fused_fc_d(D);
+
+    // Residual add, then one RMSNorm over the result. Same FP16 stage boundary
+    // as the sandwich kernel: the sum is rounded to half before the reduction.
+    float acc = 0.0f;
+    for (uint i = lid; i < DD; i += lsize) {
+        half h = half(float(hidden[i]) + float(attn[i]));
+        hidden_tg[i] = h;
+        hidden[i] = h;
+        float hf = float(h);
+        acc = fma(hf, hf, acc);
+    }
+    acc = simd_sum(acc);
+    if (simd_lane_id == 0) {
+        partial[simd_group_id] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_group_id == 0) {
+        float sum = (simd_lane_id < simdgroups) ? partial[simd_lane_id] : 0.0f;
+        sum = simd_sum(sum);
+        if (simd_lane_id == 0) {
+            partial[0] = rsqrt(sum / float(DD) + rms_eps);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float hidden_inv = partial[0];
+    for (uint i = lid; i < DD; i += lsize) {
+        const half u = half(float(hidden_tg[i]) * hidden_inv * float(w_pre_ffn[i]));
+        dense_x[i]  = u;
+        routed_x[i] = u;
+        router_x[i] = u;
+    }
+}
+
+[[kernel, max_total_threads_per_threadgroup(kFusedThreads)]]
+void fused_layer_tail_prenorm(
+    device const half*   h2             [[buffer(0)]],  // [D] FP16 routed branch
+    device const half*   h1             [[buffer(1)]],  // [D] FP16 shared/dense branch
+    device       half*   hidden         [[buffer(2)]],  // [D] FP16 in-place
+    constant     uint&   D              [[buffer(3)]],
+    constant     float&  routed_scale   [[buffer(4)]],
+    uint  lid              [[thread_position_in_threadgroup]],
+    uint  lsize            [[threads_per_threadgroup]]
+) {
+    const uint DD = fused_fc_d(D);
+    const half scale = half(routed_scale);
+    for (uint i = lid; i < DD; i += lsize) {
+        hidden[i] = half(hidden[i] + half(h1[i] + half(scale * h2[i])));
+    }
+}

@@ -135,7 +135,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         let gate: SharedExpertInt8Proj
         let up: SharedExpertInt8Proj
         let down: SharedExpertInt8Proj
-        let postF1: TensorView
+        /// nil under `.preNorm`, which does not norm the shared/dense branch
+        /// output on its way to the residual.
+        let postF1: TensorView?
     }
 
     private let model: Model
@@ -243,6 +245,25 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         self.ctx = context
         self.cfg = model.config
         self.maxContext = maxContext
+
+        // Refuse architectures the kernels cannot execute, rather than running
+        // the nearest available kernel and returning numbers that look fine.
+        // Both of these are wired end-to-end everywhere *except* the kernel
+        // itself; see "Remaining kernel work" in HANDOFF.md.
+        if model.config.routerScoring == .sigmoidTopK {
+            throw ModelError.unsupportedArchFeature(
+                feature: "routerScoring",
+                value: model.config.routerScoring.rawValue,
+                detail: "only softmax-over-topK routing has a kernel; a sigmoid "
+                      + "router needs scoring over all experts, a selection-only "
+                      + "e_score_correction_bias, and top-K renormalization")
+        }
+        if model.config.hiddenActivation != "gelu_pytorch_tanh" {
+            throw ModelError.unsupportedArchFeature(
+                feature: "hiddenActivation",
+                value: model.config.hiddenActivation,
+                detail: "every FFN kernel hardcodes gelu_pytorch_tanh")
+        }
         self.useFusedGreedyHead = runtimeConfiguration.headPath == .fusedRows
         self.prefillAttentionPath = runtimeConfiguration.prefillAttentionPath
         let useFP16Ring = runtimeConfiguration.fp16RingEnabled
@@ -394,15 +415,22 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                               options: .storageModeShared) else {
                 throw ModelError.residentBufferWrapFailed
             }
+            // A `.sigmoidTopK` router has no input scale and no 1/sqrt(D)
+            // factor — `F.linear(u, W)` on the already-normed MLP input — so
+            // its effective scale is all ones.
             if !cfg.isDenseMLP(atLayer: L) {
-                let scaleView = try model.routerScale(layer: L)
-                let src = scaleView.buffer.contents()
-                    .advanced(by: Int(scaleView.offset))
-                    .assumingMemoryBound(to: UInt16.self)
                 let dst = buf.contents().assumingMemoryBound(to: UInt16.self)
-                for i in 0..<dInts {
-                    let v = Quantization.bf16ToFloat(src[i]) * invSqrtD
-                    dst[i] = Quantization.bf16Bits(v)
+                if let scaleView = try model.routerScale(layer: L) {
+                    let src = scaleView.buffer.contents()
+                        .advanced(by: Int(scaleView.offset))
+                        .assumingMemoryBound(to: UInt16.self)
+                    for i in 0..<dInts {
+                        let v = Quantization.bf16ToFloat(src[i]) * invSqrtD
+                        dst[i] = Quantization.bf16Bits(v)
+                    }
+                } else {
+                    let one = Quantization.bf16Bits(1.0)
+                    for i in 0..<dInts { dst[i] = one }
                 }
             }
             buf.label = "effective_scale.L\(L)"
@@ -430,6 +458,44 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 "continuation expected KV position \(expectedPosition), current \(kv.position)")
         }
         resetTransientState()
+    }
+
+    /// Decode-path layer tail. The two block topologies differ in everything
+    /// between the FFN branches and the residual, so both decode call sites
+    /// (dense and routed) go through here rather than branching twice.
+    ///
+    /// `postF2`/`postF` are nil and `layerScalar` is 1.0 under `.preNorm`; the
+    /// pre-norm kernel takes neither.
+    private func encodeDecodeLayerTail(_ cb: MTLCommandBuffer,
+                                       postF2: TensorView?,
+                                       postF: TensorView?,
+                                       layerScalar: Float) {
+        let D = UInt32(model.config.hiddenSize)
+        switch model.config.normTopology {
+        case .preNorm:
+            fusedTail.encodePreNorm(commandBuffer: cb,
+                                    h2: h2Buf,
+                                    h1: h1Buf,
+                                    hidden: hidden,
+                                    d: D,
+                                    routedScale: Float(model.config.routedScalingFactor))
+        case .sandwich:
+            guard let postF2, let postF else {
+                preconditionFailure(
+                    "sandwich topology requires post_feedforward_layernorm{,_2}")
+            }
+            fusedTail.encode(commandBuffer: cb,
+                             h2: h2Buf,
+                             h1: h1Buf,
+                             hidden: hidden,
+                             postFFN2Weight: postF2.buffer,
+                             postFFN2WeightOffset: Int(postF2.offset),
+                             postFFNWeight: postF.buffer,
+                             postFFNWeightOffset: Int(postF.offset),
+                             d: D,
+                             eps: 1e-6,
+                             layerScalar: layerScalar)
+        }
     }
 
     private func resetTransientState() {
@@ -627,13 +693,18 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             let postAttention: TensorView
             let preFFN: TensorView
             let preFFN2: TensorView
-            let postFFN2: TensorView
-            let postFFN: TensorView
-            let layerScalar: TensorView
+            /// nil under `.preNorm`, which norms nothing on the way out of the
+            /// FFN and has no per-layer residual gain.
+            let postFFN2: TensorView?
+            let postFFN: TensorView?
+            let layerScalar: TensorView?
             let qNorm: TensorView
             let kNorm: TensorView
             let router: TensorView?
+            /// nil under `.sigmoidTopK`, which has no output scale.
             let routerPerExpertScale: TensorView?
+            /// nil under `.softmaxTopK`, which has no selection bias.
+            let routerSelectionBias: TensorView?
         }
 
         let layerViews = try (0..<cfg.numLayers).map { L in
@@ -654,7 +725,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 qNorm: try model.qNorm(layer: L),
                 kNorm: try model.kNorm(layer: L),
                 router: isDense ? nil : (try model.router(layer: L)),
-                routerPerExpertScale: isDense ? nil : (try model.routerPerExpertScale(layer: L)))
+                routerPerExpertScale: isDense ? nil : (try model.routerPerExpertScale(layer: L)),
+                routerSelectionBias: isDense ? nil : (try model.routerSelectionBias(layer: L)))
         }
 
         let tokenIDs = tokens.map { UInt32(bitPattern: $0) }
@@ -668,6 +740,51 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         let sqrtHidden = Float(D).squareRoot()
         let t = tokens.count
         let emb = model.embedding
+
+        /// The two block topologies differ in what happens between the FFN
+        /// branches and the residual, so the tail is dispatched here rather
+        /// than duplicated at the dense and MoE call sites.
+        func encodePrefillLayerTail(commandBuffer: MTLCommandBuffer,
+                                    views: LayerPrefillQKVViews) throws {
+            switch cfg.normTopology {
+            case .preNorm:
+                prefillLayerTail.encodePreNorm(commandBuffer: commandBuffer,
+                                               h2: scratch.h2,
+                                               h1: scratch.h1,
+                                               hidden: scratch.hidden,
+                                               queryCount: UInt32(t),
+                                               d: UInt32(D),
+                                               h2StrideElements: UInt32(D),
+                                               h1StrideElements: UInt32(D),
+                                               hiddenStrideElements: UInt32(D),
+                                               routedScale: Float(cfg.routedScalingFactor))
+            case .sandwich:
+                guard let postFFN2 = views.postFFN2,
+                      let postFFN = views.postFFN,
+                      let layerScalar = views.layerScalar else {
+                    throw ModelError.tensorNotFound(
+                        name: "post_feedforward_layernorm / layer_scalar")
+                }
+                let scalarBits = layerScalar.buffer.contents()
+                    .advanced(by: Int(layerScalar.offset))
+                    .assumingMemoryBound(to: UInt16.self)[0]
+                prefillLayerTail.encode(commandBuffer: commandBuffer,
+                                        h2: scratch.h2,
+                                        h1: scratch.h1,
+                                        hidden: scratch.hidden,
+                                        postFFN2Weight: postFFN2.buffer,
+                                        postFFN2WeightOffset: Int(postFFN2.offset),
+                                        postFFNWeight: postFFN.buffer,
+                                        postFFNWeightOffset: Int(postFFN.offset),
+                                        queryCount: UInt32(t),
+                                        d: UInt32(D),
+                                        h2StrideElements: UInt32(D),
+                                        h1StrideElements: UInt32(D),
+                                        hiddenStrideElements: UInt32(D),
+                                        eps: eps,
+                                        layerScalar: Quantization.bf16ToFloat(scalarBits))
+            }
+        }
 
         func encodeAttentionProjection(commandBuffer: MTLCommandBuffer,
                                        family: PrefillProjectionFamily,
@@ -1049,14 +1166,16 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                                     intermediate: layerF,
                                                     xStrideElements: D,
                                                     yStrideElements: D)
-                prefillRMS.encodeBF16W(commandBuffer: sharedCB,
-                                       x: scratch.h1,
-                                       weight: sharedProj.postF1.buffer,
-                                       weightOffset: Int(sharedProj.postF1.offset),
-                                       out: scratch.h1,
-                                       t: UInt32(t),
-                                       d: UInt32(D),
-                                       eps: eps)
+                if let postF1 = sharedProj.postF1 {
+                    prefillRMS.encodeBF16W(commandBuffer: sharedCB,
+                                           x: scratch.h1,
+                                           weight: postF1.buffer,
+                                           weightOffset: Int(postF1.offset),
+                                           out: scratch.h1,
+                                           t: UInt32(t),
+                                           d: UInt32(D),
+                                           eps: eps)
+                }
                 sharedCB.commit()
                 waitForCompletion(sharedCB)
                 if let error = sharedCB.error {
@@ -1070,24 +1189,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     blit.fill(buffer: scratch.h2, range: 0..<(t * D * MemoryLayout<Float16>.stride), value: 0)
                     blit.endEncoding()
                 }
-                let scalarBits = views.layerScalar.buffer.contents()
-                    .advanced(by: Int(views.layerScalar.offset))
-                    .assumingMemoryBound(to: UInt16.self)[0]
-                prefillLayerTail.encode(commandBuffer: tailCB,
-                                        h2: scratch.h2,
-                                        h1: scratch.h1,
-                                        hidden: scratch.hidden,
-                                        postFFN2Weight: views.postFFN2.buffer,
-                                        postFFN2WeightOffset: Int(views.postFFN2.offset),
-                                        postFFNWeight: views.postFFN.buffer,
-                                        postFFNWeightOffset: Int(views.postFFN.offset),
-                                        queryCount: UInt32(t),
-                                        d: UInt32(D),
-                                        h2StrideElements: UInt32(D),
-                                        h1StrideElements: UInt32(D),
-                                        hiddenStrideElements: UInt32(D),
-                                        eps: eps,
-                                        layerScalar: Quantization.bf16ToFloat(scalarBits))
+                try encodePrefillLayerTail(commandBuffer: tailCB, views: views)
                 tailCB.commit()
                 waitForCompletion(tailCB)
                 if let error = tailCB.error {
@@ -1185,14 +1287,16 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                                         intermediate: cfg.intermediateSize,
                                                         xStrideElements: D,
                                                         yStrideElements: D)
-                    prefillRMS.encodeBF16W(commandBuffer: sharedCB,
-                                           x: scratch.h1,
-                                           weight: sharedProj.postF1.buffer,
-                                           weightOffset: Int(sharedProj.postF1.offset),
-                                           out: scratch.h1,
-                                           t: UInt32(t),
-                                           d: UInt32(D),
-                                           eps: eps)
+                    if let postF1 = sharedProj.postF1 {
+                        prefillRMS.encodeBF16W(commandBuffer: sharedCB,
+                                               x: scratch.h1,
+                                               weight: postF1.buffer,
+                                               weightOffset: Int(postF1.offset),
+                                               out: scratch.h1,
+                                               t: UInt32(t),
+                                               d: UInt32(D),
+                                               eps: eps)
+                    }
                     sharedCB.commit()
                     waitForCompletion(sharedCB)
                     if let error = sharedCB.error {
@@ -1349,24 +1453,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                                       queryCount: UInt32(t),
                                                       topK: UInt32(cfg.topKExperts),
                                                       d: UInt32(D))
-                    let scalarBits = views.layerScalar.buffer.contents()
-                        .advanced(by: Int(views.layerScalar.offset))
-                        .assumingMemoryBound(to: UInt16.self)[0]
-                    prefillLayerTail.encode(commandBuffer: tailCB,
-                                            h2: scratch.h2,
-                                            h1: scratch.h1,
-                                            hidden: scratch.hidden,
-                                            postFFN2Weight: views.postFFN2.buffer,
-                                            postFFN2WeightOffset: Int(views.postFFN2.offset),
-                                            postFFNWeight: views.postFFN.buffer,
-                                            postFFNWeightOffset: Int(views.postFFN.offset),
-                                            queryCount: UInt32(t),
-                                            d: UInt32(D),
-                                            h2StrideElements: UInt32(D),
-                                            h1StrideElements: UInt32(D),
-                                            hiddenStrideElements: UInt32(D),
-                                            eps: eps,
-                                            layerScalar: Quantization.bf16ToFloat(scalarBits))
+                    try encodePrefillLayerTail(commandBuffer: tailCB, views: views)
                     tailCB.commit()
                     withExtendedLifetime(metadata) {
                         waitForCompletion(tailCB)
@@ -1539,7 +1626,13 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             let postF    = try model.postFFN(layer: L)
             let routerW  = isDense ? nil : (try model.router(layer: L))
             let perExpertScale = isDense ? nil : (try model.routerPerExpertScale(layer: L))
-            let layerScalarView = try model.layerScalar(layer: L)
+            // 1.0 under `.preNorm`, which has no per-layer residual gain.
+            let layerScalar: Float = try model.layerScalar(layer: L).map {
+                Quantization.bf16ToFloat(
+                    $0.buffer.contents()
+                        .advanced(by: Int($0.offset))
+                        .assumingMemoryBound(to: UInt16.self)[0])
+            } ?? 1.0
 
             let tCb1Start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
             // Everything up to and including the router runs in a single CB:
@@ -1676,20 +1769,34 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             }
 
             let gPostAttnSetup: (MTLCommandBuffer) -> Void = { [self] cb in
-                fusedPostAttentionSetup.encode(commandBuffer: cb,
-                                               hidden: hidden,
-                                               attn: oOut,
-                                               denseX: denseX,
-                                               routedX: routedX,
-                                               routerX: routerInput,
-                                               postAttentionWeight: postAttn.buffer,
-                                               postAttentionWeightOffset: Int(postAttn.offset),
-                                               preFFNWeight: preFFN.buffer,
-                                               preFFNWeightOffset: Int(preFFN.offset),
-                                               preFFN2Weight: preFFN2.buffer,
-                                               preFFN2WeightOffset: Int(preFFN2.offset),
-                                               d: D,
-                                               eps: eps)
+                switch cfg.normTopology {
+                case .preNorm:
+                    fusedPostAttentionSetup.encodePreNorm(commandBuffer: cb,
+                                                          hidden: hidden,
+                                                          attn: oOut,
+                                                          denseX: denseX,
+                                                          routedX: routedX,
+                                                          routerX: routerInput,
+                                                          preFFNWeight: preFFN.buffer,
+                                                          preFFNWeightOffset: Int(preFFN.offset),
+                                                          d: D,
+                                                          eps: eps)
+                case .sandwich:
+                    fusedPostAttentionSetup.encode(commandBuffer: cb,
+                                                   hidden: hidden,
+                                                   attn: oOut,
+                                                   denseX: denseX,
+                                                   routedX: routedX,
+                                                   routerX: routerInput,
+                                                   postAttentionWeight: postAttn.buffer,
+                                                   postAttentionWeightOffset: Int(postAttn.offset),
+                                                   preFFNWeight: preFFN.buffer,
+                                                   preFFNWeightOffset: Int(preFFN.offset),
+                                                   preFFN2Weight: preFFN2.buffer,
+                                                   preFFN2WeightOffset: Int(preFFN2.offset),
+                                                   d: D,
+                                                   eps: eps)
+                }
             }
 
             let gRouter: (MTLCommandBuffer) -> Void = { [self] cb in
@@ -1742,9 +1849,10 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                        scratchAct: denseScratchAct)
                 }
                 let gSharedNorm: (MTLCommandBuffer) -> Void = { [self] cb in
+                    guard let postF1 = sharedProj.postF1 else { return }
                     rms.encodeBF16W(commandBuffer: cb, x: h1Buf,
-                                    weight: sharedProj.postF1.buffer,
-                                    weightOffset: Int(sharedProj.postF1.offset),
+                                    weight: postF1.buffer,
+                                    weightOffset: Int(postF1.offset),
                                     out: h1Buf, d: D, eps: eps)
                 }
                 let sharedCB = ctx.queue.makeCommandBuffer()!
@@ -1752,23 +1860,10 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 gSharedNorm(sharedCB)
                 sharedCB.commit()
 
-                let scalarPtr = layerScalarView.buffer.contents()
-                    .advanced(by: Int(layerScalarView.offset))
-                    .assumingMemoryBound(to: UInt16.self)
-                let layerScalar = Quantization.bf16ToFloat(scalarPtr[0])
 
                 let gTail: (MTLCommandBuffer) -> Void = { [self] cb in
-                    fusedTail.encode(commandBuffer: cb,
-                                     h2: h2Buf,
-                                     h1: h1Buf,
-                                     hidden: hidden,
-                                     postFFN2Weight: postF2.buffer,
-                                     postFFN2WeightOffset: Int(postF2.offset),
-                                     postFFNWeight: postF.buffer,
-                                     postFFNWeightOffset: Int(postF.offset),
-                                     d: D,
-                                     eps: eps,
-                                     layerScalar: layerScalar)
+                    encodeDecodeLayerTail(cb, postF2: postF2, postF: postF,
+                                          layerScalar: layerScalar)
                 }
                 let tCb2Start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
                 let denseTailCB = ctx.queue.makeCommandBuffer()!
@@ -1897,9 +1992,10 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                    scratchAct: denseScratchAct)
             }
             let gSharedNorm: (MTLCommandBuffer) -> Void = { [self] cb in
+                guard let postF1 = sharedProj.postF1 else { return }
                 rms.encodeBF16W(commandBuffer: cb, x: h1Buf,
-                                weight: sharedProj.postF1.buffer,
-                                weightOffset: Int(sharedProj.postF1.offset),
+                                weight: postF1.buffer,
+                                weightOffset: Int(postF1.offset),
                                 out: h1Buf, d: D, eps: eps)
             }
             let sharedCB = ctx.queue.makeCommandBuffer()!
@@ -1945,23 +2041,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             totalIoNanos &+= layerIo
             let routedBufs = blobs.map { $0.buffer }
             let tCb2Start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-            let scalarPtr = layerScalarView.buffer.contents()
-                .advanced(by: Int(layerScalarView.offset))
-                .assumingMemoryBound(to: UInt16.self)
-            let layerScalar = Quantization.bf16ToFloat(scalarPtr[0])
-
             let gTail: (MTLCommandBuffer) -> Void = { [self] cb in
-                fusedTail.encode(commandBuffer: cb,
-                                 h2: h2Buf,
-                                 h1: h1Buf,
-                                 hidden: hidden,
-                                 postFFN2Weight: postF2.buffer,
-                                 postFFN2WeightOffset: Int(postF2.offset),
-                                 postFFNWeight: postF.buffer,
-                                 postFFNWeightOffset: Int(postF.offset),
-                                 d: D,
-                                 eps: eps,
-                                 layerScalar: layerScalar)
+                encodeDecodeLayerTail(cb, postF2: postF2, postF: postF,
+                                      layerScalar: layerScalar)
             }
             let routedCB = ctx.queue.makeCommandBuffer()!
             let splitArgBuf = phase1HitCB != nil && !phase1MissSlots.isEmpty

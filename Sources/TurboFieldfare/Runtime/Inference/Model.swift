@@ -189,27 +189,43 @@ public struct Model {
 
     // MARK: - Feed-forward norms
     //
-    // The Gemma 4 sandwich wraps two parallel FFN branches:
+    // The Gemma 4 sandwich (`normTopology == .sandwich`) wraps two parallel FFN
+    // branches:
     //   pre_feedforward_layernorm        -> dense MLP input
     //   pre_feedforward_layernorm_2      -> routed expert input
     //   post_feedforward_layernorm_1     -> dense MLP output
     //   post_feedforward_layernorm_2     -> routed expert output
     //   post_feedforward_layernorm       -> combined (h1+h2) output
+    //
+    // A `.preNorm` model has none of those five. Both branches read the same
+    // single pre-MLP norm — which that convention confusingly calls
+    // `post_attention_layernorm` — and nothing is normed on the way out. The
+    // `postFFN*` accessors therefore return nil rather than throwing, so the
+    // forward pass can ask without knowing the topology.
 
     public func preFFN(layer L: Int) throws -> TensorView {
-        try resident(name: "language_model.model.layers.\(L).pre_feedforward_layernorm.weight")
+        if config.normTopology == .preNorm {
+            return try postAttnNorm(layer: L)
+        }
+        return try resident(name: "language_model.model.layers.\(L).pre_feedforward_layernorm.weight")
     }
     public func preFFN2(layer L: Int) throws -> TensorView {
-        try resident(name: "language_model.model.layers.\(L).pre_feedforward_layernorm_2.weight")
+        if config.normTopology == .preNorm {
+            return try postAttnNorm(layer: L)
+        }
+        return try resident(name: "language_model.model.layers.\(L).pre_feedforward_layernorm_2.weight")
     }
-    public func postFFN1(layer L: Int) throws -> TensorView {
-        try resident(name: "language_model.model.layers.\(L).post_feedforward_layernorm_1.weight")
+    public func postFFN1(layer L: Int) throws -> TensorView? {
+        guard config.normTopology == .sandwich else { return nil }
+        return try resident(name: "language_model.model.layers.\(L).post_feedforward_layernorm_1.weight")
     }
-    public func postFFN2(layer L: Int) throws -> TensorView {
-        try resident(name: "language_model.model.layers.\(L).post_feedforward_layernorm_2.weight")
+    public func postFFN2(layer L: Int) throws -> TensorView? {
+        guard config.normTopology == .sandwich else { return nil }
+        return try resident(name: "language_model.model.layers.\(L).post_feedforward_layernorm_2.weight")
     }
-    public func postFFN(layer L: Int) throws -> TensorView {
-        try resident(name: "language_model.model.layers.\(L).post_feedforward_layernorm.weight")
+    public func postFFN(layer L: Int) throws -> TensorView? {
+        guard config.normTopology == .sandwich else { return nil }
+        return try resident(name: "language_model.model.layers.\(L).post_feedforward_layernorm.weight")
     }
 
     // MARK: - Router auxiliaries
@@ -218,17 +234,32 @@ public struct Model {
     // (post-RMSNorm), fused with 1/sqrt(hidden_size). `per_expert_scale` is
     // applied to the top-k routing weights after softmax over top-k.
 
-    public func routerScale(layer L: Int) throws -> TensorView {
-        try resident(name: "language_model.model.layers.\(L).router.scale")
+    /// Both are Gemma-only: a `.sigmoidTopK` router scales neither its input
+    /// nor its output, so these return nil there rather than throwing.
+    public func routerScale(layer L: Int) throws -> TensorView? {
+        guard config.routerScoring == .softmaxTopK else { return nil }
+        return try resident(name: "language_model.model.layers.\(L).router.scale")
     }
-    public func routerPerExpertScale(layer L: Int) throws -> TensorView {
-        try resident(name: "language_model.model.layers.\(L).router.per_expert_scale")
+    public func routerPerExpertScale(layer L: Int) throws -> TensorView? {
+        guard config.routerScoring == .softmaxTopK else { return nil }
+        return try resident(name: "language_model.model.layers.\(L).router.per_expert_scale")
+    }
+
+    /// Per-expert additive bias on the *selection* scores only, for
+    /// auxiliary-loss-free load balancing (arXiv:2408.15664). The gathered
+    /// routing weights stay unbiased, so this must not be folded into them.
+    /// `.sigmoidTopK` models only; shape `[numExperts]`, BF16.
+    public func routerSelectionBias(layer L: Int) throws -> TensorView? {
+        guard config.routerScoring == .sigmoidTopK else { return nil }
+        return try resident(name: "language_model.model.layers.\(L).mlp.gate.e_score_correction_bias")
     }
 
     /// Per-layer scalar gain applied to the entire residual stream at the end
-    /// of the layer; shape `[1]`, BF16.
-    public func layerScalar(layer L: Int) throws -> TensorView {
-        try resident(name: "language_model.model.layers.\(L).layer_scalar")
+    /// of the layer; shape `[1]`, BF16. Gemma-only — a `.preNorm` block has no
+    /// such term, which is a gain of 1.0.
+    public func layerScalar(layer L: Int) throws -> TensorView? {
+        guard config.normTopology == .sandwich else { return nil }
+        return try resident(name: "language_model.model.layers.\(L).layer_scalar")
     }
 
     /// Resolve a tensor name to a `TensorView` against the resident buffer.

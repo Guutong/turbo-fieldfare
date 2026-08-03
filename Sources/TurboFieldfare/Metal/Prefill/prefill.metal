@@ -333,6 +333,103 @@ void prefill_layer_tail_block(
     }
 }
 
+// Pre-norm (Qwen/Laguna) block twins of the two kernels above. See the comment
+// block above `fused_post_attn_setup_prenorm` in fused.metal for the shape.
+// Kept separate from the sandwich kernels so Gemma's path is unchanged.
+
+[[kernel, max_total_threads_per_threadgroup(256)]]
+void prefill_post_attn_setup_prenorm_block(
+    device       half*   hidden                [[buffer(0)]],
+    device const half*   attn                  [[buffer(1)]],
+    device       half*   dense_x               [[buffer(2)]],
+    device       half*   routed_x              [[buffer(3)]],
+    device       half*   router_x              [[buffer(4)]],
+    device const bfloat* w_pre_ffn             [[buffer(5)]],
+    constant uint&       T                     [[buffer(6)]],
+    constant uint&       D                     [[buffer(7)]],
+    constant uint&       hidden_stride_elems   [[buffer(8)]],
+    constant uint&       attn_stride_elems     [[buffer(9)]],
+    constant uint&       dense_stride_elems    [[buffer(10)]],
+    constant uint&       routed_stride_elems   [[buffer(11)]],
+    constant uint&       router_stride_elems   [[buffer(12)]],
+    constant float&      rms_eps               [[buffer(13)]],
+    uint                 row                   [[threadgroup_position_in_grid]],
+    uint                 lid                   [[thread_position_in_threadgroup]],
+    uint                 lsize                 [[threads_per_threadgroup]],
+    uint                 lane                  [[thread_index_in_simdgroup]],
+    uint                 sg                    [[simdgroup_index_in_threadgroup]],
+    uint                 sgs                   [[simdgroups_per_threadgroup]]
+) {
+    if (row >= T || D > kPrefillPostMaxD) return;
+
+    threadgroup half hidden_tg[kPrefillPostMaxD];
+    threadgroup float partial[kPrefillRmsMaxSimdGroups];
+
+    device half* hidden_row = hidden + row * hidden_stride_elems;
+    device const half* attn_row = attn + row * attn_stride_elems;
+    device half* dense_row = dense_x + row * dense_stride_elems;
+    device half* routed_row = routed_x + row * routed_stride_elems;
+    device half* router_row = router_x + row * router_stride_elems;
+
+    float acc = 0.0f;
+    for (uint i = lid; i < D; i += lsize) {
+        half h = half(float(hidden_row[i]) + float(attn_row[i]));
+        hidden_tg[i] = h;
+        hidden_row[i] = h;
+        float hf = float(h);
+        acc = fma(hf, hf, acc);
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) {
+        partial[sg] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sg == 0) {
+        float sum = (lane < sgs) ? partial[lane] : 0.0f;
+        sum = simd_sum(sum);
+        if (lane == 0) {
+            partial[0] = rsqrt(sum / float(D) + rms_eps);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float hidden_inv = partial[0];
+    for (uint i = lid; i < D; i += lsize) {
+        const half u = half(float(hidden_tg[i]) * hidden_inv * float(w_pre_ffn[i]));
+        dense_row[i]  = u;
+        routed_row[i] = u;
+        router_row[i] = u;
+    }
+}
+
+[[kernel, max_total_threads_per_threadgroup(256)]]
+void prefill_layer_tail_prenorm_block(
+    device const half*   h2                    [[buffer(0)]],
+    device const half*   h1                    [[buffer(1)]],
+    device       half*   hidden                [[buffer(2)]],
+    constant uint&       T                     [[buffer(3)]],
+    constant uint&       D                     [[buffer(4)]],
+    constant uint&       h2_stride_elems       [[buffer(5)]],
+    constant uint&       h1_stride_elems       [[buffer(6)]],
+    constant uint&       hidden_stride_elems   [[buffer(7)]],
+    constant float&      routed_scale          [[buffer(8)]],
+    uint                 row                   [[threadgroup_position_in_grid]],
+    uint                 lid                   [[thread_position_in_threadgroup]],
+    uint                 lsize                 [[threads_per_threadgroup]]
+) {
+    if (row >= T || D > kPrefillPostMaxD) return;
+
+    device const half* h2_row = h2 + row * h2_stride_elems;
+    device const half* h1_row = h1 + row * h1_stride_elems;
+    device half* hidden_row = hidden + row * hidden_stride_elems;
+
+    const half scale = half(routed_scale);
+    for (uint i = lid; i < D; i += lsize) {
+        hidden_row[i] = half(hidden_row[i] + half(h1_row[i] + half(scale * h2_row[i])));
+    }
+}
+
 struct PrefillTokenExpertPairMSL {
     uint token;
     uint expert;

@@ -88,6 +88,12 @@ enum GTurboJSON {
         if arch.routedScalingFactor != 1.0 {
             archDict["routedScalingFactor"] = arch.routedScalingFactor
         }
+        if arch.normTopology != "sandwich" {
+            archDict["normTopology"] = arch.normTopology
+        }
+        if arch.routerScoring != "softmaxTopK" {
+            archDict["routerScoring"] = arch.routerScoring
+        }
         let quantBits = [
             "embedding": bitWidths.embedding,
             "attention": bitWidths.attention,

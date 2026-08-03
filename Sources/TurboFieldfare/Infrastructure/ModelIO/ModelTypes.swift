@@ -64,6 +64,52 @@ public enum AttentionGating: String, Sendable, Equatable {
     case perElement
 }
 
+/// How the decoder layer arranges its RMSNorms around the two residual adds.
+///
+/// `sandwich` is Gemma 4: the attention output is normed before joining the
+/// residual, each FFN branch is normed on the way in *and* on the way out, and
+/// their sum is normed once more before the second residual add.
+///
+/// ```
+/// h1 = rmsnorm(dense(pre_ffn(x)),   post_ffn_1)
+/// h2 = rmsnorm(routed(pre_ffn_2(x)), post_ffn_2)
+/// h  = x + layer_scalar * rmsnorm(h1 + h2, post_ffn)
+/// ```
+///
+/// `preNorm` is the Qwen/Laguna arrangement: one norm before attention, one
+/// before the MLP, and nothing on the way out.
+///
+/// ```
+/// h = x + attn(input_layernorm(x))
+/// h = h + mlp(post_attention_layernorm(h))
+/// ```
+///
+/// The two are not interchangeable by substituting weights — a unit-weight
+/// RMSNorm still divides by the RMS, so `preNorm` needs the norm *skipped*, not
+/// neutralized. Note also that `post_attention_layernorm` names different
+/// things in the two conventions: under `sandwich` it norms the attention
+/// output, under `preNorm` it norms the residual on the way into the MLP.
+public enum NormTopology: String, Sendable, Equatable {
+    case sandwich
+    case preNorm
+}
+
+/// How the router turns hidden state into top-K experts and their weights.
+///
+/// `softmaxTopK` is Gemma 4: scale the router input by `router.scale` (fused
+/// with `1/sqrt(D)`), take top-K of the logits, softmax over those K, then
+/// multiply by `router.per_expert_scale`.
+///
+/// `sigmoidTopK` is Laguna (`LagunaTopKRouter`): sigmoid over *all* experts,
+/// add `e_score_correction_bias` for selection only, gather the **unbiased**
+/// scores at the selected indices, and renormalize them to sum to 1. The bias
+/// deliberately does not survive into the weights — it is load-balancing
+/// pressure on *which* experts win, not on how much they contribute.
+public enum RouterScoring: String, Sendable, Equatable {
+    case softmaxTopK
+    case sigmoidTopK
+}
+
 /// Architecture description for the loaded model. `manifest.json -> arch` must
 /// match the config the runtime was handed, field-by-field, at load time;
 /// mismatches throw `ModelError.archMismatch`.
@@ -116,6 +162,10 @@ public struct ArchConfig: Sendable, Equatable {
     /// Multiplier on the routed-expert contribution (Laguna: 2.5).
     /// 1.0 is a no-op and matches Gemma.
     public let routedScalingFactor: Double
+    /// Arrangement of the layer's RMSNorms. See `NormTopology`.
+    public let normTopology: NormTopology
+    /// Router scoring function. See `RouterScoring`.
+    public let routerScoring: RouterScoring
 
     public init(
         hiddenSize: Int,
@@ -145,7 +195,9 @@ public struct ArchConfig: Sendable, Equatable {
         fullPartialRotaryFactor: Double? = nil,
         fullRopeScaling: RopeScaling? = nil,
         attentionGating: AttentionGating = .none,
-        routedScalingFactor: Double = 1.0
+        routedScalingFactor: Double = 1.0,
+        normTopology: NormTopology = .sandwich,
+        routerScoring: RouterScoring = .softmaxTopK
     ) {
         self.hiddenSize = hiddenSize
         self.intermediateSize = intermediateSize
@@ -175,6 +227,8 @@ public struct ArchConfig: Sendable, Equatable {
         self.fullRopeScaling = fullRopeScaling
         self.attentionGating = attentionGating
         self.routedScalingFactor = routedScalingFactor
+        self.normTopology = normTopology
+        self.routerScoring = routerScoring
     }
 
     // MARK: - Per-layer accessors
@@ -312,7 +366,9 @@ public struct ArchConfig: Sendable, Equatable {
                                      betaSlow: 1.0,
                                      attentionFactor: 1.4852030263919618),
         attentionGating: .perHead,
-        routedScalingFactor: 2.5
+        routedScalingFactor: 2.5,
+        normTopology: .preNorm,
+        routerScoring: .sigmoidTopK
     )
 
     /// Full attention every 4th layer starting at 0.
@@ -351,6 +407,13 @@ enum ModelError: Error, CustomStringConvertible, Equatable {
     case indexCorrupt(detail: String)
     case posixFailed(call: String, errno: Int32)
     case trustedReceiptInvalid(detail: String)
+    /// The manifest describes an architecture feature the kernels do not
+    /// implement yet. Distinct from `archMismatch`, which is a disagreement
+    /// between two descriptions of the same model — this one means the model
+    /// is described correctly and the runtime cannot execute it. It exists so
+    /// such a model refuses to load instead of running the nearest available
+    /// kernel and returning plausible wrong numbers.
+    case unsupportedArchFeature(feature: String, value: String, detail: String)
 
     public var description: String {
         switch self {
@@ -380,6 +443,8 @@ enum ModelError: Error, CustomStringConvertible, Equatable {
             return "resident index is corrupt: \(d)"
         case .posixFailed(let c, let e):
             return "\(c) failed with errno \(e)"
+        case .unsupportedArchFeature(let feature, let value, let detail):
+            return "arch.\(feature) = \(value) is not implemented: \(detail)"
         case .trustedReceiptInvalid(let detail):
             return "trusted install receipt invalid: \(detail)"
         }

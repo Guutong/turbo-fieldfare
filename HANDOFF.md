@@ -27,9 +27,14 @@ Laguna differs from Gemma in almost every dimension that was hardcoded:
 | Layer 0 MLP | MoE | dense |
 | Quantization | 4-bit, group 64 | mixed 4/5/6/8-bit, group 128 |
 
-Laguna is **not runnable yet**. It now repacks to `.gturbo` and gets as far as
-`RealForwardRunner.init`, where it stops on a block-topology difference that no
-amount of format work will close — see "The real remaining blocker" below.
+Laguna is **not runnable yet**. It now repacks to `.gturbo` and loads, and the
+decoder-block difference described below is implemented; it stops at
+`RealForwardRunner.init` on two deliberate refusals (sigmoid routing, silu) that
+have no kernel behind them yet.
+
+**Start at "Read this first: a gate was opened without a kernel behind it."** There
+is an open validation gate with no kernel behind it and four failing tests that are
+correctly objecting to it. Everything else in this file is less urgent than that.
 
 ## What is done
 
@@ -483,9 +488,9 @@ produce plausible wrong numbers rather than an error:
   `configuration_laguna.py:147`. So `hiddenActivation` is carried and validated but
   never reaches a kernel, and its value is wrong for Laguna besides.
 
-### Suggested shape of the fix
+### Norm topology — done, but unverified
 
-Laguna's block maps onto the existing kernel slots cleanly if the norms can be
+Laguna's block maps onto the existing kernel slots cleanly once the norms can be
 *skipped* rather than substituted — a unit-weight tensor is not equivalent, since
 RMSNorm still divides by the RMS:
 
@@ -497,12 +502,218 @@ RMSNorm still divides by the RMS:
 | `layer_scalar` | 1.0 |
 | routed branch | scale by `routedScalingFactor` (2.5, already in arch) |
 
-So the work is a norm-topology flag on `ArchConfig` (`sandwich` vs `preNorm`) driving
-function-constant variants of the four fused kernels — `FusedPostAttentionSetup`,
-`FusedLayerTail`, and their prefill twins `PrefillPostAttentionSetup` /
-`PrefillLayerTail` — plus a sigmoid router variant in decode and prefill, plus silu
-variants of the four activation sites. Gemma must stay bit-identical, so the flag
-defaults to `sandwich` and the existing kernels must be reachable unchanged.
+This is implemented end-to-end and compiles. **No test covers it and no model has
+run through it** — treat every claim below as "written, not verified".
+
+`ArchConfig` gained `normTopology: NormTopology` (`.sandwich` default / `.preNorm`)
+and `routerScoring: RouterScoring` (`.softmaxTopK` default / `.sigmoidTopK`), both
+defined in `ModelTypes.swift` with the reference formulas in their doc comments.
+They round-trip through `manifest.json -> arch` (`ManifestReader`, `GTurboJSON`)
+and are only written when they differ from Gemma, so a Gemma repack still produces
+a byte-identical `arch` block. `ArchInfo.load` derives them from `model_type`.
+
+Four new Metal kernels, deliberately *separate* from the sandwich ones rather than
+function-constant branches inside them, so Gemma's path is literally the code it
+was before:
+
+| kernel | file | host wrapper |
+|---|---|---|
+| `fused_post_attn_setup_prenorm` | `Metal/Fusions/fused.metal` | `FusedPostAttentionSetup.encodePreNorm` |
+| `fused_layer_tail_prenorm` | `Metal/Fusions/fused.metal` | `FusedLayerTail.encodePreNorm` |
+| `prefill_post_attn_setup_prenorm_block` | `Metal/Prefill/prefill.metal` | `PrefillPostAttentionSetup.encodePreNorm` |
+| `prefill_layer_tail_prenorm_block` | `Metal/Prefill/prefill.metal` | `PrefillLayerTail.encodePreNorm` |
+
+Accessors that name a tensor `.preNorm` does not have (`postFFN`, `postFFN1`,
+`postFFN2`, `layerScalar`, `routerScale`, `routerPerExpertScale`) now return
+`TensorView?` and are nil under that topology, so the forward pass can ask without
+knowing which model it holds. `Model.routerSelectionBias` was added for
+`e_score_correction_bias`, which the repacker already packs.
+
+Dispatch happens in two helpers so no call site branches twice:
+`RealForwardRunner.encodeDecodeLayerTail` (decode, both dense and routed sites) and
+the local `encodePrefillLayerTail` (prefill, likewise). `gPostAttnSetup` branches
+inline. The shared-expert output norm (`postF1`) is skipped at all four of its call
+sites when nil.
+
+One subtlety worth not re-deriving: under `.preNorm` the router input is the *same*
+`u = rmsnorm(h) * post_attention_layernorm` that both FFN branches consume, not
+Gemma's unweighted `rmsnorm_no_scale(h)`. The prenorm setup kernel therefore writes
+`u` to `dense_x`, `routed_x`, and `router_x` alike. It is redundant stores, and it
+keeps every downstream consumer topology-agnostic. Relatedly, `.sigmoidTopK` has no
+`router.scale` and no `1/sqrt(D)` factor, so `effectiveScaleBuffers` is filled with
+BF16 1.0 for those models (`RealForwardRunner.init`).
+
+## Read this first: a gate was opened without a kernel behind it
+
+Commit `1c40a81` ("Allow group 128 for router in manifest validation") is **wrong and
+must be reverted or backed by a kernel.** It was made while chasing a load error
+without checking whether a kernel existed, which is the exact trap the comment above
+`validateQuant` and the tests below both warn about.
+
+Laguna's router is 8-bit **group 128** (`manifest.quant.router`). `router_gemv_gemma4_r4`
+is group-**64**-only, and not by omission — `router_gemv_gemma4_body`
+(`Metal/MoE/moe.metal:86`) hardcodes it structurally:
+
+```
+const uint n_groups = DD / kMoEGroupSize;              // 64
+const uint idx = g * kMoEGroupSize + lane * 2u;        // 32 lanes x 2 = 64/group
+```
+
+With the gate open, a group-128 router manifest loads cleanly and the kernel reads
+scales and biases at the wrong stride. It does not crash. It produces a plausible
+routing distribution that is wrong for every token. Today Laguna does not reach it
+only because the `.sigmoidTopK` guard in `RealForwardRunner.init` throws first —
+that is luck, not protection, and it does not protect any other model.
+
+Commit `569bdeb` ("Allow 5-bit and 8-bit attention") is in the same family and needs
+the same audit, though it is more likely to be legitimate: items 1 and 2 above claim
+5-/8-bit attention dispatch and 8-bit group-128 for `sharedExpert`/`embedding` were
+implemented and tested. **Verify that against the kernels rather than against those
+claims** — this file has already been wrong about what was done.
+
+Four tests fail because of these two commits, and they are doing their job:
+
+```
+ManifestReaderTests.productionManifestRejectsGroup128ForSlotsWhoseKernelIsGroup64  :269  [router]
+ManifestReaderTests.perLayerOverrideCannotBypassAGroupSizeGate                     :339
+ManifestReaderTests.perLayerOverrideWithUnsupportedWidthIsRejected                 :324
+ManifestReaderTests.lagunaMixedAttentionIsExpressibleButStillRejectedByTheKernelGate :375
+```
+
+Their comments say it outright: *"Accepting 128 would load cleanly and then produce
+silently wrong numbers, so the rejection is the feature. Relax a slot only in the
+same change that teaches its kernel group 128."* Do not delete or relax these to get
+green. Either teach `router_gemv_gemma4_body` a runtime group size (the generic MoE
+kernels at `moe.metal:272` and `:409` show the pattern — take `groupSize` as a
+parameter and stride by lane), or revert the gate and let Laguna fail at load.
+
+Sequencing note: the sigmoid router kernel (item 1 below) has to be written anyway,
+and it needs a group-size-generic GEMV front half. Doing that first and giving the
+Gemma router the same treatment is less work than doing them separately.
+
+## Remaining kernel work
+
+Two things are wired everywhere *except* the kernel. `RealForwardRunner.init`
+refuses to construct when either is required, throwing
+`ModelError.unsupportedArchFeature`, so Laguna fails loudly at load instead of
+running Gemma's kernel and returning plausible wrong numbers. **Deleting those two
+guards is the last step of each item, not the first.**
+
+### 1. Sigmoid router
+
+Reference: `LagunaTopKRouter.forward`, `modeling_laguna.py:169`.
+
+```python
+router_logits   = F.linear(u, W)                 # [T, E], u already normed
+routing_scores  = sigmoid(router_logits)         # over ALL experts
+scores_for_sel  = routing_scores + e_score_correction_bias
+_, sel          = topk(scores_for_sel, top_k)
+w               = routing_scores.gather(-1, sel)  # UNBIASED scores
+w               = w / w.sum(-1, keepdim=True)     # norm_topk_prob = true
+```
+
+Three details that are easy to get wrong and impossible to see in the output:
+
+- The bias shifts *selection only*. The gathered weights come from
+  `routing_scores`, not `scores_for_selection`. Folding the bias into the weights
+  is a plausible-looking bug that changes every token slightly.
+- Renormalization is over the K gathered weights, gated on `norm_topk_prob`
+  (true for Laguna). It is not a softmax — sigmoid outputs are independent.
+- `router_logit_softcapping` exists in the reference (`tanh(x/c)*c`) but Laguna's
+  config does not set it, so it is 0.0 / disabled. Implement it or assert it is
+  absent; do not silently ignore a nonzero value.
+
+Sites: `moe.encodeRouterGemma4` (decode, `Kernels/MoE/MoE.swift`, kernel
+`router_topk_gemma4`) and `prefillRouter.encodeGemma4Block` (prefill,
+`prefill.metal:478` `prefill_router_gemma4_block`). Add `..._sigmoid` twins rather
+than editing these. The GEMV front half is identical and can be shared; only the
+scoring tail differs. The host side already has `views.routerSelectionBias` /
+`model.routerSelectionBias(layer:)` plumbed to the call sites and unused.
+
+### 2. silu activation
+
+Every FFN activation in the tree is hardcoded `gelu_pytorch_tanh`:
+
+```
+Metal/MoE/moe.metal:492, 528, 605, 642    (routed experts, four dispatch shapes)
+Metal/Prefill/prefill.metal:636           (prefill grouped experts)
+Metal/Quant/dequant_int8.metal:152        (8-bit shared expert)
+Metal/Primitives/utility.metal:17         (gelu_mul_fp16)
+```
+
+`arch.hiddenActivation` is carried and validated but reaches no kernel. Laguna is
+silu (`x * sigmoid(x)`); note its `config.json` omits `hidden_act` entirely and
+`configuration_laguna.py:147` defaults it to silu — `ArchInfo.load` now supplies
+that per `model_type`, so the manifest is correct, but nothing reads it.
+
+A function constant selecting the activation is the cheaper option than doubling
+seven kernels; the activation is one inlined call in each. Whichever way, the
+selection must be visible in `ArchConfig` rather than inferred at the call site.
+
+### 3. Then
+
+Delete both guards in `RealForwardRunner.init`, repack, and run. Note that
+`--local-checkpoint` skips re-downloading; see below.
+
+### Suggested order
+
+The dependencies are mostly one-way, so this order avoids rework:
+
+1. **Router group size** (the section above). Make `router_gemv_gemma4_body` take a
+   runtime `groupSize`, restore the four `ManifestReaderTests` guards to green, and
+   audit `569bdeb` against the attention kernels while you are in there. Nothing
+   else can be trusted until the validation gates mean something again.
+2. **Sigmoid router**, reusing the now-generic GEMV front half. Ends with the
+   `routerScoring` guard in `RealForwardRunner.init` deleted.
+3. **silu**, which is independent of both and could be done first if you want a
+   quick win. Ends with the `hiddenActivation` guard deleted.
+4. **Tests for the norm topology**, against a CPU reference, before running Laguna.
+   A pre-norm forward pass that is subtly wrong looks exactly like a model that
+   needs more sampling tuning.
+5. **Laguna end-to-end.**
+
+Steps 1 and 4 are the ones most likely to be skipped under pressure and the ones
+that most determine whether the result can be trusted.
+
+### Verification, in the order that catches the most
+
+1. **Gemma first, every time.** It must stay bit-identical. If a Gemma generation
+   changes, something in the shared path moved. This is the cheapest signal
+   available and it is worth running before looking at Laguna at all.
+2. **CPU reference per kernel, not end-to-end.** The handoff note below about
+   Metal failing silently applies to all of this. A wrong buffer index in the
+   sigmoid router produces a valid-looking distribution.
+3. **Mutation-test before believing green.** Copy the `.metal` aside, break one
+   thing each new test claims to cover, confirm the suite fails, restore, `grep`
+   for survivors. This has already caught tests on this branch that checked
+   nothing (see the router-selection note in "Working notes").
+4. Only then a Laguna end-to-end generation, checked for coherent text rather
+   than for "it ran".
+
+### State of the test suite
+
+`swift build` is clean. `swift test` is 629 tests with **7 failing**:
+
+| test | file | status |
+|---|---|---|
+| `productionManifestRejectsGroup128ForSlotsWhoseKernelIsGroup64` [router] | `ManifestReaderTests:269` | **regression** — `1c40a81` |
+| `perLayerOverrideCannotBypassAGroupSizeGate` | `ManifestReaderTests:339` | **regression** — `1c40a81` |
+| `perLayerOverrideWithUnsupportedWidthIsRejected` | `ManifestReaderTests:324` | **regression** — `569bdeb` |
+| `lagunaMixedAttentionIsExpressibleButStillRejectedByTheKernelGate` | `ManifestReaderTests:375` | **regression** — `569bdeb` |
+| `denseLayer0ForwardPassInPrefillAndDecode` | `DenseMLPLayerTests:470` | pre-existing fixture bug (`ffnIntermediate = 64; expected 256`) |
+| `nonInstallableSourceIsExcludedFromCatalogInstallOffers` | `AppModelInstallDescriptorTests:63` | pre-existing — expects Laguna non-installable |
+| `unavailableCatalogEntriesSurfacesNonInstallableSourcesWithAReason` | `AppModelInstallDescriptorTests:68,72` | pre-existing — same |
+| `notYetInstallableModelIDIsRejectedWithItsBlockedReason` | `RepackCLITests:55,56` | pre-existing — disk-space-dependent path |
+
+The four regressions are the subject of the section above. The earlier claim in this
+file of "6 pre-existing failures" counted issues, not tests; the real pre-existing
+count is 4 tests / 6 issues.
+
+**Nothing that was added this session has a test.** Not the norm topology, not the
+local-checkpoint repacker, not the per-slot `groupSize` plumbing, not the dense-layer
+layout handling. The four new Metal kernels have never executed — the build compiles
+them, which proves only that they parse. That is the largest gap in this branch, and
+per the note below a green suite would not have told you otherwise.
 
 ## Repacking from a local checkpoint
 

@@ -36,6 +36,8 @@ struct ArchInfo: Sendable, Equatable {
     let fullRopeScaling: RopeScalingInfo?
     let attentionGating: String
     let routedScalingFactor: Double
+    let normTopology: String
+    let routerScoring: String
 
     static func load(configPath: String) throws -> ArchInfo {
         let data = try Data(contentsOf: URL(fileURLWithPath: configPath))
@@ -144,6 +146,31 @@ struct ArchInfo: Sendable, Equatable {
             headsPerLayer = perLayer
         }
 
+        // The decoder-block shape is not spelled out in any config key, so it
+        // is keyed off `model_type`. Unknown types get Gemma's arrangement,
+        // which is what every other field here defaults to — but note that a
+        // third architecture with a different block will produce wrong numbers
+        // rather than an error, so add it to this table before repacking it.
+        //
+        // `hidden_act` is also read from this table: Laguna's config.json omits
+        // the key entirely and `configuration_laguna.py` defaults it to silu,
+        // so falling back to Gemma's gelu would silently use the wrong
+        // activation.
+        let modelType = (tc["model_type"] as? String) ?? (root["model_type"] as? String) ?? ""
+        let normTopology: String
+        let routerScoring: String
+        let defaultActivation: String
+        switch modelType {
+        case "laguna":
+            normTopology = "preNorm"
+            routerScoring = "sigmoidTopK"
+            defaultActivation = "silu"
+        default:
+            normTopology = "sandwich"
+            routerScoring = "softmaxTopK"
+            defaultActivation = "gelu_pytorch_tanh"
+        }
+
         // `gating: true` means per-element in the reference implementation.
         let gatingRaw = tc["gating"]
         let gating: String
@@ -175,14 +202,16 @@ struct ArchInfo: Sendable, Equatable {
             attentionKEqV: (tc["attention_k_eq_v"] as? Bool) ?? false,
             fullAttentionLayerMask: mask,
             hiddenActivation: (tc["hidden_activation"] as? String)
-                ?? (tc["hidden_act"] as? String) ?? "gelu_pytorch_tanh",
+                ?? (tc["hidden_act"] as? String) ?? defaultActivation,
             headsPerLayer: headsPerLayer,
             denseMLPLayerMask: hasDense ? denseMask : [],
             denseMLPIntermediateSize: denseFFN,
             fullPartialRotaryFactor: fullPRF,
             fullRopeScaling: ropeScaling,
             attentionGating: gating,
-            routedScalingFactor: optDouble("moe_routed_scaling_factor") ?? 1.0)
+            routedScalingFactor: optDouble("moe_routed_scaling_factor") ?? 1.0,
+            normTopology: normTopology,
+            routerScoring: routerScoring)
     }
 }
 
