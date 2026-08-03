@@ -59,9 +59,12 @@ final class SharedExpertInt8 {
     private let int8: DequantInt8GEMV
     private let fusedGateUpActPSO: MTLComputePipelineState
     private let specializedFusedGateUpActPSO: MTLComputePipelineState?
+    private let geluMulPSO: MTLComputePipelineState
+    private let useSilu: Bool
 
     init(context: MetalContext, useSilu: Bool = false) throws {
         self.int8 = try DequantInt8GEMV(context: context)
+        self.useSilu = useSilu
         let siluConst: [MetalFunctionConstant] =
             useSilu ? [MetalFunctionConstant(index: 87, value: .bool(true))] : []
         self.fusedGateUpActPSO = try context.pipeline(
@@ -75,6 +78,7 @@ final class SharedExpertInt8 {
                 MetalFunctionConstant(index: 72, value: .bool(true)),
                 MetalFunctionConstant(index: 73, value: .uint32(8)),
             ] + siluConst)
+        self.geluMulPSO = try context.pipeline("gelu_mul_fp16")
     }
 
     func encode(commandBuffer cb: MTLCommandBuffer,
@@ -83,6 +87,8 @@ final class SharedExpertInt8 {
                        up:   SharedExpertInt8Proj,
                        down: SharedExpertInt8Proj,
                        y: MTLBuffer, yOffset: Int = 0,
+                       scratchGate: MTLBuffer, scratchGateOffset: Int = 0,
+                       scratchUp: MTLBuffer, scratchUpOffset: Int = 0,
                        scratchAct:  MTLBuffer, scratchActOffset:  Int = 0) throws {
         guard gate.rows == up.rows, gate.cols == up.cols else {
             throw SharedExpertInt8Error.dimensionMismatch(
@@ -108,13 +114,51 @@ final class SharedExpertInt8 {
                 "y offset \(yOffset) + needed \(outputBytes) exceeds length \(y.length)")
         }
 
-        try encodePhase1(commandBuffer: cb,
-                         x: x,
-                         xOffset: xOffset,
-                         gate: gate,
-                         up: up,
-                         scratchAct: scratchAct,
-                         scratchActOffset: scratchActOffset)
+        // The fused SIMD kernel (shared_int8_gate_up_act_simd) is group-64
+        // only. For group-128 shared experts (Laguna), fall back to separate
+        // GEMVs + gelu_mul_fp16 using the group-size-generic path.
+        let needsGeneric = gate.groupSize != Quantization.groupSize
+        if needsGeneric {
+            int8.encode(commandBuffer: cb,
+                        weights: gate.weights, weightsOffset: gate.weightsOffset,
+                        scales: gate.scales, scalesOffset: gate.scalesOffset,
+                        biases: gate.biases, biasesOffset: gate.biasesOffset,
+                        x: x, xOffset: xOffset,
+                        y: scratchGate, yOffset: scratchGateOffset,
+                        m: gate.rows, n: gate.cols,
+                        groupSize: gate.groupSize)
+            int8.encode(commandBuffer: cb,
+                        weights: up.weights, weightsOffset: up.weightsOffset,
+                        scales: up.scales, scalesOffset: up.scalesOffset,
+                        biases: up.biases, biasesOffset: up.biasesOffset,
+                        x: x, xOffset: xOffset,
+                        y: scratchUp, yOffset: scratchUpOffset,
+                        m: up.rows, n: up.cols,
+                        groupSize: up.groupSize)
+            guard let enc = cb.makeComputeCommandEncoder() else {
+                throw SharedExpertInt8Error.dimensionMismatch("encoder alloc failed")
+            }
+            enc.setComputePipelineState(geluMulPSO)
+            enc.setBuffer(scratchGate, offset: scratchGateOffset, index: 0)
+            enc.setBuffer(scratchUp, offset: scratchUpOffset, index: 1)
+            enc.setBuffer(scratchAct, offset: scratchActOffset, index: 2)
+            var count = gate.rows
+            enc.setBytes(&count, length: MemoryLayout<UInt32>.size, index: 3)
+            var siluFlag = useSilu
+            enc.setBytes(&siluFlag, length: MemoryLayout<Bool>.size, index: 4)
+            let width = min(geluMulPSO.maxTotalThreadsPerThreadgroup, 256)
+            enc.dispatchThreads(MTLSize(width: Int(gate.rows), height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1))
+            enc.endEncoding()
+        } else {
+            try encodePhase1(commandBuffer: cb,
+                             x: x,
+                             xOffset: xOffset,
+                             gate: gate,
+                             up: up,
+                             scratchAct: scratchAct,
+                             scratchActOffset: scratchActOffset)
+        }
 
         try encodeDown(commandBuffer: cb,
                        down: down,
