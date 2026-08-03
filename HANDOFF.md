@@ -36,6 +36,64 @@ have no kernel behind them yet.
 is an open validation gate with no kernel behind it and four failing tests that are
 correctly objecting to it. Everything else in this file is less urgent than that.
 
+## Read this first: a gate was opened without a kernel behind it
+
+Commit `1c40a81` ("Allow group 128 for router in manifest validation") is **wrong and
+must be reverted or backed by a kernel.** It was made while chasing a load error
+without checking whether a kernel existed, which is the exact trap the comment above
+`validateQuant` and the tests below both warn about.
+
+Laguna's router is 8-bit **group 128** (`manifest.quant.router`). `router_gemv_gemma4_r4`
+is group-**64**-only, and not by omission — `router_gemv_gemma4_body`
+(`Metal/MoE/moe.metal:86`) hardcodes it structurally:
+
+```
+const uint n_groups = DD / kMoEGroupSize;              // 64
+const uint idx = g * kMoEGroupSize + lane * 2u;        // 32 lanes x 2 = 64/group
+```
+
+With the gate open, a group-128 router manifest loads cleanly and the kernel reads
+scales and biases at the wrong stride. It does not crash. It produces a plausible
+routing distribution that is wrong for every token. Today Laguna does not reach it
+only because the `.sigmoidTopK` guard in `RealForwardRunner.init` throws first —
+that is luck, not protection, and it does not protect any other model.
+
+The sibling commit `569bdeb` ("Allow 5-bit and 8-bit attention") is, by contrast,
+**legitimate — checked, not assumed.** `FusedQKVGEMVGeneric`
+(`Kernels/Fusions/FusedQKVGEMVGeneric.swift:24`) wraps `dequant_int5_qkv_gemv_simd`
+and `dequant_int8_qkv_gemv_simd` and takes `groupSize` at runtime, and
+`RealForwardRunner` dispatches per layer from `attentionQuantByLayer` in both decode
+(`:1654`) and prefill (`:870`, `:887`). That gate has a kernel behind it.
+
+So the four failing tests split two and two, and the two halves need opposite
+treatment:
+
+| test | site | verdict |
+|---|---|---|
+| `productionManifestRejectsGroup128ForSlotsWhoseKernelIsGroup64` [router] | `:269` | **correct** — no kernel; fix the gate or the kernel |
+| `perLayerOverrideCannotBypassAGroupSizeGate` (router 4-bit g128) | `:339` | **correct** — same |
+| `perLayerOverrideWithUnsupportedWidthIsRejected` (attention 5-bit) | `:324` | **obsolete** — kernel now exists |
+| `lagunaMixedAttentionIsExpressibleButStillRejectedByTheKernelGate` | `:375` | **obsolete** — its own name records the assumption that expired |
+
+For the first two: do not delete or relax them to get green. Their comments say it
+outright — *"Accepting 128 would load cleanly and then produce silently wrong
+numbers, so the rejection is the feature. Relax a slot only in the same change that
+teaches its kernel group 128."* Either teach `router_gemv_gemma4_body` a runtime
+group size (the generic MoE kernels at `moe.metal:272` and `:409` show the pattern:
+take `groupSize` as a parameter and stride by lane), or revert `1c40a81` and let
+Laguna fail at load until the kernel exists.
+
+For the second two: update them deliberately and say so in the commit message, which
+is what the "Working notes" rule below asks for. They encode "5-bit attention has no
+kernel", which stopped being true when `FusedQKVGEMVGeneric` landed. Rewrite them to
+assert what is still true — that a width with *no* kernel is rejected — rather than
+deleting the coverage. A width nobody implemented (6-bit, say) is the natural
+replacement subject.
+
+Sequencing note: the sigmoid router kernel (item 1 below) has to be written anyway,
+and it needs a group-size-generic GEMV front half. Doing that first and giving the
+Gemma router the same treatment is less work than doing them separately.
+
 ## What is done
 
 **Phase 0a — config generalization.** `ArchConfig` gained per-layer accessors
@@ -325,7 +383,7 @@ would make a 64 GB repack succeed and then fail at load, when `uniformBits` can 
 during planning instead. Teach the producer to emit `perLayer` in the same change that
 teaches a kernel to decode the widths involved — not before.
 
-### 5- and 8-bit fused QKV (kernels done, not yet wired into the forward pass)
+### 5- and 8-bit fused QKV (done — kernels and forward-pass dispatch)
 
 `dequant_int5_qkv_gemv_simd` and `dequant_int8_qkv_gemv_simd` in
 `Metal/Quant/dequant_subbyte.metal`, with `FusedQKVGEMVGeneric` as their host wrapper. It mirrors `dequant_int4_qkv_gemv_simd`'s
@@ -430,8 +488,11 @@ In rough dependency order:
 
 ## The real remaining blocker: Laguna's decoder block is a different shape
 
-The seven items above were the whole list, and they are all done — but the list was
-written before anyone got a Laguna checkpoint far enough to *load*. Doing that
+The seven items above were the whole list, and were all marked done — but treat those
+"verified with X" claims as the previous author's, not as checked. Item 5 cites
+`DenseMLPLayerTests.swift`, and that test currently fails on its own fixture
+(`ffnIntermediate = 64; expected 256`). The list was also written before anyone got a
+Laguna checkpoint far enough to *load*. Doing that
 (see "Repacking from a local checkpoint" below) surfaced a blocker that was never on
 it: the runtime's per-layer topology is Gemma's sandwich-norm block, and Laguna is a
 plain pre-norm block. This is not a naming mismatch that an alias can paper over —
@@ -483,10 +544,11 @@ produce plausible wrong numbers rather than an error:
 - **Activation.** Every activation in `Sources/TurboFieldfare/Metal/` is hardcoded
   `gelu_pytorch_tanh` (`moe.metal`, `prefill.metal`, `dequant_int8.metal`,
   `utility.metal`). Laguna uses **silu**. Worse, the manifest currently *says* gelu:
-  `ArchInfo.swift:177` reads `hidden_activation` then `hidden_act`, and Laguna's
+  `ArchInfo.swift:204` reads `hidden_activation` then `hidden_act`, and Laguna's
   `config.json` carries neither — `silu` is a Python-side default in
   `configuration_laguna.py:147`. So `hiddenActivation` is carried and validated but
-  never reaches a kernel, and its value is wrong for Laguna besides.
+  never reaches a kernel. (The manifest side of this is now fixed: `ArchInfo.load`
+  supplies the right default per `model_type`. Nothing reads it yet.)
 
 ### Norm topology — done, but unverified
 
@@ -542,54 +604,6 @@ Gemma's unweighted `rmsnorm_no_scale(h)`. The prenorm setup kernel therefore wri
 keeps every downstream consumer topology-agnostic. Relatedly, `.sigmoidTopK` has no
 `router.scale` and no `1/sqrt(D)` factor, so `effectiveScaleBuffers` is filled with
 BF16 1.0 for those models (`RealForwardRunner.init`).
-
-## Read this first: a gate was opened without a kernel behind it
-
-Commit `1c40a81` ("Allow group 128 for router in manifest validation") is **wrong and
-must be reverted or backed by a kernel.** It was made while chasing a load error
-without checking whether a kernel existed, which is the exact trap the comment above
-`validateQuant` and the tests below both warn about.
-
-Laguna's router is 8-bit **group 128** (`manifest.quant.router`). `router_gemv_gemma4_r4`
-is group-**64**-only, and not by omission — `router_gemv_gemma4_body`
-(`Metal/MoE/moe.metal:86`) hardcodes it structurally:
-
-```
-const uint n_groups = DD / kMoEGroupSize;              // 64
-const uint idx = g * kMoEGroupSize + lane * 2u;        // 32 lanes x 2 = 64/group
-```
-
-With the gate open, a group-128 router manifest loads cleanly and the kernel reads
-scales and biases at the wrong stride. It does not crash. It produces a plausible
-routing distribution that is wrong for every token. Today Laguna does not reach it
-only because the `.sigmoidTopK` guard in `RealForwardRunner.init` throws first —
-that is luck, not protection, and it does not protect any other model.
-
-Commit `569bdeb` ("Allow 5-bit and 8-bit attention") is in the same family and needs
-the same audit, though it is more likely to be legitimate: items 1 and 2 above claim
-5-/8-bit attention dispatch and 8-bit group-128 for `sharedExpert`/`embedding` were
-implemented and tested. **Verify that against the kernels rather than against those
-claims** — this file has already been wrong about what was done.
-
-Four tests fail because of these two commits, and they are doing their job:
-
-```
-ManifestReaderTests.productionManifestRejectsGroup128ForSlotsWhoseKernelIsGroup64  :269  [router]
-ManifestReaderTests.perLayerOverrideCannotBypassAGroupSizeGate                     :339
-ManifestReaderTests.perLayerOverrideWithUnsupportedWidthIsRejected                 :324
-ManifestReaderTests.lagunaMixedAttentionIsExpressibleButStillRejectedByTheKernelGate :375
-```
-
-Their comments say it outright: *"Accepting 128 would load cleanly and then produce
-silently wrong numbers, so the rejection is the feature. Relax a slot only in the
-same change that teaches its kernel group 128."* Do not delete or relax these to get
-green. Either teach `router_gemv_gemma4_body` a runtime group size (the generic MoE
-kernels at `moe.metal:272` and `:409` show the pattern — take `groupSize` as a
-parameter and stride by lane), or revert the gate and let Laguna fail at load.
-
-Sequencing note: the sigmoid router kernel (item 1 below) has to be written anyway,
-and it needs a group-size-generic GEMV front half. Doing that first and giving the
-Gemma router the same treatment is less work than doing them separately.
 
 ## Remaining kernel work
 
@@ -660,9 +674,9 @@ Delete both guards in `RealForwardRunner.init`, repack, and run. Note that
 The dependencies are mostly one-way, so this order avoids rework:
 
 1. **Router group size** (the section above). Make `router_gemv_gemma4_body` take a
-   runtime `groupSize`, restore the four `ManifestReaderTests` guards to green, and
-   audit `569bdeb` against the attention kernels while you are in there. Nothing
-   else can be trusted until the validation gates mean something again.
+   runtime `groupSize`, and settle the four `ManifestReaderTests` — two by fixing
+   the kernel, two by deliberately rewriting an expired assumption. Nothing else
+   can be trusted until the validation gates mean something again.
 2. **Sigmoid router**, reusing the now-generic GEMV front half. Ends with the
    `routerScoring` guard in `RealForwardRunner.init` deleted.
 3. **silu**, which is independent of both and could be done first if you want a
@@ -679,7 +693,12 @@ that most determine whether the result can be trusted.
 
 1. **Gemma first, every time.** It must stay bit-identical. If a Gemma generation
    changes, something in the shared path moved. This is the cheapest signal
-   available and it is worth running before looking at Laguna at all.
+   available and it is worth running before looking at Laguna at all. Note there
+   is **no automated end-to-end Gemma baseline in the suite** — the golden-value
+   tests that exist (`DequantInt4GEMVTests`, `MoEFusedFFNTests`) are per-kernel.
+   Comparing a full Gemma generation before and after is a manual step, and
+   capturing that baseline as a test would be worth more than most of the work
+   below.
 2. **CPU reference per kernel, not end-to-end.** The handoff note below about
    Metal failing silently applies to all of this. A wrong buffer index in the
    sigmoid router produces a valid-looking distribution.
@@ -696,10 +715,10 @@ that most determine whether the result can be trusted.
 
 | test | file | status |
 |---|---|---|
-| `productionManifestRejectsGroup128ForSlotsWhoseKernelIsGroup64` [router] | `ManifestReaderTests:269` | **regression** — `1c40a81` |
-| `perLayerOverrideCannotBypassAGroupSizeGate` | `ManifestReaderTests:339` | **regression** — `1c40a81` |
-| `perLayerOverrideWithUnsupportedWidthIsRejected` | `ManifestReaderTests:324` | **regression** — `569bdeb` |
-| `lagunaMixedAttentionIsExpressibleButStillRejectedByTheKernelGate` | `ManifestReaderTests:375` | **regression** — `569bdeb` |
+| `productionManifestRejectsGroup128ForSlotsWhoseKernelIsGroup64` [router] | `ManifestReaderTests:269` | **regression** — `1c40a81`, no kernel |
+| `perLayerOverrideCannotBypassAGroupSizeGate` | `ManifestReaderTests:339` | **regression** — `1c40a81`, no kernel |
+| `perLayerOverrideWithUnsupportedWidthIsRejected` | `ManifestReaderTests:324` | **obsolete test** — `569bdeb`, kernel exists |
+| `lagunaMixedAttentionIsExpressibleButStillRejectedByTheKernelGate` | `ManifestReaderTests:375` | **obsolete test** — `569bdeb`, kernel exists |
 | `denseLayer0ForwardPassInPrefillAndDecode` | `DenseMLPLayerTests:470` | pre-existing fixture bug (`ffnIntermediate = 64; expected 256`) |
 | `nonInstallableSourceIsExcludedFromCatalogInstallOffers` | `AppModelInstallDescriptorTests:63` | pre-existing — expects Laguna non-installable |
 | `unavailableCatalogEntriesSurfacesNonInstallableSourcesWithAReason` | `AppModelInstallDescriptorTests:68,72` | pre-existing — same |
