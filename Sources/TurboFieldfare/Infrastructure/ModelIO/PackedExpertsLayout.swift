@@ -45,7 +45,11 @@ struct PackedExpertsLayout: Sendable {
 }
 
 enum PackedExpertsLayoutReader {
-    static let defaultMaxBytes: UInt64 = 16 * 1024 * 1024
+    /// Sanity bound on layout.json, which grows as layers x experts x
+    /// sub-tensors. Laguna (47 sparse layers x 256 experts x 8 sub-tensors)
+    /// lands around 10 MB; the cap leaves headroom for larger expert counts
+    /// while still rejecting an absurd file before it is read into memory.
+    static let defaultMaxBytes: UInt64 = 128 * 1024 * 1024
 
     static func load(directoryURL: URL,
                             maxBytes: UInt64 = defaultMaxBytes) throws -> PackedExpertsLayout {
@@ -85,6 +89,13 @@ enum PackedExpertsLayoutReader {
                 let expertsArr = layerObj["experts"] as? [[String: Any]]
             else {
                 throw ModelError.indexCorrupt(detail: "layout.json: malformed layer entry")
+            }
+            // A dense-MLP layer carries no routed experts. It keeps a layout
+            // entry (so `layers` stays indexable by layer number) with an
+            // empty expert list and a 0-byte placeholder file.
+            if expertsArr.isEmpty {
+                layers.append(LayerLayout(layer: layerIdx, file: file, experts: []))
+                continue
             }
             var experts = [ExpertEntry?](repeating: nil, count: expertsPerLayer)
             for expertObj in expertsArr {

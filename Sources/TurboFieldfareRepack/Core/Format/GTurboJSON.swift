@@ -205,10 +205,14 @@ enum GTurboJSON {
         let obj: [String: Any] = [
             "expertStride": expertStride,
             "numLayers": arch.numLayers,
-            "expertsPerLayer": plan.layers.first?.expertsPerLayer ?? 0,
+            // Dense-MLP layers hold zero experts, so the sparse-layer count has
+            // to come from the first layer that actually has any.
+            "expertsPerLayer": plan.layers.first(where: { $0.expertsPerLayer > 0 })?.expertsPerLayer ?? 0,
             "layers": layersArr
         ]
+        // Written compact: this file is machine-read only and scales with
+        // layers x experts x sub-tensors (tens of MB on a large MoE).
         return try JSONSerialization.data(withJSONObject: obj,
-            options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
+            options: [.sortedKeys, .withoutEscapingSlashes])
     }
 }

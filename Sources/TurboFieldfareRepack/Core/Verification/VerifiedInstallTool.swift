@@ -18,6 +18,10 @@ public struct VerifyInstallResult: Sendable {
 
 public enum VerifiedInstallTool {
     public static let metadataMaxBytes: UInt64 = 16 * 1024 * 1024
+    /// layout.json scales with layers x experts x sub-tensors and outgrows the
+    /// general metadata cap on a large MoE, so it gets its own bound. Kept in
+    /// step with `PackedExpertsLayoutReader.defaultMaxBytes`.
+    public static let layoutMaxBytes: UInt64 = 128 * 1024 * 1024
 
     public static func run(options: VerifyInstallOptions) throws -> VerifyInstallResult {
         let root = URL(fileURLWithPath: options.inputGTurbo).standardizedFileURL
@@ -115,18 +119,22 @@ public enum VerifiedInstallTool {
 
     private static func loadLayout(path: String) throws -> PackedExpertsLayout {
         do {
-            let data = try loadMetadataJSON(path: path, relativePath: "packed_experts/layout.json")
+            let data = try loadMetadataJSON(path: path,
+                                            relativePath: "packed_experts/layout.json",
+                                            maxBytes: layoutMaxBytes)
             return try JSONDecoder().decode(PackedExpertsLayout.self, from: data)
         } catch {
             throw RepackError.configurationInvalid(detail: "packed_experts/layout.json invalid: \(error)")
         }
     }
 
-    private static func loadMetadataJSON(path: String, relativePath: String) throws -> Data {
+    private static func loadMetadataJSON(path: String,
+                                         relativePath: String,
+                                         maxBytes: UInt64 = metadataMaxBytes) throws -> Data {
         let size = try fileSize(path: path, relativePath: relativePath)
-        guard size <= metadataMaxBytes else {
+        guard size <= maxBytes else {
             throw RepackError.configurationInvalid(
-                detail: "\(relativePath) size \(size) exceeds metadata cap \(metadataMaxBytes)")
+                detail: "\(relativePath) size \(size) exceeds metadata cap \(maxBytes)")
         }
         return try Data(contentsOf: URL(fileURLWithPath: path))
     }
@@ -150,12 +158,15 @@ public enum VerifiedInstallTool {
         guard layout.layers.count == layout.numLayers else {
             throw RepackError.configurationInvalid(detail: "packed expert layout layer count mismatch")
         }
-        let expectedLayerSize = UInt64(layout.expertsPerLayer) * layout.expertStride
+        let sparseLayerSize = UInt64(layout.expertsPerLayer) * layout.expertStride
         for layer in layout.layers {
             guard layer.layer >= 0 && layer.layer < layout.numLayers else {
                 throw RepackError.configurationInvalid(detail: "packed expert layer index out of range")
             }
-            guard layer.experts.count == layout.expertsPerLayer else {
+            // Dense-MLP layers carry no experts; their file is a 0-byte
+            // placeholder that keeps layer indexing uniform.
+            let expectedLayerSize = layer.experts.isEmpty ? 0 : sparseLayerSize
+            guard layer.experts.isEmpty || layer.experts.count == layout.expertsPerLayer else {
                 throw RepackError.configurationInvalid(
                     detail: "packed_experts/\(layer.file) expert count mismatch")
             }

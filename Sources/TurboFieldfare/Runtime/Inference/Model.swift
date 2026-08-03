@@ -294,6 +294,10 @@ public struct Model {
         if streamersBox.streamers[L] != nil {
             return
         }
+        // Dense-MLP layers have no routed experts to stream.
+        if packedExpertsLayout.layers[L].experts.isEmpty {
+            return
+        }
         let basename = packedExpertsLayout.layers[L].file
         let url = directoryURL
             .appendingPathComponent("packed_experts")
@@ -508,7 +512,11 @@ extension Model {
             guard let manifestEntry = manifest.files[relativePath] else {
                 throw ModelError.trustedReceiptInvalid(detail: "manifest missing \(relativePath)")
             }
-            let expectedSize = UInt64(layout.expertsPerLayer) * layout.expertStride
+            // Dense-MLP layers carry no experts; their file is a 0-byte
+            // placeholder that keeps layer indexing uniform.
+            let expectedSize = layer.experts.isEmpty
+                ? 0
+                : UInt64(layout.expertsPerLayer) * layout.expertStride
             guard manifestEntry.size == expectedSize else {
                 throw ModelError.trustedReceiptInvalid(
                     detail: "\(relativePath) manifest size \(manifestEntry.size) != \(expectedSize)")
@@ -521,7 +529,7 @@ extension Model {
                 throw ModelError.trustedReceiptInvalid(
                     detail: "\(relativePath) size \(actualSize) != \(expectedSize)")
             }
-            guard layer.experts.count == layout.expertsPerLayer else {
+            guard layer.experts.isEmpty || layer.experts.count == layout.expertsPerLayer else {
                 throw ModelError.trustedReceiptInvalid(detail: "\(relativePath) expert count mismatch")
             }
             for expert in layer.experts {
