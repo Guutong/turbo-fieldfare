@@ -133,9 +133,14 @@ public struct Model {
     public func oProj(layer L: Int) throws -> TensorView {
         try resident(name: "language_model.model.layers.\(L).self_attn.o_proj.weight")
     }
-    /// Writer emits `.router.proj.weight` (no `.mlp.` segment).
+    /// Gemma spells the router `.router.proj.weight`; Laguna spells it
+    /// `.mlp.gate.proj.weight`. Both are stored as-is from the source checkpoint.
     public func router(layer L: Int) throws -> TensorView {
-        try resident(name: "language_model.model.layers.\(L).router.proj.weight")
+        let name = "language_model.model.layers.\(L).router.proj.weight"
+        if residentIndex.entries[name] != nil {
+            return try resident(name: name)
+        }
+        return try resident(name: "language_model.model.layers.\(L).mlp.gate.proj.weight")
     }
     /// Writer emits the shared-expert FFN as `.mlp.{gate,up,down}_proj.weight`
     /// without a `.shared_expert.` segment.
