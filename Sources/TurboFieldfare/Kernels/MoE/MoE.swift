@@ -51,8 +51,10 @@ final class MoE {
 
     private let routerGemvPSO: MTLComputePipelineState
     private let routerGemvSpecializedPSO: MTLComputePipelineState
+    private let routerGemvGenericPSO: MTLComputePipelineState
     private let routerSelectPSO: MTLComputePipelineState
     private let routerSelectSpecializedPSO: MTLComputePipelineState
+    private let routerSigmoidSelectPSO: MTLComputePipelineState
     private let routerLogits: MTLBuffer
     private let phase1U16PSO: MTLComputePipelineState
     private let phase1U16SpecializedPSO: MTLComputePipelineState
@@ -83,7 +85,16 @@ final class MoE {
             routerName,
             constants: Self.realDecodeRouterConstants,
             maxTotalThreadsPerThreadgroup: 512)
+        // groupSize != Quantization.groupSize goes through the generic
+        // strided-loop kernel, which takes groupSize as a runtime buffer; no
+        // FC_ROUTER_* function constants there, per the generic-kernel
+        // convention.
+        self.routerGemvGenericPSO = try context.pipeline(
+            "router_gemv_gemma4_r4_generic",
+            constants: [],
+            maxTotalThreadsPerThreadgroup: 512)
         self.routerSelectPSO = try context.pipeline("router_topk_select")
+        self.routerSigmoidSelectPSO = try context.pipeline("router_topk_sigmoid")
         self.routerSelectSpecializedPSO = try context.pipeline(
             "router_topk_select",
             constants: Self.realDecodeRouterConstants)
@@ -129,6 +140,52 @@ final class MoE {
         self.reusableRoutedArgBuffer = reusable
     }
 
+    /// Shared GEMV front half for both router scoring paths: one 8-bit row of
+    /// `num_experts` x `d` into `routerLogits`. groupSize ==
+    /// Quantization.groupSize keeps the group-64 pipelines with the identical
+    /// dispatch they had before group-128 support existed; any other groupSize
+    /// goes through the generic strided-loop pipeline, which takes groupSize
+    /// as a runtime buffer (index 8).
+    private func encodeRouterGEMVFront(commandBuffer: MTLCommandBuffer,
+                                       weights: MTLBuffer, weightsOffset: Int,
+                                       scales: MTLBuffer, scalesOffset: Int,
+                                       biases: MTLBuffer, biasesOffset: Int,
+                                       hidden: MTLBuffer,
+                                       effectiveScale: MTLBuffer, effectiveScaleOffset: Int,
+                                       outLogits: MTLBuffer,
+                                       numExperts: UInt32,
+                                       d: UInt32,
+                                       groupSize: UInt32) {
+        var expertCount = numExperts
+        var dimension = d
+        let useGeneric = groupSize != UInt32(Quantization.groupSize)
+        let useSpecialized = !useGeneric
+            && numExperts == Self.realDecodeNumExperts
+            && d == Self.realDecodeD
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.setComputePipelineState(
+                useGeneric
+                    ? routerGemvGenericPSO
+                    : (useSpecialized ? routerGemvSpecializedPSO : routerGemvPSO))
+            encoder.setBuffer(weights, offset: weightsOffset, index: 0)
+            encoder.setBuffer(scales, offset: scalesOffset, index: 1)
+            encoder.setBuffer(biases, offset: biasesOffset, index: 2)
+            encoder.setBuffer(hidden, offset: 0, index: 3)
+            encoder.setBuffer(effectiveScale, offset: effectiveScaleOffset, index: 4)
+            encoder.setBuffer(outLogits, offset: 0, index: 5)
+            encoder.setBytes(&expertCount, length: MemoryLayout<UInt32>.stride, index: 6)
+            encoder.setBytes(&dimension, length: MemoryLayout<UInt32>.stride, index: 7)
+            if useGeneric {
+                var group = groupSize
+                encoder.setBytes(&group, length: MemoryLayout<UInt32>.stride, index: 8)
+            }
+            encoder.dispatchThreadgroups(
+                MTLSize(width: (Int(numExperts) + 3) / 4, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+            encoder.endEncoding()
+        }
+    }
+
     func encodeRouterGemma4(commandBuffer: MTLCommandBuffer,
                                    weights: MTLBuffer, weightsOffset: Int = 0,
                                    scales: MTLBuffer, scalesOffset: Int = 0,
@@ -140,31 +197,25 @@ final class MoE {
                                    outWeights: MTLBuffer,
                                    numExperts: UInt32,
                                    d: UInt32,
-                                   topK: UInt32) {
-        precondition(d.isMultiple(of: UInt32(Quantization.groupSize)))
+                                   topK: UInt32,
+                                   groupSize: UInt32 = UInt32(Quantization.groupSize)) {
+        precondition(d.isMultiple(of: groupSize), "D must be a multiple of groupSize")
         precondition(numExperts <= 256)
         precondition(topK >= 1 && topK <= UInt32(Self.maxStreamedExperts))
 
         var expertCount = numExperts
-        var dimension = d
         let useSpecialized = numExperts == Self.realDecodeNumExperts
             && d == Self.realDecodeD
-        if let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.setComputePipelineState(
-                useSpecialized ? routerGemvSpecializedPSO : routerGemvPSO)
-            encoder.setBuffer(weights, offset: weightsOffset, index: 0)
-            encoder.setBuffer(scales, offset: scalesOffset, index: 1)
-            encoder.setBuffer(biases, offset: biasesOffset, index: 2)
-            encoder.setBuffer(hidden, offset: 0, index: 3)
-            encoder.setBuffer(effectiveScale, offset: effectiveScaleOffset, index: 4)
-            encoder.setBuffer(routerLogits, offset: 0, index: 5)
-            encoder.setBytes(&expertCount, length: MemoryLayout<UInt32>.stride, index: 6)
-            encoder.setBytes(&dimension, length: MemoryLayout<UInt32>.stride, index: 7)
-            encoder.dispatchThreadgroups(
-                MTLSize(width: (Int(numExperts) + 3) / 4, height: 1, depth: 1),
-                threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
-            encoder.endEncoding()
-        }
+        encodeRouterGEMVFront(commandBuffer: commandBuffer,
+                              weights: weights, weightsOffset: weightsOffset,
+                              scales: scales, scalesOffset: scalesOffset,
+                              biases: biases, biasesOffset: biasesOffset,
+                              hidden: hidden,
+                              effectiveScale: effectiveScale,
+                              effectiveScaleOffset: effectiveScaleOffset,
+                              outLogits: routerLogits,
+                              numExperts: numExperts, d: d,
+                              groupSize: groupSize)
 
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.setComputePipelineState(
@@ -176,6 +227,58 @@ final class MoE {
             encoder.setBytes(&expertCount, length: MemoryLayout<UInt32>.stride, index: 4)
             var selectedExperts = topK
             encoder.setBytes(&selectedExperts, length: MemoryLayout<UInt32>.stride, index: 5)
+            encoder.dispatchThreadgroups(
+                MTLSize(width: 1, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            encoder.endEncoding()
+        }
+    }
+
+    /// Sigmoid-over-all-experts routing (Laguna's `LagunaTopKRouter`). The
+    /// GEMV front half is identical to `encodeRouterGemma4`; only the scoring
+    /// tail differs — sigmoid over every expert, an additive selection bias
+    /// that shifts *which* experts win (not the gathered weights), and
+    /// sum-division renormalization of the unbiased scores.
+    func encodeRouterSigmoid(commandBuffer: MTLCommandBuffer,
+                             weights: MTLBuffer, weightsOffset: Int = 0,
+                             scales: MTLBuffer, scalesOffset: Int = 0,
+                             biases: MTLBuffer, biasesOffset: Int = 0,
+                             hidden: MTLBuffer,
+                             effectiveScale: MTLBuffer, effectiveScaleOffset: Int = 0,
+                             perExpertScale: MTLBuffer, perExpertScaleOffset: Int = 0,
+                             selectionBias: MTLBuffer, selectionBiasOffset: Int = 0,
+                             outIndices: MTLBuffer,
+                             outWeights: MTLBuffer,
+                             numExperts: UInt32,
+                             d: UInt32,
+                             topK: UInt32,
+                             groupSize: UInt32 = UInt32(Quantization.groupSize)) {
+        precondition(d.isMultiple(of: groupSize), "D must be a multiple of groupSize")
+        precondition(numExperts <= 256)
+        precondition(topK >= 1 && topK <= UInt32(Self.maxStreamedExperts))
+
+        var expertCount = numExperts
+        var selectedExperts = topK
+        encodeRouterGEMVFront(commandBuffer: commandBuffer,
+                              weights: weights, weightsOffset: weightsOffset,
+                              scales: scales, scalesOffset: scalesOffset,
+                              biases: biases, biasesOffset: biasesOffset,
+                              hidden: hidden,
+                              effectiveScale: effectiveScale,
+                              effectiveScaleOffset: effectiveScaleOffset,
+                              outLogits: routerLogits,
+                              numExperts: numExperts, d: d,
+                              groupSize: groupSize)
+
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.setComputePipelineState(routerSigmoidSelectPSO)
+            encoder.setBuffer(routerLogits, offset: 0, index: 0)
+            encoder.setBuffer(perExpertScale, offset: perExpertScaleOffset, index: 1)
+            encoder.setBuffer(outIndices, offset: 0, index: 2)
+            encoder.setBuffer(outWeights, offset: 0, index: 3)
+            encoder.setBytes(&expertCount, length: MemoryLayout<UInt32>.stride, index: 4)
+            encoder.setBuffer(selectionBias, offset: selectionBiasOffset, index: 5)
+            encoder.setBytes(&selectedExperts, length: MemoryLayout<UInt32>.stride, index: 6)
             encoder.dispatchThreadgroups(
                 MTLSize(width: 1, height: 1, depth: 1),
                 threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))

@@ -255,23 +255,20 @@ import Foundation
         #expect(manifest.quant?.routedExpert.groupSize == 128)
     }
 
-    /// `router` is 8-bit (`router_gemv_gemma4_r4`). Accepting 128 would load
-    /// cleanly and then produce silently wrong numbers, so the rejection is the
-    /// feature. Relax a slot only in the same change that teaches its kernel group 128.
-    @Test(arguments: ["router"])
-    func productionManifestRejectsGroup128ForSlotsWhoseKernelIsGroup64(
-        _ slotName: String
-    ) throws {
+    /// `router` is 8-bit and was group-64-only (`router_gemv_gemma4_r4`).
+    /// This change taught the router group 128 (`router_gemv_gemma4_r4_generic`,
+    /// strided-lane like the other generic kernels), so the slot moves from
+    /// the rejected set to the accepted one — the "same change that teaches
+    /// its kernel group 128" the old rejection comment asked for. Group-128
+    /// rejection coverage still exists for widths no kernel implements (see
+    /// perLayerOverrideWithUnsupportedWidthIsRejected).
+    @Test func productionManifestAcceptsGroup128ForRouterNowThatItsKernelLearnedIt() throws {
         let (dir, config) = try Self.writeToyManifest(
-            ["quant": Self.quant(groupSizeOverrides: [slotName: 128])],
+            ["quant": Self.quant(groupSizeOverrides: ["router": 128])],
             config: .gemma4_26B_A4B)
         defer { try? FileManager.default.removeItem(at: dir) }
-        #expect {
-            _ = try ManifestReader.load(directoryURL: dir, expecting: config)
-        } throws: { error in
-            guard case ModelError.indexCorrupt(let detail) = error else { return false }
-            return detail.contains(slotName)
-        }
+        let manifest = try ManifestReader.load(directoryURL: dir, expecting: config)
+        #expect(manifest.quant?.router.groupSize == 128)
     }
 
     // MARK: - Per-layer quantization
@@ -317,31 +314,36 @@ import Foundation
     /// names an unsupported width would otherwise load cleanly and then hand
     /// the kernels bits they cannot decode.
     @Test func perLayerOverrideWithUnsupportedWidthIsRejected() throws {
+        // 5-bit attention was once unimplemented; FusedQKVGEMVGeneric now
+        // decodes 5/8-bit, so the truly unsupported width is 6-bit.
         let (dir, config) = try Self.writeToyManifest(
-            ["quant": Self.quant(perLayerOverrides: ["attention": [(3, 5, 64)]])],
+            ["quant": Self.quant(perLayerOverrides: ["attention": [(3, 6, 64)]])],
             config: .gemma4_26B_A4B)
         defer { try? FileManager.default.removeItem(at: dir) }
         #expect {
             _ = try ManifestReader.load(directoryURL: dir, expecting: config)
         } throws: { error in
             guard case ModelError.indexCorrupt(let detail) = error else { return false }
-            return detail.contains("attention") && detail.contains("5-bit")
+            return detail.contains("attention") && detail.contains("6-bit")
         }
     }
 
-    /// Same rule for group size: `router` is group-64-only, and an
-    /// override must not be a side door around the slot-level gate.
-    @Test func perLayerOverrideCannotBypassAGroupSizeGate() throws {
+    /// Same rule, other direction: a per-layer override clears the same gate
+    /// as the slot default. The router's group gate is now open for 128 (its
+    /// kernel learned it in the same change), so a group-128 override loads,
+    /// resolving on the overridden layer only. The gate itself is still
+    /// enforced — perLayerOverrideWithUnsupportedWidthIsRejected covers a
+    /// width that does not clear it.
+    @Test func perLayerOverrideWithNowSupportedGroupSizeClearsTheGate() throws {
         let (dir, config) = try Self.writeToyManifest(
             ["quant": Self.quant(perLayerOverrides: ["router": [(1, 4, 128)]])],
             config: .gemma4_26B_A4B)
         defer { try? FileManager.default.removeItem(at: dir) }
-        #expect {
-            _ = try ManifestReader.load(directoryURL: dir, expecting: config)
-        } throws: { error in
-            guard case ModelError.indexCorrupt(let detail) = error else { return false }
-            return detail.contains("router")
-        }
+        let manifest = try ManifestReader.load(directoryURL: dir, expecting: config)
+        let router = try #require(manifest.quant?.router)
+        #expect(router.resolved(atLayer: 1).groupSize == 128)
+        // Unlisted layers keep the slot default, not the override.
+        #expect(router.resolved(atLayer: 0).groupSize == Quantization.groupSize)
     }
 
     /// Two entries for the same layer are two different answers to "what is the
@@ -360,23 +362,24 @@ import Foundation
         }
     }
 
-    /// Laguna's actual attention slot, as a whole: 5-bit on 20 layers, 8-bit on
-    /// 28. The format can now *express* it; the kernels still cannot decode
-    /// 5-bit attention, so loading must still fail — and fail naming the width,
-    /// not with the old "cannot be represented" silence.
+    /// The attention slot varies by layer, as a whole. 5/8-bit are now
+    /// decodable (FusedQKVGEMVGeneric), so the still-unsupported width is
+    /// 6-bit: the format can *express* the mixture, but loading must still
+    /// fail — and fail naming the width, not with the old "cannot be
+    /// represented" silence.
     @Test func lagunaMixedAttentionIsExpressibleButStillRejectedByTheKernelGate() throws {
-        let fiveBitLayers = [0, 1, 3, 4, 5, 6, 7, 9, 10, 11, 13, 14, 15]
+        let sixBitLayers = [0, 1, 3, 4, 5, 6, 7, 9, 10, 11, 13, 14, 15]
         let (dir, config) = try Self.writeToyManifest(
             ["quant": Self.quant(
                 groupSizeOverrides: ["attention": 64],
-                perLayerOverrides: ["attention": fiveBitLayers.map { ($0, 5, 64) }])],
+                perLayerOverrides: ["attention": sixBitLayers.map { ($0, 6, 64) }])],
             config: .gemma4_26B_A4B)
         defer { try? FileManager.default.removeItem(at: dir) }
         #expect {
             _ = try ManifestReader.load(directoryURL: dir, expecting: config)
         } throws: { error in
             guard case ModelError.indexCorrupt(let detail) = error else { return false }
-            return detail.contains("attention") && detail.contains("5-bit")
+            return detail.contains("attention") && detail.contains("6-bit")
         }
     }
 

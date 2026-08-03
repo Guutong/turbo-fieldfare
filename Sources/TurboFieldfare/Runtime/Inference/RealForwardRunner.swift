@@ -223,6 +223,11 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     /// allocation per layer. ~168 KB total at 30 layers × 2816 BF16 — bounded
     /// host work done once at init.
     private let effectiveScaleBuffers: [MTLBuffer]
+    /// BF16 all-ones `[numExperts]` buffer. `.sigmoidTopK` models have no
+    /// `per_expert_scale` (`Model.routerPerExpertScale` returns nil), but the
+    /// sigmoid kernels read that buffer slot, so it gets ones — multiplying a
+    /// weight by 1.0 is exact, so this is a no-op numerically.
+    private let routerOnesPerExpert: MTLBuffer
     private let sharedExpertProjections: [LayerSharedExpertProjections]
 
     public let maxContext: Int
@@ -248,16 +253,12 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
 
         // Refuse architectures the kernels cannot execute, rather than running
         // the nearest available kernel and returning numbers that look fine.
-        // Both of these are wired end-to-end everywhere *except* the kernel
-        // itself; see "Remaining kernel work" in HANDOFF.md.
-        if model.config.routerScoring == .sigmoidTopK {
-            throw ModelError.unsupportedArchFeature(
-                feature: "routerScoring",
-                value: model.config.routerScoring.rawValue,
-                detail: "only softmax-over-topK routing has a kernel; a sigmoid "
-                      + "router needs scoring over all experts, a selection-only "
-                      + "e_score_correction_bias, and top-K renormalization")
-        }
+        // Sigmoid routing is now implemented end to end (router_topk_sigmoid /
+        // prefill_router_sigmoid_block, wired in the decode and prefill loops
+        // below), so the remaining refusal is the activation. Router logit
+        // softcapping (tanh(x/c)*c) is not implemented; Laguna does not set it
+        // (config.json: moe_router_logit_softcapping = 0.0) and no config
+        // field carries it, so a nonzero value cannot arrive silently.
         if model.config.hiddenActivation != "gelu_pytorch_tanh" {
             throw ModelError.unsupportedArchFeature(
                 feature: "hiddenActivation",
@@ -441,6 +442,21 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             perLayer.append(buf)
         }
         self.effectiveScaleBuffers = perLayer
+
+        // All-ones per-expert scale for `.sigmoidTopK` routing, which has no
+        // `router.per_expert_scale` tensor. The sigmoid kernels multiply the
+        // gathered (already renormalized) weights by this buffer, so ones keep
+        // the reference semantics exactly.
+        guard let ones = device.makeBuffer(
+            length: max(cfg.numExperts, 1) * MemoryLayout<UInt16>.size,
+            options: .storageModeShared) else {
+            throw ModelError.residentBufferWrapFailed
+        }
+        let oneBits = Quantization.bf16Bits(1.0)
+        let oneDst = ones.contents().assumingMemoryBound(to: UInt16.self)
+        for i in 0..<cfg.numExperts { oneDst[i] = oneBits }
+        ones.label = "router.per_expert_scale.ones"
+        self.routerOnesPerExpert = ones
     }
 
     public func reset() {
@@ -1208,28 +1224,60 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 continue
             }
 
-            guard let router = views.router, let routerPerExpertScale = views.routerPerExpertScale else {
+            guard let router = views.router else {
                 throw ModelError.tensorNotFound(name: "language_model.model.layers.\(L).router.proj.weight")
             }
-            prefillRouter.encodeGemma4Block(
-                        commandBuffer: cb,
-                        weights: router.buffer,
-                        weightsOffset: Int(router.offset),
-                        scales: router.buffer,
-                        scalesOffset: Int(router.scaleOffset),
-                        biases: router.buffer,
-                        biasesOffset: Int(router.biasOffset),
-                        hidden: scratch.routerX,
-                        effectiveScale: effectiveScaleBuffers[L],
-                        perExpertScale: routerPerExpertScale.buffer,
-                        perExpertScaleOffset: Int(routerPerExpertScale.offset),
-                        outIndices: scratch.routeIDs,
-                        outWeights: scratch.routeWeights,
-                        queryCount: UInt32(t),
-                        numExperts: UInt32(cfg.numExperts),
-                        d: UInt32(D),
-                        topK: UInt32(cfg.topKExperts),
-                        hiddenStrideElements: UInt32(D))
+            if cfg.routerScoring == .sigmoidTopK {
+                guard let selectionBias = views.routerSelectionBias else {
+                    throw ModelError.tensorNotFound(
+                        name: "language_model.model.layers.\(L).mlp.gate.e_score_correction_bias")
+                }
+                prefillRouter.encodeSigmoidBlock(
+                            commandBuffer: cb,
+                            weights: router.buffer,
+                            weightsOffset: Int(router.offset),
+                            scales: router.buffer,
+                            scalesOffset: Int(router.scaleOffset),
+                            biases: router.buffer,
+                            biasesOffset: Int(router.biasOffset),
+                            hidden: scratch.routerX,
+                            effectiveScale: effectiveScaleBuffers[L],
+                            perExpertScale: routerOnesPerExpert,
+                            selectionBias: selectionBias.buffer,
+                            selectionBiasOffset: Int(selectionBias.offset),
+                            outIndices: scratch.routeIDs,
+                            outWeights: scratch.routeWeights,
+                            queryCount: UInt32(t),
+                            numExperts: UInt32(cfg.numExperts),
+                            d: UInt32(D),
+                            topK: UInt32(cfg.topKExperts),
+                            hiddenStrideElements: UInt32(D))
+            } else {
+                guard let routerPerExpertScale = views.routerPerExpertScale else {
+                    throw ModelError.tensorNotFound(
+                        name: "language_model.model.layers.\(L).router.per_expert_scale")
+                }
+                prefillRouter.encodeGemma4Block(
+                            commandBuffer: cb,
+                            weights: router.buffer,
+                            weightsOffset: Int(router.offset),
+                            scales: router.buffer,
+                            scalesOffset: Int(router.scaleOffset),
+                            biases: router.buffer,
+                            biasesOffset: Int(router.biasOffset),
+                            hidden: scratch.routerX,
+                            effectiveScale: effectiveScaleBuffers[L],
+                            perExpertScale: routerPerExpertScale.buffer,
+                            perExpertScaleOffset: Int(routerPerExpertScale.offset),
+                            outIndices: scratch.routeIDs,
+                            outWeights: scratch.routeWeights,
+                            queryCount: UInt32(t),
+                            numExperts: UInt32(cfg.numExperts),
+                            d: UInt32(D),
+                            topK: UInt32(cfg.topKExperts),
+                            hiddenStrideElements: UInt32(D),
+                            groupSize: UInt32(Quantization.groupSize))
+            }
 
                     cb.commit()
                     waitForCompletion(cb)
@@ -1630,6 +1678,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             let postF    = try model.postFFN(layer: L)
             let routerW  = isDense ? nil : (try model.router(layer: L))
             let perExpertScale = isDense ? nil : (try model.routerPerExpertScale(layer: L))
+            // nil under `.softmaxTopK`, which has no selection bias.
+            let selectionBias = isDense ? nil : (try model.routerSelectionBias(layer: L))
             // 1.0 under `.preNorm`, which has no per-layer residual gain.
             let layerScalar: Float = try model.layerScalar(layer: L).map {
                 Quantization.bf16ToFloat(
@@ -1804,17 +1854,33 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             }
 
             let gRouter: (MTLCommandBuffer) -> Void = { [self] cb in
-                guard let routerW, let perExpertScale else { return }
-                moe.encodeRouterGemma4(commandBuffer: cb,
-                    weights: routerW.buffer, weightsOffset: Int(routerW.offset),
-                    scales:  routerW.buffer, scalesOffset:  Int(routerW.scaleOffset),
-                    biases:  routerW.buffer, biasesOffset:  Int(routerW.biasOffset),
-                    hidden: routerInput,
-                    effectiveScale: effectiveScaleBuffers[L],
-                    perExpertScale: perExpertScale.buffer,
-                    perExpertScaleOffset: Int(perExpertScale.offset),
-                    outIndices: outIndices, outWeights: outWeights,
-                    numExperts: UInt32(cfg.numExperts), d: D, topK: UInt32(cfg.topKExperts))
+                guard let routerW else { return }
+                if cfg.routerScoring == .sigmoidTopK {
+                    guard let selectionBias else { return }
+                    moe.encodeRouterSigmoid(commandBuffer: cb,
+                        weights: routerW.buffer, weightsOffset: Int(routerW.offset),
+                        scales:  routerW.buffer, scalesOffset:  Int(routerW.scaleOffset),
+                        biases:  routerW.buffer, biasesOffset:  Int(routerW.biasOffset),
+                        hidden: routerInput,
+                        effectiveScale: effectiveScaleBuffers[L],
+                        perExpertScale: routerOnesPerExpert,
+                        selectionBias: selectionBias.buffer,
+                        selectionBiasOffset: Int(selectionBias.offset),
+                        outIndices: outIndices, outWeights: outWeights,
+                        numExperts: UInt32(cfg.numExperts), d: D, topK: UInt32(cfg.topKExperts))
+                } else {
+                    guard let perExpertScale else { return }
+                    moe.encodeRouterGemma4(commandBuffer: cb,
+                        weights: routerW.buffer, weightsOffset: Int(routerW.offset),
+                        scales:  routerW.buffer, scalesOffset:  Int(routerW.scaleOffset),
+                        biases:  routerW.buffer, biasesOffset:  Int(routerW.biasOffset),
+                        hidden: routerInput,
+                        effectiveScale: effectiveScaleBuffers[L],
+                        perExpertScale: perExpertScale.buffer,
+                        perExpertScaleOffset: Int(perExpertScale.offset),
+                        outIndices: outIndices, outWeights: outWeights,
+                        numExperts: UInt32(cfg.numExperts), d: D, topK: UInt32(cfg.topKExperts))
+                }
             }
 
             let cb = ctx.queue.makeCommandBuffer()!

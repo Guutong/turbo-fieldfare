@@ -125,6 +125,79 @@ static inline void router_gemv_gemma4_body(
     if (lane == 0) out_logits[e] = acc;
 }
 
+// Group-size-agnostic counterpart to router_gemv_gemma4_body: the group-64
+// kernel maps 32 lanes x 2 consecutive elements per group, a stride baked to
+// kMoEGroupSize. This takes `groupSize` at runtime and each lane strides
+// across a group by 32 instead (the pattern of
+// moe_int4_gemv_row_simd_dev_vec_generic), so correctness does not depend on
+// the group size. Router weights are one byte per element (not packed int4).
+// Used for groupSize != kMoEGroupSize (128, for Laguna's router);
+// router_gemv_gemma4_body is untouched, so the group-64 fast path (Gemma) is
+// unaffected. No FC_ROUTER_* function constants here, per the generic-kernel
+// convention.
+static inline void router_gemv_gemma4_body_generic(
+    device const uint8_t* W,
+    device const bfloat* scales,
+    device const bfloat* biases,
+    device const half* hidden,
+    device const bfloat* effective_scale,
+    device float* out_logits,
+    constant uint& num_experts,
+    constant uint& D,
+    constant uint& groupSize,
+    uint rows_per_tg,
+    uint tg_idx,
+    uint sg_idx,
+    uint lane
+) {
+    const uint e = tg_idx * rows_per_tg + sg_idx;
+    if (e >= num_experts) return;
+
+    const uint n_groups = D / groupSize;
+    device const uint8_t* W_row = W + uint(e) * D;
+    device const bfloat* s_row = scales + uint(e) * n_groups;
+    device const bfloat* b_row = biases + uint(e) * n_groups;
+
+    float acc = 0.0f;
+    for (uint g = 0; g < n_groups; ++g) {
+        const float s = float(s_row[g]);
+        const float b = float(b_row[g]);
+        const uint group_base = g * groupSize;
+        float dot = 0.0f;
+        float sum = 0.0f;
+        for (uint elem = lane; elem < groupSize; elem += 32u) {
+            const uint idx = group_base + elem;
+            const float q = float(uint(W_row[idx]));
+            const float xv = float(hidden[idx]) * float(effective_scale[idx]);
+            dot = fma(q, xv, dot);
+            sum += xv;
+        }
+        acc = fma(s, dot, acc);
+        acc = fma(b, sum, acc);
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) out_logits[e] = acc;
+}
+
+kernel void router_gemv_gemma4_r4_generic(
+    device const uint8_t* W [[buffer(0)]],
+    device const bfloat* scales [[buffer(1)]],
+    device const bfloat* biases [[buffer(2)]],
+    device const half* hidden [[buffer(3)]],
+    device const bfloat* effective_scale [[buffer(4)]],
+    device float* out_logits [[buffer(5)]],
+    constant uint& num_experts [[buffer(6)]],
+    constant uint& D [[buffer(7)]],
+    constant uint& groupSize [[buffer(8)]],
+    uint tg_idx [[threadgroup_position_in_grid]],
+    uint sg_idx [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    router_gemv_gemma4_body_generic(W, scales, biases, hidden, effective_scale,
+                                    out_logits, num_experts, D, groupSize,
+                                    4, tg_idx, sg_idx, lane);
+}
+
 kernel void router_gemv_gemma4_r4(
     device const uint8_t* W [[buffer(0)]],
     device const bfloat* scales [[buffer(1)]],
@@ -197,6 +270,78 @@ kernel void router_topk_select(
     for (uint i = 0; i < K; ++i) {
         const uint expert_idx = top_idx[i];
         const float weight = exps[i] / sum_exp;
+        out_indices[i] = expert_idx;
+        out_weights[i] = half(weight * float(per_expert_scale[expert_idx]));
+    }
+}
+
+// Sigmoid with input clamping. For x <= -20 the value is below ~2.1e-9, so
+// clamping preserves every representable difference while keeping `exp` far
+// from overflow; for x above -20 the formula is exact.
+static inline float router_sigmoid_score(float x) {
+    return 1.0f / (1.0f + exp(-max(x, -20.0f)));
+}
+
+// Sigmoid-over-all-experts routing (Laguna's `LagunaTopKRouter`). Unlike
+// router_topk_select there is no softmax over the selected K: every expert's
+// score is sigmoid(logit), the additive selection bias shifts only *which*
+// experts win (load-balancing pressure), the gathered weights are the
+// UNBIASED sigmoid scores at the selected indices, and they are renormalized
+// by sum-division (`norm_topk_prob: true`).
+kernel void router_topk_sigmoid(
+    device const float* logits [[buffer(0)]],
+    device const bfloat* per_expert_scale [[buffer(1)]],
+    device uint* out_indices [[buffer(2)]],
+    device half* out_weights [[buffer(3)]],
+    constant uint& num_experts [[buffer(4)]],
+    device const bfloat* selection_bias [[buffer(5)]],
+    constant uint& top_k [[buffer(6)]],
+    uint tid [[thread_position_in_threadgroup]]
+) {
+    if (tid != 0) return;
+    const uint K = min(top_k, kMoEMaxTopK);
+    const uint NE = num_experts;
+
+    uint top_idx[kMoEMaxTopK];
+    float top_score[kMoEMaxTopK];
+    for (uint i = 0; i < K; ++i) {
+        top_idx[i] = 0u;
+        top_score[i] = -INFINITY;
+    }
+
+    // Selection loop over biased scores; the bias must not survive into the
+    // gathered weights below.
+    for (uint e = 0; e < NE; ++e) {
+        const float s = router_sigmoid_score(logits[e]) + float(selection_bias[e]);
+        if (s <= top_score[K - 1]) continue;
+        uint pos = K;
+        for (uint i = 0; i < K; ++i) {
+            if (s > top_score[i] || (s == top_score[i] && e < top_idx[i])) {
+                pos = i;
+                break;
+            }
+        }
+        if (pos >= K) continue;
+        for (uint i = K - 1; i > pos; --i) {
+            top_idx[i] = top_idx[i - 1];
+            top_score[i] = top_score[i - 1];
+        }
+        top_idx[pos] = e;
+        top_score[pos] = s;
+    }
+
+    // Gather UNBIASED routing scores at the selected indices, then
+    // renormalize to sum to one (sum-divide, not softmax).
+    float weights[kMoEMaxTopK];
+    float sum_w = 0.0f;
+    for (uint i = 0; i < K; ++i) {
+        const float w = router_sigmoid_score(logits[top_idx[i]]);
+        weights[i] = w;
+        sum_w += w;
+    }
+    for (uint i = 0; i < K; ++i) {
+        const uint expert_idx = top_idx[i];
+        const float weight = weights[i] / sum_w;
         out_indices[i] = expert_idx;
         out_weights[i] = half(weight * float(per_expert_scale[expert_idx]));
     }
