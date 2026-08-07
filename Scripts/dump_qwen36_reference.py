@@ -172,22 +172,54 @@ def main():
 
     print(f"Loading model: {args.model}")
 
-    # Load the model using mlx-lm (handles config + download automatically)
-    from mlx_lm import load
-    model, tokenizer = load(args.model)
+    # Load config
+    import os
+    model_path = args.model
+    config_path = os.path.join(model_path, "config.json")
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"config.json not found in {model_path}")
+    with open(config_path, "r") as f:
+        config = json.load(f)
 
-    # Extract config from the model
-    config = model.args.__dict__ if hasattr(model.args, '__dict__') else vars(model.args)
-    # Convert any MLX arrays in config to Python types
-    def to_python(val):
-        if isinstance(val, mx.array):
-            return mx.to_numpy(val).tolist()
-        if isinstance(val, (list, tuple)):
-            return type(val)(to_python(v) for v in val)
-        if isinstance(val, dict):
-            return {k: to_python(v) for k, v in val.items()}
-        return val
-    config = to_python(config)
+    # Load tokenizer
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+
+    # Load model weights and build architecture
+    from mlx_lm.models import get_model_from_args
+    from mlx_lm.utils import load_config
+
+    # Use mlx_lm's model loading with local path
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    # Import the Qwen3Next model class
+    from mlx_lm.models.qwen3_next import Model as Qwen3NextModel, ModelArgs as Qwen3NextModelArgs
+
+    # Build config
+    model_args = Qwen3NextModelArgs(**{k: v for k, v in config.items()})
+
+    # Create model
+    model = Qwen3NextModel(model_args)
+
+    # Load weights from safetensors (handle sharded files)
+    import glob
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    if os.path.exists(index_path):
+        with open(index_path, "r") as f:
+            index = json.load(f)
+        weight_files = sorted(set(index["weight_map"].values()))
+    else:
+        weight_files = sorted(glob.glob(os.path.join(model_path, "*.safetensors")))
+
+    if not weight_files:
+        raise FileNotFoundError(f"No safetensors files found in {model_path}")
+
+    # Load all weights
+    all_weights = {}
+    for wf in weight_files:
+        all_weights.update(mx.load(wf))
+    model.update(all_weights)
 
     print(f"Config layers: {config.get('num_hidden_layers')}, hidden: {config.get('hidden_size')}, vocab: {config.get('vocab_size')}")
 
