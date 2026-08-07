@@ -69,7 +69,7 @@ smaller tasks in `plan.md`, add them to the board with new IDs, and stop with
 | P0-2 | DeltaNet structure, from source | DONE | |
 | P0-3 | Norm + QK details, from source | DONE | |
 | P0-4 | MRoPE reduces to plain RoPE? | DONE | |
-| P0-5 | Write findings to IMPLEMENTATION_REFERENCES.md | TODO | |
+| P0-5 | Write findings to IMPLEMENTATION_REFERENCES.md | DONE | |
 | P0-6 | Write scripts/dump_qwen36_reference.py | TODO | write only, do not run |
 | P0-7 | Run the dump, commit fixture | TODO | ⚠️ needs ≥32GB host, not this Air |
 | P1-1 | ArchInfo: root-level config | TODO | |
@@ -153,6 +153,13 @@ Ran:      web fetch of `rope_utils.py` and `qwen3_next.py`
 Learned:  **MRoPE reduces to plain partial RoPE for text-only.** `Qwen3NextAttention.__init__` calls `initialize_rope(int(head_dim * partial_rotary_factor), ..., scaling_config=args.rope_scaling)`. `args.rope_scaling` = `rope_parameters` dict = `{"type": "default", "mrope_section": [11,11,10], ...}`. In `initialize_rope`, `rope_type = scaling_config.get("type")` = `"default"`, which hits the `if rope_type in ["default", "linear"]` branch and returns `nn.RoPE(dims, traditional=traditional, base=base)` — a standard RoPE with no mrope_section awareness. The `mrope` type branch (which also just returns plain `nn.RoPE`) is never reached because the config says `type: "default"`. For text-only input, all three mrope_sections receive identical positions, so the mrope_section is irrelevant. Rotary dim = `head_dim * partial_rotary_factor` = 256 * 0.25 = 64.
 Unproven: nothing for this task
 Next:     P0-5
+
+### 2026-08-08 — P0-5 — TODO -> DOING
+Did:      Added "Qwen3.6-35B-A3B" section to `docs/IMPLEMENTATION_REFERENCES.md` with findings from P0-1 through P0-4, in the citation style used in the file.
+Ran:      `grep -c "qwen3_5_moe" docs/IMPLEMENTATION_REFERENCES.md` -> 2
+Learned:  Section covers: MoE router (plain softmax, norm_topk_prob=True, no extra scaling), Gated DeltaNet (projections, conv1d, recurrence, state tensors, head mapping), Attention norm/topology (q_norm/k_norm, pre-norm, gate_up_proj split), MRoPE reduction (type: default → plain partial RoPE, rotary_dim=64).
+Unproven: nothing for this task
+Next:     P0-6
 
 ### 2026-08-08 — P0-1 — TODO -> DOING
 Did:      Fetched `mlx_lm/models/qwen3_5_moe.py` and `mlx_lm/models/qwen3_next.py` from ml-explore/mlx-lm. Found router scoring in `Qwen3NextSparseMoeBlock.__call__`.
