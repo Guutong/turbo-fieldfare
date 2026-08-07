@@ -184,7 +184,8 @@ def main():
     # Load tokenizer
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-
+    from mlx_lm import load
+    model, tokenizer = load(model_path)
     # Load model weights and build architecture
     import mlx.core as mx
     import mlx.nn as nn
