@@ -66,7 +66,7 @@ smaller tasks in `plan.md`, add them to the board with new IDs, and stop with
 |---|---|---|---|
 | P0-0 | Baseline: branch + test counts | DONE | |
 | P0-1 | Router scoring, from mlx-lm source | DONE | never guess this |
-| P0-2 | DeltaNet structure, from source | TODO | |
+| P0-2 | DeltaNet structure, from source | DONE | |
 | P0-3 | Norm + QK details, from source | TODO | |
 | P0-4 | MRoPE reduces to plain RoPE? | TODO | |
 | P0-5 | Write findings to IMPLEMENTATION_REFERENCES.md | TODO | |
@@ -126,12 +126,19 @@ Learned:  Repo is upstream `main`, Gemma-only. No silu, no pre-norm, no sigmoid 
 Unproven: everything below P0-0
 Next:     P0-0
 
-### 2026-08-08 — P0-0 — TODO -> DOING
-Did:      Created branch `qwen36-bringup` off `main`. Ran full test suite.
-Ran:      `swift test 2>&1 | tail -30` -> `Test run with 648 tests in 122 suites passed after 39.381 seconds.`
-Learned:  Baseline: 648 tests, 0 failures, 122 suites. All green on Gemma-only code.
+### 2026-08-08 — P0-1 — TODO -> DOING
+Did:      Fetched `mlx_lm/models/qwen3_5_moe.py` and `mlx_lm/models/qwen3_next.py` from ml-explore/mlx-lm. Found router scoring in `Qwen3NextSparseMoeBlock.__call__`.
+Ran:      web fetch of two source files
+Learned:  Router uses **plain softmax** (`mx.softmax(gates, axis=-1, precise=True)`), NOT sigmoid. `norm_topk_prob` defaults to `True` in `qwen3_5.py` TextModelArgs (the Qwen3.6 model inherits from it), so top-k scores are divided by their sum. No additional routed scaling factor beyond the softmax+norm. `gate_up_proj` split: `mid = gate_up.shape[-2] // 2`, gate = `[..., :mid, :]`, up = `[..., mid:, :]`, mapped to `switch_mlp.gate_proj.weight` / `switch_mlp.up_proj.weight`.
 Unproven: nothing for this task
-Next:     P0-1
+Next:     P0-2
+
+### 2026-08-08 — P0-2 — TODO -> DOING
+Did:      Analyzed `GatedDeltaNet` in `qwen3_5.py` and `gated_delta_update` in `gated_delta.py` from ml-explore/mlx-lm.
+Ran:      web fetch of `qwen3_5.py` and `gated_delta.py`
+Learned:  **Projections:** `in_proj_qkv` (Linear[H, key_dim*2+value_dim]), `in_proj_z` (Linear[H, value_dim]), `in_proj_b` (Linear[H, num_v_heads]), `in_proj_a` (Linear[H, num_v_heads]), `conv1d` (Conv1d[conv_dim, kernel=4, groups=conv_dim, padding=0]), `out_proj` (Linear[value_dim, H]), `norm` (RMSNormGated[head_v_dim]). **Causal conv1d:** sits after `mx.concatenate([conv_state, qkv])`, width=4, output passes through `nn.silu()`. **Recurrence:** `gated_delta_update(q, k, v, a, b, A_log, dt_bias, state, mask)` — computes `beta = mx.sigmoid(b)`, `g = mx.exp(-mx.exp(A_log) * nn.softplus(a + dt_bias))`, then sequential loop: `state = state * g[..., None, None]`, `kv_mem = (state * k[..., None, :]).sum(-1)`, `delta = (v - kv_mem) * beta[..., None]`, `state = state + k[..., None, :] * delta`, `y = (state * q[..., None, :]).sum(-1)`. **16 key heads × 128 → 32 value heads × 128:** repeat_factor = Hv//Hk = 2; `q` and `k` are repeated along head dim before recurrence. **Per-layer state tensors:** (1) `conv_state`: shape `[B, 3, conv_dim]` — last 3 steps of concatenated qkv; (2) `recurrent_state`: shape `[B, Hv, Dv, Dk]` = `[B, 32, 128, 128]` — accumulated KV product, fp32.
+Unproven: nothing for this task
+Next:     P0-3
 
 ### 2026-08-08 — P0-1 — TODO -> DOING
 Did:      Fetched `mlx_lm/models/qwen3_5_moe.py` and `mlx_lm/models/qwen3_next.py` from ml-explore/mlx-lm. Found router scoring in `Qwen3NextSparseMoeBlock.__call__`.
