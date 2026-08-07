@@ -70,8 +70,8 @@ smaller tasks in `plan.md`, add them to the board with new IDs, and stop with
 | P0-3 | Norm + QK details, from source | DONE | |
 | P0-4 | MRoPE reduces to plain RoPE? | DONE | |
 | P0-5 | Write findings to IMPLEMENTATION_REFERENCES.md | DONE | |
-| P0-6 | Write scripts/dump_qwen36_reference.py | TODO | write only, do not run |
-| P0-7 | Run the dump, commit fixture | TODO | ⚠️ needs ≥32GB host, not this Air |
+| P0-6 | Write scripts/dump_qwen36_reference.py | DONE | write only, do not run |
+| P0-7 | Run the dump, commit fixture | BLOCKED | ⚠️ needs ≥32GB host, not this Air |
 | P1-1 | ArchInfo: root-level config | TODO | |
 | P1-2 | ArchInfo: accept linear_attention | TODO | |
 | P1-3 | ArchInfo: sliding_window optional | TODO | |
