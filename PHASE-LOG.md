@@ -65,7 +65,7 @@ smaller tasks in `plan.md`, add them to the board with new IDs, and stop with
 | ID | Task | Status | Notes |
 |---|---|---|---|
 | P0-0 | Baseline: branch + test counts | DONE | |
-| P0-1 | Router scoring, from mlx-lm source | TODO | never guess this |
+| P0-1 | Router scoring, from mlx-lm source | DONE | never guess this |
 | P0-2 | DeltaNet structure, from source | TODO | |
 | P0-3 | Norm + QK details, from source | TODO | |
 | P0-4 | MRoPE reduces to plain RoPE? | TODO | |
@@ -132,3 +132,10 @@ Ran:      `swift test 2>&1 | tail -30` -> `Test run with 648 tests in 122 suites
 Learned:  Baseline: 648 tests, 0 failures, 122 suites. All green on Gemma-only code.
 Unproven: nothing for this task
 Next:     P0-1
+
+### 2026-08-08 — P0-1 — TODO -> DOING
+Did:      Fetched `mlx_lm/models/qwen3_5_moe.py` and `mlx_lm/models/qwen3_next.py` from ml-explore/mlx-lm. Found router scoring in `Qwen3NextSparseMoeBlock.__call__`.
+Ran:      web fetch of two source files
+Learned:  Router uses **plain softmax** (`mx.softmax(gates, axis=-1, precise=True)`), NOT sigmoid. `norm_topk_prob` defaults to `True` in `qwen3_5.py` TextModelArgs (the Qwen3.6 model inherits from it), so top-k scores are divided by their sum. No additional routed scaling factor beyond the softmax+norm. `gate_up_proj` split: `mid = gate_up.shape[-2] // 2`, gate = `[..., :mid, :]`, up = `[..., mid:, :]`, mapped to `switch_mlp.gate_proj.weight` / `switch_mlp.up_proj.weight`.
+Unproven: nothing for this task
+Next:     P0-2
