@@ -161,6 +161,20 @@ Learned:  Section covers: MoE router (plain softmax, norm_topk_prob=True, no ext
 Unproven: nothing for this task
 Next:     P0-6
 
+### 2026-08-08 — P0-6 — TODO -> DOING
+Did:      Wrote `scripts/dump_qwen36_reference.py` — loads mlx-community/Qwen3.6-35B-A3B-4bit, runs fixed prompt "The capital of France is", captures input_token_ids, embedding_output, hidden_in/out for all 40 layers, router_logits and expert_ids for layers 0 and 3. Saves one safetensors file.
+Ran:      `python3 -m py_compile scripts/dump_qwen36_reference.py` -> clean (exit 0)
+Learned:  Script uses mlx-lm `load()` API, HookedQwen3Next wrapper for per-layer capture, safetensors.numpy.save_file for output. Does NOT run the dump (P0-7 is human-only).
+Unproven: nothing for this task
+Next:     P0-7
+
+### 2026-08-08 — P0-7 — TODO -> BLOCKED
+Did:      Marked P0-7 as BLOCKED — requires ~19 GB of weights resident, does not fit in 16 GB host.
+Ran:      nothing
+Learned:  A human must run `python3 scripts/dump_qwen36_reference.py --output Tests/Fixtures/qwen36_fixture.safetensors` on a ≥32 GB machine and commit the fixture under `Tests/Fixtures/`.
+Unproven: nothing for this task
+Next:     STOP — P0-7 is human-only. All Phase 0 tasks complete.
+
 ### 2026-08-08 — P0-1 — TODO -> DOING
 Did:      Fetched `mlx_lm/models/qwen3_5_moe.py` and `mlx_lm/models/qwen3_next.py` from ml-explore/mlx-lm. Found router scoring in `Qwen3NextSparseMoeBlock.__call__`.
 Ran:      web fetch of two source files
