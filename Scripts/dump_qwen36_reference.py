@@ -16,6 +16,7 @@ Greedy decoding (temperature 0), deterministic.
 
 import argparse
 import json
+import numpy as np
 import safetensors
 import safetensors.numpy
 import mlx.core as mx
@@ -26,7 +27,8 @@ from mlx.utils import tree_flatten, tree_unflatten
 def mlx_to_np(tree):
     """Recursively convert an MLX pytree to numpy for safetensors."""
     if isinstance(tree, mx.array):
-        return mx.to_numpy(tree)
+        # Explicitly copy to host memory, then convert to numpy
+        return np.array(np.frombuffer(tree.tobytes(), dtype=tree.dtype), dtype=tree.dtype).reshape(tree.shape)
     if isinstance(tree, (list, tuple)):
         return type(tree)(mlx_to_np(x) for x in tree)
     if isinstance(tree, dict):
@@ -170,30 +172,24 @@ def main():
 
     print(f"Loading model: {args.model}")
 
-    # Load model config
-    if args.config:
-        with open(args.config, "r") as f:
-            config = json.load(f)
-    else:
-        # Try to load from the model repo
-        import os
-        config_path = os.path.join(args.model, "config.json")
-        if os.path.exists(config_path):
-            with open(config_path, "r") as f:
-                config = json.load(f)
-        else:
-            # Download config
-            import subprocess
-            subprocess.run(["huggingface-cli", "download", args.model, "config.json",
-                          "--local-dir", "."], check=True)
-            with open("config.json", "r") as f:
-                config = json.load(f)
-
-    print(f"Config: {json.dumps({k: v for k, v in config.items() if k != 'rope_scaling'}, indent=2, default=str)}")
-
-    # Load the model using mlx-lm
+    # Load the model using mlx-lm (handles config + download automatically)
     from mlx_lm import load
     model, tokenizer = load(args.model)
+
+    # Extract config from the model
+    config = model.args.__dict__ if hasattr(model.args, '__dict__') else vars(model.args)
+    # Convert any MLX arrays in config to Python types
+    def to_python(val):
+        if isinstance(val, mx.array):
+            return mx.to_numpy(val).tolist()
+        if isinstance(val, (list, tuple)):
+            return type(val)(to_python(v) for v in val)
+        if isinstance(val, dict):
+            return {k: to_python(v) for k, v in val.items()}
+        return val
+    config = to_python(config)
+
+    print(f"Config layers: {config.get('num_hidden_layers')}, hidden: {config.get('hidden_size')}, vocab: {config.get('vocab_size')}")
 
     # Create hooked model
     hooked = HookedQwen3Next(model)
