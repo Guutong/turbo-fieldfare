@@ -67,7 +67,7 @@ smaller tasks in `plan.md`, add them to the board with new IDs, and stop with
 | P0-0 | Baseline: branch + test counts | DONE | |
 | P0-1 | Router scoring, from mlx-lm source | DONE | never guess this |
 | P0-2 | DeltaNet structure, from source | DONE | |
-| P0-3 | Norm + QK details, from source | TODO | |
+| P0-3 | Norm + QK details, from source | DONE | |
 | P0-4 | MRoPE reduces to plain RoPE? | TODO | |
 | P0-5 | Write findings to IMPLEMENTATION_REFERENCES.md | TODO | |
 | P0-6 | Write scripts/dump_qwen36_reference.py | TODO | write only, do not run |
@@ -139,6 +139,13 @@ Ran:      web fetch of `qwen3_5.py` and `gated_delta.py`
 Learned:  **Projections:** `in_proj_qkv` (Linear[H, key_dim*2+value_dim]), `in_proj_z` (Linear[H, value_dim]), `in_proj_b` (Linear[H, num_v_heads]), `in_proj_a` (Linear[H, num_v_heads]), `conv1d` (Conv1d[conv_dim, kernel=4, groups=conv_dim, padding=0]), `out_proj` (Linear[value_dim, H]), `norm` (RMSNormGated[head_v_dim]). **Causal conv1d:** sits after `mx.concatenate([conv_state, qkv])`, width=4, output passes through `nn.silu()`. **Recurrence:** `gated_delta_update(q, k, v, a, b, A_log, dt_bias, state, mask)` — computes `beta = mx.sigmoid(b)`, `g = mx.exp(-mx.exp(A_log) * nn.softplus(a + dt_bias))`, then sequential loop: `state = state * g[..., None, None]`, `kv_mem = (state * k[..., None, :]).sum(-1)`, `delta = (v - kv_mem) * beta[..., None]`, `state = state + k[..., None, :] * delta`, `y = (state * q[..., None, :]).sum(-1)`. **16 key heads × 128 → 32 value heads × 128:** repeat_factor = Hv//Hk = 2; `q` and `k` are repeated along head dim before recurrence. **Per-layer state tensors:** (1) `conv_state`: shape `[B, 3, conv_dim]` — last 3 steps of concatenated qkv; (2) `recurrent_state`: shape `[B, Hv, Dv, Dk]` = `[B, 32, 128, 128]` — accumulated KV product, fp32.
 Unproven: nothing for this task
 Next:     P0-3
+
+### 2026-08-08 — P0-3 — TODO -> DOING
+Did:      Analyzed `Qwen3NextAttention`, `Qwen3NextDecoderLayer`, and `qwen3_5_moe.py.sanitize` from ml-explore/mlx-lm source (already fetched).
+Ran:      read source from previous fetches
+Learned:  **q_norm/k_norm:** YES — `Qwen3NextAttention` has `self.q_norm = nn.RMSNorm(self.head_dim)` and `self.k_norm = nn.RMSNorm(self.head_dim)`, applied before RoPE: `queries = self.q_norm(queries).transpose(...)` and `keys = self.k_norm(keys...).transpose(...)`. **Topology:** **pre-norm** — `DecoderLayer.__call__`: `r = self.self_attn(self.input_layernorm(x), ...)` (pre-norm before attention), `h = x + r`, `out = h + self.mlp(self.post_attention_layernorm(h))` (pre-norm before MLP). No post-norm at layer end. **gate_up_proj split:** in `qwen3_5_moe.py` `sanitize()`: `mid = gate_up.shape[-2] // 2`, `gate_up[..., :mid, :]` → `switch_mlp.gate_proj.weight`, `gate_up[..., mid:, :]` → `switch_mlp.up_proj.weight`, `gate_up.pop(f"{prefix}.experts.down_proj")` → `switch_mlp.down_proj.weight`.
+Unproven: nothing for this task
+Next:     P0-4
 
 ### 2026-08-08 — P0-1 — TODO -> DOING
 Did:      Fetched `mlx_lm/models/qwen3_5_moe.py` and `mlx_lm/models/qwen3_next.py` from ml-explore/mlx-lm. Found router scoring in `Qwen3NextSparseMoeBlock.__call__`.
