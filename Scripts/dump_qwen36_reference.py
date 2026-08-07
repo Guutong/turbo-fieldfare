@@ -186,15 +186,70 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 
     # Load model weights and build architecture
-    from mlx_lm.models import get_model_from_args
-    from mlx_lm.utils import load_config
-
-    # Use mlx_lm's model loading with local path
     import mlx.core as mx
     import mlx.nn as nn
 
-    # Import the Qwen3Next model class
-    from mlx_lm.models.qwen3_next import Model as Qwen3NextModel, ModelArgs as Qwen3NextModelArgs
+    # Try to import Qwen3Next model class from mlx_lm
+    try:
+        from mlx_lm.models.qwen3_next import Model as Qwen3NextModel, ModelArgs as Qwen3NextModelArgs
+    except ImportError:
+        # Older mlx_lm doesn't have qwen3_next - download source files
+        import subprocess
+        import tempfile
+        import shutil
+
+        tmpdir = tempfile.mkdtemp()
+        try:
+            # Download the necessary source files from mlx-lm
+            subprocess.run([
+                "curl", "-sL",
+                "https://raw.githubusercontent.com/ml-explore/mlx-lm/main/mlx_lm/models/qwen3_next.py",
+                "-o", os.path.join(tmpdir, "qwen3_next.py")
+            ], check=True)
+            subprocess.run([
+                "curl", "-sL",
+                "https://raw.githubusercontent.com/ml-explore/mlx-lm/main/mlx_lm/models/gated_delta.py",
+                "-o", os.path.join(tmpdir, "gated_delta.py")
+            ], check=True)
+            subprocess.run([
+                "curl", "-sL",
+                "https://raw.githubusercontent.com/ml-explore/mlx-lm/main/mlx_lm/models/rope_utils.py",
+                "-o", os.path.join(tmpdir, "rope_utils.py")
+            ], check=True)
+            subprocess.run([
+                "curl", "-sL",
+                "https://raw.githubusercontent.com/ml-explore/mlx-lm/main/mlx_lm/models/base.py",
+                "-o", os.path.join(tmpdir, "base.py")
+            ], check=True)
+            subprocess.run([
+                "curl", "-sL",
+                "https://raw.githubusercontent.com/ml-explore/mlx-lm/main/mlx_lm/models/activations.py",
+                "-o", os.path.join(tmpdir, "activations.py")
+            ], check=True)
+            subprocess.run([
+                "curl", "-sL",
+                "https://raw.githubusercontent.com/ml-explore/mlx-lm/main/mlx_lm/models/switch_layers.py",
+                "-o", os.path.join(tmpdir, "switch_layers.py")
+            ], check=True)
+            subprocess.run([
+                "curl", "-sL",
+                "https://raw.githubusercontent.com/ml-explore/mlx-lm/main/mlx_lm/models/cache.py",
+                "-o", os.path.join(tmpdir, "cache.py")
+            ], check=True)
+
+            # Add tmpdir to path and import
+            import sys
+            sys.path.insert(0, tmpdir)
+
+            # Create minimal base module
+            os.makedirs(os.path.join(tmpdir, "mlx_lm"), exist_ok=True)
+            os.makedirs(os.path.join(tmpdir, "mlx_lm", "models"), exist_ok=True)
+            open(os.path.join(tmpdir, "mlx_lm", "__init__.py"), "w").close()
+            open(os.path.join(tmpdir, "mlx_lm", "models", "__init__.py"), "w").close()
+
+            from qwen3_next import Model as Qwen3NextModel, ModelArgs as Qwen3NextModelArgs
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
     # Build config
     model_args = Qwen3NextModelArgs(**{k: v for k, v in config.items()})
