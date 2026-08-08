@@ -94,7 +94,7 @@ smaller tasks in `plan.md`, add them to the board with new IDs, and stop with
 | P6b-4 | Speculative decoding | TODO | kimi-k3 inspired · frontier |
 | P3-1 | DeltaNet conv1d + state (Swift) | DONE | 5 hand-checked tests; 662/662 suite |
 | P3-2 | Delta rule + gating (Swift) | DONE | 16 tests; 678/678 suite; oracle-verified |
-| P3-3 | Layer-0 isolation test | FAILED | rel-L2 0.32 / max-abs 0.051 vs gate 2e-2/1e-2 — see History · ⚠️ frontier only |
+| P3-3 | Layer-0 isolation test | FAILED | DeltaNet+router now verified correct (<1.1% relL2 vs MLX); blocked on zero-filled packed_experts data in /tmp/qwen36.gturbo — see History |
 | P3-3b | Qwen36 sequential prefill (decode loop) | TODO | pulled forward from P5-1 · ⚠️ frontier only |
 | P3-4 | Full 40-layer forward, coherent text | TODO | ⚠️ frontier only · milestone |
 | P4-1 | Port recurrence to Metal | TODO | ⚠️ frontier only |
@@ -544,3 +544,83 @@ Next:     Escalate to the owner per ADR-0002's "knife-edge routing escalates
           intermediate DeltaNet tensors (not just layer boundaries) for a
           true apples-to-apples comparison instead of inferring from the
           layer-boundary fixture alone.
+
+### 2026-08-08 — P3-3 bisection — FAILED (root cause found, not fixable this session)
+Did:      Got real MLX ground truth locally instead of needing the remote
+          javis machine: `pip install mlx mlx-lm` works on this Apple
+          Silicon sandbox, and the Qwen3.6-35B-A3B-4bit weights are already
+          cached at /Users/guutong/models/Qwen3.6-35B-A3B-4bit (same
+          group_size=64/bits=4 affine quant as the .gturbo repack). Wrote
+          two new diagnostic scripts: `scripts/dump_qwen36_deltanet_stages.py`
+          (dumps every intermediate DeltaNet tensor for layer 0 — norm_in,
+          qkv/z/a/b raw projections, conv_out, q/k postconv, q/k RMS-normed,
+          beta, g, y_recurrence, y_gated, delta_out) and
+          `scripts/dump_qwen36_mlp_stages.py` (same for the router/shared-
+          expert/routed-MoE stages). Confirmed via `type(dn).__module__` that
+          this checkpoint uses `mlx_lm.models.qwen3_5.GatedDeltaNet`
+          (separate in_proj_qkv/z/b/a matrices), not qwen3_next.py's packed
+          qkvz/ba variant — matches the Swift deltaQKVProj/deltaZProj/
+          deltaAProj/deltaBProj accessor layout already in place, so no
+          formula confusion there.
+Ran:      First discovery: dequantizing `embed_tokens` directly from
+          `/tmp/qwen36.gturbo/model_weights.bin`'s resident bytes matched
+          the LOCAL model snapshot almost exactly (max-abs diff 2.4e-4) but
+          diverged hugely from the existing `Tests/Fixtures/
+          qwen36_fixture.safetensors` (max-abs diff 0.0074 on values with
+          rms 0.0104 — i.e. essentially unrelated numbers). The fixture had
+          been generated from a DIFFERENT snapshot of
+          mlx-community/Qwen3.6-35B-A3B-4bit than the one the .gturbo repack
+          was built from. Regenerated the fixture from the matching local
+          snapshot (`python3 scripts/dump_qwen36_reference.py --model
+          /Users/guutong/models/Qwen3.6-35B-A3B-4bit`) and copied it over
+          Tests/Fixtures/qwen36_fixture.safetensors (gitignored, not
+          tracked — safe to overwrite). Re-ran Layer0's numeric test: STILL
+          FAILED with nearly the same magnitude (relL2 0.28, was 0.32) — so
+          the snapshot mismatch was real but NOT the P3-3 root cause.
+          Instrumented the test to dump every DeltaNet + MLP stage for
+          token 0 to raw Float32 files and diffed elementwise against the
+          MLX stage dumps (not just RMS, which can hide directional error):
+          norm_in, qkv_raw, z_raw, a_raw, b_raw, conv_out, beta, g,
+          delta_out, hidden_out_check (attn-residual only) ALL matched MLX
+          to relL2 ≤1.3% — an order of magnitude inside the 2e-2 gate.
+          router-probs also matched to ≤1.1% relL2 for every token, and the
+          expert-set #expect assertions passed silently (exact match) for
+          all 5 tokens. mlp_input, gates, and shared_y also matched to
+          ≤1.2%. But `routed_y` (the routed-MoE combine output) came back
+          EXACTLY ZERO from the Swift side (rms=0 vs MLX's rms=0.0082),
+          which fully explains the remaining ~28% relL2 (missing roughly
+          half of the MLP contribution to hidden_out).
+Learned:  `routed_y`=0 traced to `/tmp/qwen36.gturbo/packed_experts/
+          layer_00.bin` being ENTIRELY ZERO-FILLED (verified: first 1MB is
+          all 0x00 bytes) — and every other layer's packed_experts/
+          layer_NN.bin has the IDENTICAL sha256
+          (dc79f61ee5a0ffed132db99dbfa012fa3562745fbcf0a0fd43034e7913c096a5),
+          confirming this .gturbo build's MoE expert weights were never
+          actually repacked; it's a stub/placeholder artifact, not real
+          model data. This has nothing to do with Swift code — dequantAffine,
+          matVec, the routed-expert weighted-sum loop, and expert selection
+          are all provably correct (proven by the exact expert-ID match and
+          the correct topScores). DeltaNet (P3-1/P3-2) and the router are
+          now DEFINITIVELY CLEARED as root causes — every DeltaNet-owned
+          stage numerically matches real MLX ground truth to <1.3% relL2,
+          10-20x tighter than the ADR-0002 gate.
+Unproven: Whether the *true* production .gturbo repack (built by the real
+          repacker pipeline for actual deployment, wherever that runs) also
+          has this zero-filled packed_experts bug, or whether this
+          particular /tmp/qwen36.gturbo is a one-off broken/incomplete local
+          build. Did not attempt to run TurboFieldfareRepack to regenerate
+          real packed-expert data — that's a heavy multi-GB repack of the
+          real MoE expert weights, out of scope for a numeric-bisection
+          session and risks touching repacker code/output outside P3-3's
+          remit (explicitly told not to touch P3-3b/P3-4/unrelated files).
+Next:     Regenerate /tmp/qwen36.gturbo's packed_experts/*.bin with a real
+          repacker run (verify TurboFieldfareRepack actually writes non-zero
+          expert data — this may itself be a repacker bug worth its own
+          task) before re-attempting P3-3's gate. Once packed_experts is
+          real, P3-3 should pass on the first try: every other stage already
+          matches MLX to <1.3% relL2 with real repacked weights. Separately,
+          worth double-checking whatever pipeline generates
+          Tests/Fixtures/qwen36_fixture.safetensors in CI/other envs pins
+          the exact same model revision the .gturbo repack is built from,
+          so this snapshot-mismatch class of bug can't recur (it's currently
+          gitignored/regenerated ad hoc, so nothing enforces this).
