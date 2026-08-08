@@ -36,6 +36,7 @@ public struct Model {
     public var sharedExpertWeightBits: Int { manifest.quant?.sharedExpert.weightBits ?? 8 }
     public var sharedExpertGroupSize: Int { manifest.quant?.sharedExpert.groupSize ?? Quantization.groupSize }
     public var routerGroupSize: Int { manifest.quant?.router.groupSize ?? Quantization.groupSize }
+    public var routedExpertGroupSize: Int { manifest.quant?.routedExpert.groupSize ?? Quantization.groupSize }
 
     /// Quantization of this layer's attention projections.
     ///

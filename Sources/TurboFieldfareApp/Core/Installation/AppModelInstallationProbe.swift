@@ -11,7 +11,7 @@ public enum AppModelInstallationProbe {
     public static func status(
         at directory: URL,
         descriptor: AppModelInstallDescriptor = .default,
-        architecture: ArchConfig = .gemma4_26B_A4B
+        architecture: ArchConfig? = nil
     ) -> AppModelInstallationStatus {
         let directory = directory.standardizedFileURL
         let manifestURL = directory.appendingPathComponent("manifest.json")
@@ -20,6 +20,8 @@ public enum AppModelInstallationProbe {
         }
 
         do {
+            // architecture: nil → auto-detect from manifest. Needed for
+            // multi-model support (Laguna vs Gemma have different arch fields).
             let manifest = try ManifestReader.load(directoryURL: directory,
                                                    expecting: architecture)
             let expectedSource = "sha256:" + descriptor.sourceIndexSHA256

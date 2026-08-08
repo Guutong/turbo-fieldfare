@@ -7,7 +7,7 @@ final class MockModelInstallerClient: AppModelInstallerClient, Sendable {
     let failure: Error?
     let holdOpen: Bool
     let requirement: AppModelInstallRequirement
-    let descriptor: AppModelInstallDescriptor
+    nonisolated(unsafe) var descriptor: AppModelInstallDescriptor
     let delayCancellationAcknowledgement: Bool
     private struct State {
         var task: Task<Void, Never>?
@@ -93,6 +93,10 @@ final class MockModelInstallerClient: AppModelInstallerClient, Sendable {
                 task?.cancel()
             }
         }
+    }
+
+    func rebind(descriptor: AppModelInstallDescriptor) {
+        self.descriptor = descriptor
     }
 
     func cancel() {

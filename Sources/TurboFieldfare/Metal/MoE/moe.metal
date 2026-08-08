@@ -198,6 +198,52 @@ kernel void router_gemv_gemma4_r4_generic(
                                     4, tg_idx, sg_idx, lane);
 }
 
+// BF16 router kernel — used when the router weights were not quantized by the
+// repacker (e.g. BF16 source checkpoint with no INT8 step).  Reads 2-byte
+// bfloat weights directly; no per-group scales/biases.
+static inline void router_gemv_bf16_body(
+    device const bfloat* W,
+    device const half* hidden,
+    device const bfloat* effective_scale,
+    device float* out_logits,
+    constant uint& num_experts,
+    constant uint& D,
+    uint rows_per_tg,
+    uint tg_idx,
+    uint sg_idx,
+    uint lane
+) {
+    const uint e = tg_idx * rows_per_tg + sg_idx;
+    if (e >= num_experts) return;
+    device const bfloat* W_row = W + uint(e) * D;
+    float acc = 0.0f;
+    for (uint i = lane; i < D; i += 32u) {
+        const float w = float(W_row[i]);
+        const float xv = float(hidden[i]) * float(effective_scale[i]);
+        acc = fma(w, xv, acc);
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) out_logits[e] = acc;
+}
+
+kernel void router_gemv_bf16_r4(
+    device const bfloat* W [[buffer(0)]],
+    device const bfloat* scales [[buffer(1)]],  // unused, kept for ABI compat
+    device const bfloat* biases [[buffer(2)]],  // unused
+    device const half* hidden [[buffer(3)]],
+    device const bfloat* effective_scale [[buffer(4)]],
+    device float* out_logits [[buffer(5)]],
+    constant uint& num_experts [[buffer(6)]],
+    constant uint& D [[buffer(7)]],
+    uint tg_idx [[threadgroup_position_in_grid]],
+    uint sg_idx [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    router_gemv_bf16_body(W, hidden, effective_scale,
+                          out_logits, num_experts, D,
+                          4, tg_idx, sg_idx, lane);
+}
+
 kernel void router_gemv_gemma4_r4(
     device const uint8_t* W [[buffer(0)]],
     device const bfloat* scales [[buffer(1)]],

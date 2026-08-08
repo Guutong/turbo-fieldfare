@@ -1131,7 +1131,26 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                        tokenCount: t,
                                        xStrideElements: qDim,
                                        yStrideElements: D)
-            prefillPostAttention.encode(commandBuffer: cb,
+            switch cfg.normTopology {
+            case .preNorm:
+                prefillPostAttention.encodePreNorm(commandBuffer: cb,
+                                                    hidden: scratch.hidden,
+                                                    attn: scratch.h1,
+                                                    denseX: scratch.denseX,
+                                                    routedX: scratch.routedX,
+                                                    routerX: scratch.routerX,
+                                                    preFFNWeight: views.preFFN.buffer,
+                                                    preFFNWeightOffset: Int(views.preFFN.offset),
+                                                    queryCount: UInt32(t),
+                                                    d: UInt32(D),
+                                                    hiddenStrideElements: UInt32(D),
+                                                    attnStrideElements: UInt32(D),
+                                                    denseStrideElements: UInt32(D),
+                                                    routedStrideElements: UInt32(D),
+                                                    routerStrideElements: UInt32(D),
+                                                    eps: eps)
+            case .sandwich:
+                prefillPostAttention.encode(commandBuffer: cb,
                                             hidden: scratch.hidden,
                                             attn: scratch.h1,
                                             denseX: scratch.denseX,
@@ -1151,6 +1170,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                             routedStrideElements: UInt32(D),
                                             routerStrideElements: UInt32(D),
                                             eps: eps)
+            }
 
             if cfg.isDenseMLP(atLayer: L) {
                 cb.commit()
@@ -1246,7 +1266,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                             d: UInt32(D),
                             topK: UInt32(cfg.topKExperts),
                             hiddenStrideElements: UInt32(D),
-                            groupSize: UInt32(model.routerGroupSize))
+                            groupSize: UInt32(model.routerGroupSize),
+                            useBF16: router.scaleLength == 0)
             } else {
                 guard let routerPerExpertScale = views.routerPerExpertScale else {
                     throw ModelError.tensorNotFound(
@@ -1863,7 +1884,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                         selectionBiasOffset: Int(selectionBias.offset),
                         outIndices: outIndices, outWeights: outWeights,
                         numExperts: UInt32(cfg.numExperts), d: D, topK: UInt32(cfg.topKExperts),
-                        groupSize: UInt32(model.routerGroupSize))
+                        groupSize: UInt32(model.routerGroupSize),
+                        useBF16: routerW.scaleLength == 0)
                 } else {
                     guard let perExpertScale else { return }
                     moe.encodeRouterGemma4(commandBuffer: cb,
@@ -1876,7 +1898,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                         perExpertScaleOffset: Int(perExpertScale.offset),
                         outIndices: outIndices, outWeights: outWeights,
                         numExperts: UInt32(cfg.numExperts), d: D, topK: UInt32(cfg.topKExperts),
-                        groupSize: UInt32(model.routerGroupSize))
+                        groupSize: UInt32(model.routerGroupSize),
+                        useBF16: routerW.scaleLength == 0)
                 }
             }
 
@@ -1961,7 +1984,6 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             for i in 0..<cfg.topKExperts {
                 experts[i] = min(Int(idxPtr[i]), cfg.numExperts - 1)
             }
-
             let routedOffsets = model.routedExpertOffsets(layer: L)
             let topK = UInt32(cfg.topKExperts)
             let canPlanPhase1HitSplit =
@@ -1995,7 +2017,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                                         acts: moeActs,
                                                         d: D,
                                                         f: FmoE,
-                                                        topK: topK)
+                                                        topK: topK,
+                                                        groupSize: UInt32(model.routedExpertGroupSize))
             }
 
             func encodeRoutedPhase1Subset(
@@ -2018,7 +2041,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     activeCount: activeCount,
                     d: D,
                     f: FmoE,
-                    topK: topK)
+                    topK: topK,
+                    groupSize: UInt32(model.routedExpertGroupSize))
             }
 
             if let plan = plannedFetch,
@@ -2143,7 +2167,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                                    y: h2Buf,
                                                    d: D,
                                                    f: FmoE,
-                                                   topK: topK)
+                                                   topK: topK,
+                                                   groupSize: UInt32(model.routedExpertGroupSize))
             gTail(routedCB)
             routedCB.commit()
             precondition(pendingRoutedCommand == nil,

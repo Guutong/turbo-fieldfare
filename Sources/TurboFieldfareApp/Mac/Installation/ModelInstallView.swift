@@ -10,6 +10,7 @@ struct ModelInstallView: View {
         ScrollView {
             VStack(spacing: 22) {
                 identity
+                modelPicker
                 storageCard
                 progressArea
                 actions
@@ -47,6 +48,32 @@ struct ModelInstallView: View {
                 .font(.body)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
+        }
+    }
+
+    @ViewBuilder
+    private var modelPicker: some View {
+        let sources = model.availableModelSources
+        if sources.count > 1 {
+            VStack(spacing: 6) {
+                Text("Choose Model")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Picker("Model", selection: Binding(
+                    get: { model.selectedModelSourceID },
+                    set: { newID in
+                        model.switchModelSource(toID: newID)
+                    }
+                )) {
+                    ForEach(sources) { source in
+                        Text(source.displayName).tag(source.id)
+                    }
+                }
+                .pickerStyle(.menu)
+                .labelsHidden()
+                .frame(maxWidth: 280)
+            }
+            .padding(.vertical, 4)
         }
     }
 

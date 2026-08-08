@@ -30,10 +30,12 @@ public struct PrefillTokenExpertPair: Equatable, Sendable {
 final class PrefillRouter {
     private let pso: MTLComputePipelineState
     private let sigmoidPSO: MTLComputePipelineState
+    private let sigmoidBF16PSO: MTLComputePipelineState
 
     init(context: MetalContext) throws {
         self.pso = try context.pipeline("prefill_router_gemma4_block")
         self.sigmoidPSO = try context.pipeline("prefill_router_sigmoid_block")
+        self.sigmoidBF16PSO = try context.pipeline("prefill_router_sigmoid_bf16_block")
     }
 
     func encodeGemma4Block(commandBuffer: MTLCommandBuffer,
@@ -121,14 +123,15 @@ final class PrefillRouter {
                             d: UInt32,
                             topK: UInt32,
                             hiddenStrideElements: UInt32,
-                            groupSize: UInt32 = UInt32(Quantization.groupSize)) {
+                            groupSize: UInt32 = UInt32(Quantization.groupSize),
+                            useBF16: Bool = false) {
         precondition(queryCount > 0, "queryCount must be positive")
         precondition(numExperts <= 256, "numExperts > 256 is not supported")
         precondition(topK > 0 && topK <= 64, "topK must be in 1...64")
-        precondition(d % groupSize == 0, "D must be a multiple of \(groupSize)")
+        precondition(useBF16 || d % groupSize == 0, "D must be a multiple of \(groupSize)")
         precondition(hiddenStrideElements >= d, "hidden stride is too small")
         guard let enc = commandBuffer.makeComputeCommandEncoder() else { return }
-        enc.setComputePipelineState(sigmoidPSO)
+        enc.setComputePipelineState(useBF16 ? sigmoidBF16PSO : sigmoidPSO)
         enc.setBuffer(weights, offset: weightsOffset, index: 0)
         enc.setBuffer(scales, offset: scalesOffset, index: 1)
         enc.setBuffer(biases, offset: biasesOffset, index: 2)

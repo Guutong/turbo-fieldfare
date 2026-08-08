@@ -52,6 +52,7 @@ final class MoE {
     private let routerGemvPSO: MTLComputePipelineState
     private let routerGemvSpecializedPSO: MTLComputePipelineState
     private let routerGemvGenericPSO: MTLComputePipelineState
+    private let routerGemvBF16PSO: MTLComputePipelineState
     private let routerSelectPSO: MTLComputePipelineState
     private let routerSelectSpecializedPSO: MTLComputePipelineState
     private let routerSigmoidSelectPSO: MTLComputePipelineState
@@ -91,6 +92,10 @@ final class MoE {
         // convention.
         self.routerGemvGenericPSO = try context.pipeline(
             "router_gemv_gemma4_r4_generic",
+            constants: [],
+            maxTotalThreadsPerThreadgroup: 512)
+        self.routerGemvBF16PSO = try context.pipeline(
+            "router_gemv_bf16_r4",
             constants: [],
             maxTotalThreadsPerThreadgroup: 512)
         self.routerSelectPSO = try context.pipeline("router_topk_select")
@@ -155,18 +160,23 @@ final class MoE {
                                        outLogits: MTLBuffer,
                                        numExperts: UInt32,
                                        d: UInt32,
-                                       groupSize: UInt32) {
+                                       groupSize: UInt32,
+                                       useBF16: Bool = false) {
         var expertCount = numExperts
         var dimension = d
-        let useGeneric = groupSize != UInt32(Quantization.groupSize)
-        let useSpecialized = !useGeneric
+        let useGeneric = !useBF16 && groupSize != UInt32(Quantization.groupSize)
+        let useSpecialized = !useBF16 && !useGeneric
             && numExperts == Self.realDecodeNumExperts
             && d == Self.realDecodeD
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.setComputePipelineState(
-                useGeneric
-                    ? routerGemvGenericPSO
-                    : (useSpecialized ? routerGemvSpecializedPSO : routerGemvPSO))
+            if useBF16 {
+                encoder.setComputePipelineState(routerGemvBF16PSO)
+            } else {
+                encoder.setComputePipelineState(
+                    useGeneric
+                        ? routerGemvGenericPSO
+                        : (useSpecialized ? routerGemvSpecializedPSO : routerGemvPSO))
+            }
             encoder.setBuffer(weights, offset: weightsOffset, index: 0)
             encoder.setBuffer(scales, offset: scalesOffset, index: 1)
             encoder.setBuffer(biases, offset: biasesOffset, index: 2)
@@ -198,13 +208,15 @@ final class MoE {
                                    numExperts: UInt32,
                                    d: UInt32,
                                    topK: UInt32,
-                                   groupSize: UInt32 = UInt32(Quantization.groupSize)) {
-        precondition(d.isMultiple(of: groupSize), "D must be a multiple of groupSize")
+                                   groupSize: UInt32 = UInt32(Quantization.groupSize),
+                                   useBF16: Bool = false) {
+        precondition(useBF16 || d.isMultiple(of: groupSize), "D must be a multiple of groupSize")
         precondition(numExperts <= 256)
         precondition(topK >= 1 && topK <= UInt32(Self.maxStreamedExperts))
 
         var expertCount = numExperts
-        let useSpecialized = numExperts == Self.realDecodeNumExperts
+        let useSpecialized = !useBF16
+            && numExperts == Self.realDecodeNumExperts
             && d == Self.realDecodeD
         encodeRouterGEMVFront(commandBuffer: commandBuffer,
                               weights: weights, weightsOffset: weightsOffset,
@@ -215,7 +227,8 @@ final class MoE {
                               effectiveScaleOffset: effectiveScaleOffset,
                               outLogits: routerLogits,
                               numExperts: numExperts, d: d,
-                              groupSize: groupSize)
+                              groupSize: groupSize,
+                              useBF16: useBF16)
 
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.setComputePipelineState(
@@ -252,8 +265,9 @@ final class MoE {
                              numExperts: UInt32,
                              d: UInt32,
                              topK: UInt32,
-                             groupSize: UInt32 = UInt32(Quantization.groupSize)) {
-        precondition(d.isMultiple(of: groupSize), "D must be a multiple of groupSize")
+                             groupSize: UInt32 = UInt32(Quantization.groupSize),
+                             useBF16: Bool = false) {
+        precondition(useBF16 || d.isMultiple(of: groupSize), "D must be a multiple of groupSize")
         precondition(numExperts <= 256)
         precondition(topK >= 1 && topK <= UInt32(Self.maxStreamedExperts))
 
@@ -268,7 +282,8 @@ final class MoE {
                               effectiveScaleOffset: effectiveScaleOffset,
                               outLogits: routerLogits,
                               numExperts: numExperts, d: d,
-                              groupSize: groupSize)
+                              groupSize: groupSize,
+                              useBF16: useBF16)
 
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.setComputePipelineState(routerSigmoidSelectPSO)
