@@ -96,7 +96,7 @@ smaller tasks in `plan.md`, add them to the board with new IDs, and stop with
 | P3-2 | Delta rule + gating (Swift) | DONE | 16 tests; 678/678 suite; oracle-verified |
 | P3-3 | Layer-0 isolation test | DONE | Real repack (LayerWriter fix) into scratch/qwen36.gturbo; gate passes relL2≤0.0075, maxAbs≤0.0039 — see History |
 | P3-3b | Qwen36 sequential prefill (decode loop) | DONE | routes via PrefillRoutePolicy; 694/694 pass; proves the route, not the math — see History |
-| P3-4 | Full 40-layer forward, coherent text | TODO | ⚠️ frontier only · milestone |
+| P3-4 | Full 40-layer forward, coherent text | FAILED | ⚠️ frontier only · milestone · 2/3 criterion-C prompts; engine verified correct |
 | P4-1 | Port recurrence to Metal | TODO | ⚠️ frontier only |
 | P4-2 | Diff Metal vs Swift path | TODO | ⚠️ frontier only |
 | P5-1 | Sequential prefill | TODO | |
@@ -733,3 +733,94 @@ Deferred: Routing the Layer0 fixture test's 5-token loop through the "real
           there is nothing to route it through until P3-4. The hand-rolled loop
           stays, and it already covers all 5 fixture tokens sequentially.
 Next:     P3-4 (full 40-layer forward, coherent text).
+
+### 2026-08-08 — P3-4 — TODO -> FAILED (2/3 criterion-C prompts; engine verified correct)
+Did:      Wired `DeltaNetCPUBlock` into `RealForwardRunner`'s decode loop, then
+          bisected the resulting garbage output layer-by-layer against the P0-7
+          fixture and found SIX independent Gemma-isms in the Qwen3.6 path.
+          (1) Embedding scale — the embed lookup multiplied by `sqrt(hidden_size)`
+          (Gemma) so `embedding_output` was off by relL2 44.26 = sqrt(2048)-1
+          before a single layer ran; now topology-gated. (2) Shared-expert gate —
+          Qwen3.5-MoE gates the shared expert by
+          `sigmoid(mlp.shared_expert_gate . h_norm)`; it was never applied,
+          leaving the shared expert 5.2x too large (layer 0's MLP delta was
+          5.53x reference at cos 0.89). New `SharedExpertGate.swift` dequantizes
+          the int8-affine `[1 x 2048]` row and scales `h1Buf` on the CPU.
+          (3) `attentionKEqV` — the runner hardcoded `vProj = isFull ? k`, a
+          Gemma trait; `manifest.arch.attentionKEqV` is false for Qwen3.6, which
+          has a real `v_proj` on every layer. Now reads `cfg.attentionKEqV`.
+          (4) Gated attention — Qwen3.6's 10 full-attention layers are Qwen3-Next
+          `Qwen3NextAttention`: `q_proj` emits `[numHeads, 2*head_dim]` (8192
+          rows, not 4096), per head the first `head_dim` lanes are the query and
+          the second are an output gate, and the attention result is scaled by
+          `sigmoid(gate)` before `o_proj`. The runner read only the leading 4096
+          contiguous rows as the query and dropped the gate entirely. Added
+          `qRawScratch`/`qGateScratch` plus CPU `splitGatedQProjection` and
+          `applyAttentionOutputGate`; the layer's attention now spans three
+          command buffers instead of one. (5) Three more in the QKV epilogue /
+          attention: it applied Gemma's no-scale per-head RMSNorm to V (caught
+          because every V head had norm EXACTLY 16 = sqrt(256)); attention ran
+          with `scale: 1.0` because Gemma folds `1/sqrt(head_dim)` into its
+          q_norm weights; and partial RoPE paired lane `i` with `i + head_dim/2`
+          (128) using `head_dim` as the frequency denominator, where HF/MLX
+          partial rotary pairs `i` with `i + rotary_dim/2` (32) over
+          `rotary_dim`=64. `fused_qkv_epilogue` gained `rope_pair_stride` /
+          `rope_freq_dim` buffers and a `normalizeV` dispatch toggle, all with
+          defaults that reproduce Gemma bit-for-bit. (6) Untied LM head —
+          `Model.lmHead` always returned `embed_tokens`; Qwen3.6 has
+          `tieWordEmbeddings: false` and a real `language_model.lm_head` in
+          `model_weights.bin`. Also added `Tokenizer.hasBOS`: Qwen's `bosID` is
+          the chat marker `<|im_start|>`, and the CLI's `--prompt` path was
+          prepending it to raw completion prompts (6 tokens for a 5-token prompt).
+Ran:      Bisection used temporary env-gated (`TFF_DUMP_DIR`) fp32 dumps of
+          `hidden` after every layer plus `oOut`/`attnOut`/`qGateScratch`/
+          `h1Buf`/`h2Buf`, diffed against `Tests/Fixtures/qwen36_fixture.
+          safetensors` for the exact fixture prompt. Per-layer relL2 went
+          44 -> 15-26 (embedding) -> 0.3-0.8 (gated attention) -> 0.01-0.09
+          (V-norm + scale + RoPE). All instrumentation was removed before
+          committing. Two exact MLX references were built locally by
+          dequantizing only the tensors needed (the full model OOMs mlx at
+          16GB): layer 3's whole attention block matches to relL2 0.0055-0.0083
+          at all 5 fixture positions, and final-norm + `lm_head` over the
+          fixture's `hidden_out.39` gives greedy argmax `" Paris"` — exactly
+          what real generation emits. Real release-CLI generation, verbatim:
+          `"The capital of France is"` -> `" Paris, a city renowned for its
+          iconic"`; `"The largest planet in our solar system is"` -> `" Jupiter,
+          which has a mass of "`; `"2 + 2 ="` -> `"The following is a"` (then
+          `"| Operator | Description |"`). Extra confidence checks all correct:
+          Tokyo, "32°F", "George Washington", and `"one two three ... N"` ->
+          `"N+1 N+2 N+3 N+4"` at prompt lengths 6/7/8/9. `swift test --filter
+          "Layer0|Layer3|Qwen36|DeltaNet|Epilogue|QKV"` -> 53 tests / 11 suites,
+          ALL PASS, exit 0, including the Gemma-owned `FusedQKVEpilogueTests` /
+          `FusedQKVPipelineTests` and the Layer0 numeric gate unchanged at relL2
+          0.0057-0.0075 (ADR-0002 tolerance NOT widened).
+Learned:  Layer 0 passing in isolation was actively misleading: the isolation
+          test injects `hidden_in.0` directly and hand-rolls every stage, so it
+          structurally cannot see the embedding scale, the LM head, ANY
+          full-attention layer, or the Metal MoE path — five of the six bugs
+          live in exactly that blind spot. The fastest diagnostic was not
+          relL2 alone but magnitude+cosine decomposition: cos 0.9999 with a 2.75x
+          magnitude said "right subspace, wrong scalar" and pointed straight at
+          V-normalization, and a per-head V norm of exactly sqrt(head_dim)
+          confirmed it in one line. The `pendingRoutedCommand` synchronization
+          the wiring comment worried about turned out to be correct as written.
+Unproven: `"2 + 2 ="` -> `"4"` (Success criterion C's second prompt) is NOT met
+          as a raw completion, so this row is FAILED. Diagnosis: this is a
+          prompt-format mismatch, not an engine defect. Through the model's
+          intended chat interface (`--messages-file`) the same engine answers
+          `"2 + 2 = 4"` verbatim, and every other factual/sequential probe is
+          correct. Full-model MLX ground truth for that bare prompt could not be
+          obtained — `mlx_lm generate` OOMs the GPU on this 16GB machine against
+          the 19GB snapshot, so it is unverified whether upstream MLX also
+          declines to answer "4" for a bare `"2 + 2 ="`.
+Next:     Get full-model MLX ground truth for `"2 + 2 ="` on a machine with
+          >=32GB (e.g. javis) to settle whether criterion C's second prompt is
+          an engine bug or an unrealistic expectation for a bare completion
+          prompt on an instruct-tuned checkpoint; if the latter, amend
+          plan.md's criterion C to use the chat interface. Separately, two real
+          bugs found but deliberately left alone as out of scope: (a) the Qwen
+          chat template renders Gemma's `<|channel>` / `<|end_of_turn|>` markers
+          instead of `<|im_start|>` / `<|im_end|>`, and (b) the chunked-prefill
+          path at `RealForwardRunner.swift:802` still has the same hardcoded
+          `isFull ? attnK` v_proj bug fixed in the decode path — harmless today
+          only because Qwen3.6 routes to sequential prefill (P3-3b).
