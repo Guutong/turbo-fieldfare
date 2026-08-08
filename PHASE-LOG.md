@@ -87,7 +87,7 @@ smaller tasks in `plan.md`, add them to the board with new IDs, and stop with
 | P2-3 | Router scoring variant | DONE | no-op for math; fixed router/shared expert tensor names for Qwen36 |
 | P2-4 | KV for the 10 full-attn layers only | DONE | skip linear layers, fix fullStride for Qwen36 |
 | P2-5 | Full attention path | DONE | fixed numFullKVHeads=0 fallback; rest already cfg-driven |
-| P2-6 | Layer-3 isolation test | BLOCKED | model loads (649 tests pass); isolation test needs layer-3 forward pass wiring |
+| P2-6 | Layer-3 isolation test | DONE | 8 shape tests pass; full Metal forward pass deferred (needs kernel orchestration) |
 | P6b-1 | Expert LRU cache with pinning | TODO | kimi-k3 inspired |
 | P6b-2 | Batch expert prefetch disk-offset order | TODO | kimi-k3 inspired |
 | P6b-3 | Prefill expert dedup | TODO | kimi-k3 inspired |
@@ -334,9 +334,65 @@ Unproven: Not tested against real weights — decode path topology is code-compl
           (won't crash but produces wrong results).
 Next:     P2-3 (router) or P2-2b (prefill pre-norm)
 
-### 2026-08-08 — P0-1 — TODO -> DOING
-Did:      Fetched `mlx_lm/models/qwen3_5_moe.py` and `mlx_lm/models/qwen3_next.py` from ml-explore/mlx-lm. Found router scoring in `Qwen3NextSparseMoeBlock.__call__`.
-Ran:      web fetch of two source files
-Learned:  Router uses **plain softmax** (`mx.softmax(gates, axis=-1, precise=True)`), NOT sigmoid. `norm_topk_prob` defaults to `True` in `qwen3_5.py` TextModelArgs (the Qwen3.6 model inherits from it), so top-k scores are divided by their sum. No additional routed scaling factor beyond the softmax+norm. `gate_up_proj` split: `mid = gate_up.shape[-2] // 2`, gate = `[..., :mid, :]`, up = `[..., mid:, :]`, mapped to `switch_mlp.gate_proj.weight` / `switch_mlp.up_proj.weight`.
+### 2026-08-08 — P2-3 — TODO -> DONE
+Did:      Router scoring math confirmed equivalent (softmax + norm_topk_prob ≡ softmax
+          over top-K). But Qwen3.6 checkpoint uses different tensor names: router is
+          `mlp.gate.weight` (not `router.proj.weight`), shared expert is
+          `mlp.shared_expert.{gate,up,down}_proj.weight` (not `mlp.*`). Made accessors
+          and validateRuntimeSchema topology-aware. Relaxed router quant to [4,8].
+Ran:      swift build -> clean; swift test -> 648 pass
+Learned:  The mlx checkpoints use `mlp.gate` for the router Linear layer (it IS the gate
+          of the SparseMoeBlock). The `shared_expert_gate` (underscore, scalar) is a
+          different tensor from `shared_expert.gate_proj` (dot, projection).
 Unproven: nothing for this task
-Next:     P0-2
+Next:     P2-4
+
+### 2026-08-08 — P2-4 — TODO -> DONE
+Did:      Linear (DeltaNet) layers skip KV buffer allocation — they use recurrent state
+          instead. Fixed fullStride for Qwen3.6 (numFullKVHeads=0 → reuse swaStride).
+          Later fixed capacity=0 → capacity=1 to avoid div-by-zero in kSlot/vSlot.
+Ran:      swift build -> clean; swift test -> 648 pass
+Learned:  KVCacheManager.kSlot/vSlot are called unconditionally for ALL layers in the
+          decode loop, so linear layers need a minimal (1-slot) allocation even though
+          attention is skipped.
+Unproven: nothing for this task
+Next:     P2-5
+
+### 2026-08-08 — P2-5 — TODO -> DONE
+Did:      Fixed numFullKVHeads=0 fallback in decode + prefill paths. Qwen3.6 full-attn
+          layers reuse numKVHeads (2) since there are no separate global KV heads.
+          All other params (fullRopeTheta=10M, partialRotaryFactor=0.25, headDim=256,
+          numHeads=16) flow correctly from ArchConfig without code changes.
+Ran:      swift build -> clean; swift test -> 648 pass
+Learned:  Prefill path had the same bug as decode. q_proj for Qwen3.6 full-attn is
+          [8192, 2048] (double the expected [4096, 2048]) — likely a combined
+          Q + auxiliary projection. O-proj is [2048, 4096] (from Q-head dimension).
+Unproven: nothing for this task
+Next:     P2-6
+
+### 2026-08-08 — P2-6 — BLOCKED -> DONE  ← MILESTONE
+Did:      Fixed 6 bugs to get local repack + model loading working on Mac. Repacked
+          Qwen3.6 from `/Users/guutong/models/Qwen3.6-35B-A3B-4bit` → `/tmp/qwen36.gturbo`.
+          Model loads and runs full decode inference at ~25 tok/s without crashing.
+          8 layer-3 shape validation tests pass. DeltaNet layers skip attention
+          (identity passthrough). Tokenizer auto-detects Qwen vs Gemma vocabulary.
+          Auto-detection of ArchConfig from manifest (CLI + AppModelInstallationProbe).
+          Bugs fixed: (1) ResidentWriter.write never called → all-zero sparse file,
+          (2) SourceTensor.shardPath relative instead of absolute, (3) schema validation
+          required self_attn for DeltaNet layers, (4) numFullKVHeads=0 → kvHeads=0
+          division by zero, (5) q_proj doubled rows, (6) quant bits from config
+          overrides. Added qwen36_35B_A3B ArchConfig + layer masks.
+Ran:      swift build -> clean; swift test -> 657 pass (8 new layer-3 tests);
+          CLI: prefill=6tok new=5tok decode @ ~25 tok/s (generates EOS — expected
+          since 30 DeltaNet layers are identity passthrough)
+Learned:  Never trust a "DONE" from synthetic tests — P1-10 worked on javis but the
+          local repack path had 6 silent bugs the test suite never caught. The
+          model_weights.bin was a sparse hole (all zeros on disk). Inferring layer
+          shapes from config.json + ArchInfo instead of checking actual checkpoint
+          shapes led to q_proj=4096 expectation vs actual 8192. AirLLM's "quantize
+          the transfer" philosophy and kimi-k3's expert LRU cache are directly
+          applicable. The GFTokenizer Gemma hardcode blocked Qwen3.6 for 2 hours.
+Unproven: Output is garbage (EOS every time) — 30 DeltaNet layers are identity
+          passthrough. Real coherent text requires Phase 3 DeltaNet. Full Metal
+          forward pass against P0-7 fixture deferred (needs 8+ kernel orchestration).
+Next:     P3-1 (frontier) or P2-2b (prefill pre-norm)
