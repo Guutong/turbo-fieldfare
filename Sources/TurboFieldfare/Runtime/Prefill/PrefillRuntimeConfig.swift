@@ -116,6 +116,30 @@ enum PrefillChunkPlanner {
     }
 }
 
+/// How a prompt is fed through the forward stack (P3-3b).
+///
+/// The chunked path is Gemma-shaped: it batches tokens through the sandwich
+/// topology. Qwen3.6 is pure pre-norm and its 30 linear layers carry a
+/// sequential DeltaNet recurrence, so its prompt is replayed one token at a
+/// time through the same decode loop `produce` uses.
+public enum PrefillRoute: String, Sendable, Equatable {
+    case chunked
+    case sequentialDecodeLoop
+}
+
+/// Single decision point for `PrefillRoute`. Routing is a pure function of the
+/// model's `LayerTopology`, so it is testable without a device or weights.
+public enum PrefillRoutePolicy {
+    public static func route(for topology: LayerTopology) -> PrefillRoute {
+        switch topology {
+        case .gemma4:
+            return .chunked
+        case .qwen36:
+            return .sequentialDecodeLoop
+        }
+    }
+}
+
 public enum PrefillKVStorageMode: String, Sendable, Equatable {
     case fp16
 }

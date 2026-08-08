@@ -478,6 +478,12 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     public private(set) var totalHeadNanos: UInt64 = 0
     public private(set) var totalHeadFusedNanos: UInt64 = 0
     public private(set) var lastGreedyToken: UInt32 = 0
+    /// Prefill routing counters (P3-3b). `chunkedPrefillChunkCount` counts
+    /// entries into `executePrefillChunk` — the Gemma-topology chunked path —
+    /// and must stay at zero for a Qwen3.6 generation.
+    public private(set) var chunkedPrefillChunkCount: Int = 0
+    public private(set) var sequentialPrefillTokenCount: Int = 0
+    public var prefillRoute: PrefillRoute { PrefillRoutePolicy.route(for: cfg.topology) }
     public var usesFusedGreedyHead: Bool { useFusedGreedyHead }
     public private(set) var totalRDAdviseNanos: UInt64 = 0
     public private(set) var totalRDAdviseCalls: UInt64 = 0
@@ -579,6 +585,17 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             return PrefillResult(newPosition: startPosition, seed: .logitsWritten)
         }
 
+        switch PrefillRoutePolicy.route(for: cfg.topology) {
+        case .sequentialDecodeLoop:
+            return try await prefillSequential(tokens: tokens,
+                                               startPosition: startPosition,
+                                               outputMode: outputMode,
+                                               logits: logits,
+                                               onProgress: onProgress)
+        case .chunked:
+            break
+        }
+
         let scratch = try ensurePrefillScratch(config: config)
         let spans = PrefillChunkPlanner.spans(tokenCount: tokens.count,
                                               startPosition: startPosition,
@@ -604,6 +621,43 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                              seed: .logitsWritten)
     }
 
+    /// Qwen3.6 sequential prefill (P3-3b): replay the prompt through the same
+    /// per-token decode loop `produce` uses, one token at a time.
+    ///
+    /// The pre-norm topology (raw residuals, one shared
+    /// `post_attention_layernorm`, no layer scalar) and the DeltaNet
+    /// recurrence live on the decode path only — the chunked path is
+    /// Gemma-shaped. Stepping `produceToken` per prompt token keeps the KV
+    /// cursor of the 10 full-attention layers and the per-layer DeltaNet state
+    /// (conv window + recurrent state, keyed by global layer index) advancing
+    /// exactly as they do during decode, so the first generated token sees the
+    /// state a decode-only replay of the prompt would have built. No prefill
+    /// scratch is allocated and `executePrefillChunk` is never entered.
+    private func prefillSequential(tokens: ArraySlice<Int32>,
+                                   startPosition: Int,
+                                   outputMode: PrefillOutputMode,
+                                   logits: MTLBuffer,
+                                   onProgress: (Int) -> Void) async throws -> PrefillResult {
+        var position = startPosition
+        let lastOffset = tokens.count - 1
+        for (offset, token) in tokens.enumerated() {
+            try Task.checkCancellation()
+            try await produceToken(token: token,
+                                   position: position,
+                                   into: logits,
+                                   emitHead: offset == lastOffset,
+                                   outputMode: outputMode)
+            position += 1
+            sequentialPrefillTokenCount += 1
+            onProgress(offset + 1)
+        }
+        if outputMode == .greedyIfAvailable, useFusedGreedyHead {
+            return PrefillResult(newPosition: position,
+                                 seed: .greedyToken(lastGreedyToken))
+        }
+        return PrefillResult(newPosition: position, seed: .logitsWritten)
+    }
+
     @discardableResult
     private func ensurePrefillScratch(config: PrefillRuntimeConfig) throws -> PrefillChunkScratchBuffers {
         let layout = PrefillChunkScratchLayout(config: cfg, runtime: config)
@@ -623,6 +677,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                      config: PrefillRuntimeConfig,
                                      writeFinalHead: Bool) async throws {
         guard !tokens.isEmpty else { return }
+        chunkedPrefillChunkCount += 1
         guard kv != nil else {
             throw PrefillError.chunkedUnsupported("chunked prefill attention requires FP16 KV")
         }

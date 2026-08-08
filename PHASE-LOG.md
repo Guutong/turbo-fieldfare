@@ -674,3 +674,62 @@ Learned:  This was a genuine repacker bug, not a stale/interrupted-run
 Unproven: Whether the remote streaming path's packed_experts output has any
           analogous gap — out of scope here since local reproduces DONE.
 Next:     P3-3b (Qwen3.6 sequential prefill decode loop).
+
+### 2026-08-08 — P3-3b — TODO -> DONE
+Did:      Routed Qwen3.6 prompts through the per-token decode loop instead of the
+          Gemma-shaped chunked prefill. Added `PrefillRoute` +
+          `PrefillRoutePolicy.route(for: LayerTopology)` in
+          `Runtime/Prefill/PrefillRuntimeConfig.swift` — a pure function
+          (gemma4 -> .chunked, qwen36 -> .sequentialDecodeLoop) so the routing
+          decision is testable with no device and no weights. In
+          `RealForwardRunner.prefillChunked`, after the existing validation
+          guards and BEFORE `ensurePrefillScratch`, the qwen36 route returns
+          from a new private `prefillSequential(...)`, which loops the prompt
+          through the SAME `produceToken` the decode path uses (`emitHead` only
+          on the final token), advancing `position` and reporting cumulative
+          `onProgress`, then returns the same `PrefillResult` seed shape as the
+          chunked tail (`.greedyToken(lastGreedyToken)` under
+          `.greedyIfAvailable` + fused head, else `.logitsWritten`). No new
+          public API and no caller change — `runRawCompletion` still calls
+          `prefillChunked`. DeltaNet state needs no explicit threading: the
+          store is keyed by GLOBAL layer index and owned per session, so
+          stepping the decode loop token-by-token accumulates conv window +
+          recurrent state exactly as decode does; the KV cursor of the 10
+          full-attention layers advances via `kv?.advance()` inside
+          `produceToken`. Added two counters for testability
+          (`chunkedPrefillChunkCount`, incremented on entry to
+          `executePrefillChunk`; `sequentialPrefillTokenCount`) plus a
+          `prefillRoute` accessor. Gemma's chunked path is otherwise
+          byte-for-byte unchanged — the only edit inside `executePrefillChunk`
+          is the counter increment.
+Ran:      `swift build` -> clean. `swift test` -> 694 tests in 129 suites, ALL
+          PASS, 0 failures (baseline 691 + 3 new). New suite
+          `Qwen36SequentialPrefillTests` (Tests/TurboFieldfare/Core/Runtime/
+          Prefill/): routing purity for both topologies, and the real
+          end-to-end proof — loads `scratch/qwen36.gturbo`, builds a
+          `RealForwardRunner`, prefills a 5-token prompt through the public
+          `prefillChunked`, and asserts `chunkedPrefillChunkCount == 0`,
+          `sequentialPrefillTokenCount == 5`, `newPosition == 5`,
+          `progress == [1,2,3,4,5]`, then decodes one more token and re-asserts
+          the chunk count is still 0 and the KV cursor is 6 (38.5s, real model,
+          real Metal). Layer0 numeric gate re-ran unchanged and still passes
+          (relL2 0.0057-0.0075, maxAbs 0.0007-0.0039) — no tolerance touched.
+Learned:  The decision point is a pure function of `ArchConfig.topology`, so the
+          "never enters the chunked path" assertion splits cleanly into a
+          device-free routing test (always runs, including CI without weights)
+          plus a model-gated behavioral spy. Because `prefillSequential` returns
+          before `ensurePrefillScratch`, a Qwen3.6 run also never allocates the
+          Gemma prefill scratch buffers at all.
+Unproven: Numeric quality of a Qwen3.6 prefill+decode run — the runner's decode
+          loop still treats the 30 linear layers as identity passthrough
+          (DeltaNet is wired only in the plain-Swift P3-1/P3-2 modules and the
+          Layer0 isolation test). P3-3b proves the ROUTE, not the math; P3-4
+          owns wiring DeltaNet into the runner, after which the sequential
+          prefill it now feeds becomes numerically meaningful.
+Deferred: Routing the Layer0 fixture test's 5-token loop through the "real
+          prefill entry point" — deliberately not done. That test is plain
+          Swift fp32 by ADR-0001 and injects `hidden_in.0` directly; the real
+          entry point is Metal-orchestrated and does not run DeltaNet yet, so
+          there is nothing to route it through until P3-4. The hand-rolled loop
+          stays, and it already covers all 5 fixture tokens sequentially.
+Next:     P3-4 (full 40-layer forward, coherent text).
