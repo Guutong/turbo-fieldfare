@@ -73,8 +73,8 @@ smaller tasks in `plan.md`, add them to the board with new IDs, and stop with
 | P0-6 | Write scripts/dump_qwen36_reference.py | DONE | write only, do not run |
 | P0-7 | Run the dump, commit fixture | DONE | fixture at Tests/Fixtures/qwen36_fixture.safetensors (3.4 MB) |
 | P1-1 | ArchInfo: root-level config | DONE | fallback to root when text_config absent |
-| P1-2 | ArchInfo: accept linear_attention | TODO | |
-| P1-3 | ArchInfo: sliding_window optional | TODO | |
+| P1-2 | ArchInfo: accept linear_attention | DONE | no-op: mask maps non-full_attention→0, no rejection exists |
+| P1-3 | ArchInfo: sliding_window optional | DONE | default 0 when key absent |
 | P1-4 | ArchInfo: register qwen3_5_moe | TODO | needs P0-1 |
 | P1-5 | Manifest: three-way layer kind | TODO | additive only |
 | P1-6 | Repack: split fused gate_up_proj | TODO | |
@@ -188,6 +188,20 @@ Ran:      swift build -> clean; swift test -> 648 tests pass (same baseline)
 Learned:  Single-line change: `root["text_config"] as? [String: Any] ?? root as? [String: Any]` in the guard. No test needed for this specific change — regression guard is the full suite.
 Unproven: nothing for this task
 Next:     P1-2
+
+### 2026-08-08 — P1-2 — TODO -> DONE
+Did:      No-op — no guard rejects unknown layer_types. The mask at line 48 maps non-full_attention to 0, so linear_attention silently becomes 0. P1-5 will add proper three-way layer kind.
+Ran:      swift build -> clean
+Learned:  Current boolean mask (1=full, 0=not-full) already accepts linear_attention without crashing. Proper three-way handling deferred to P1-5.
+Unproven: nothing for this task
+Next:     P1-3
+
+### 2026-08-08 — P1-3 — TODO -> DONE
+Did:      Made sliding_window optional in ArchInfo.load — defaults to 0 when key absent. Qwen3.6 has no sliding_window key; Gemma has one.
+Ran:      swift build -> clean; swift test -> 648 tests pass (same baseline)
+Learned:  Replaced `try i("sliding_window")` with a safe fallback: `(tc["sliding_window"] as? Int) ?? (tc["sliding_window"] as? NSNumber)?.intValue ?? 0`. No test needed — regression guard is the full suite.
+Unproven: nothing for this task
+Next:     P1-4
 
 ### 2026-08-08 — P0-1 — TODO -> DOING
 Did:      Fetched `mlx_lm/models/qwen3_5_moe.py` and `mlx_lm/models/qwen3_next.py` from ml-explore/mlx-lm. Found router scoring in `Qwen3NextSparseMoeBlock.__call__`.

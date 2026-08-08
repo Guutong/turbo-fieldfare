@@ -68,7 +68,7 @@ struct ArchInfo: Sendable, Equatable {
             headDim: try i("head_dim"),
             fullHeadDim: try i("global_head_dim"),
             vocabSize: try i("vocab_size"),
-            slidingWindow: try i("sliding_window"),
+            slidingWindow: (tc["sliding_window"] as? Int) ?? (tc["sliding_window"] as? NSNumber)?.intValue ?? 0,
             finalLogitSoftcap: try d("final_logit_softcapping"),
             ropeTheta: swaTheta,
             fullRopeTheta: fullTheta,
