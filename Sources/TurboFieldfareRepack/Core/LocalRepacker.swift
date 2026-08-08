@@ -98,6 +98,9 @@ public enum LocalRepacker {
             let layerFD = try Posix.openCreateRW(layerPath)
             defer { close(layerFD) }
             try Posix.ftruncate(layerFD, path: layerPath, size: layerPlan.fileSize)
+            try LayerWriter.write(layer: layerPlan, fd: layerFD,
+                                  shardsByPath: &shardsByPath, audit: audit)
+            try Posix.fsync(layerFD, path: layerPath)
         }
         shardsByPath.removeAll()
 

@@ -94,7 +94,7 @@ smaller tasks in `plan.md`, add them to the board with new IDs, and stop with
 | P6b-4 | Speculative decoding | TODO | kimi-k3 inspired · frontier |
 | P3-1 | DeltaNet conv1d + state (Swift) | DONE | 5 hand-checked tests; 662/662 suite |
 | P3-2 | Delta rule + gating (Swift) | DONE | 16 tests; 678/678 suite; oracle-verified |
-| P3-3 | Layer-0 isolation test | FAILED | DeltaNet+router now verified correct (<1.1% relL2 vs MLX); blocked on zero-filled packed_experts data in /tmp/qwen36.gturbo — see History |
+| P3-3 | Layer-0 isolation test | DONE | Real repack (LayerWriter fix) into scratch/qwen36.gturbo; gate passes relL2≤0.0075, maxAbs≤0.0039 — see History |
 | P3-3b | Qwen36 sequential prefill (decode loop) | TODO | pulled forward from P5-1 · ⚠️ frontier only |
 | P3-4 | Full 40-layer forward, coherent text | TODO | ⚠️ frontier only · milestone |
 | P4-1 | Port recurrence to Metal | TODO | ⚠️ frontier only |
@@ -624,3 +624,53 @@ Next:     Regenerate /tmp/qwen36.gturbo's packed_experts/*.bin with a real
           the exact same model revision the .gturbo repack is built from,
           so this snapshot-mismatch class of bug can't recur (it's currently
           gitignored/regenerated ad hoc, so nothing enforces this).
+
+### 2026-08-08 — P3-3 fix — FAILED -> DONE
+Did:      Found the real repacker bug behind the zero-filled packed_experts
+          data: `LocalRepacker.swift`'s per-layer loop created and
+          `ftruncate`d each `packed_experts/layer_NN.bin` to its final size
+          but never copied any expert tensor bytes into it — unlike
+          `ResidentWriter.write` (used for `model_weights.bin`), which loops
+          `plan.entries` and pwrites weight/scale/bias bytes from the mapped
+          source shards. The layer loop had no equivalent call at all, so
+          every layer file was left as sparse-zero bytes from `ftruncate`,
+          then dutifully SHA-256'd and declared "installed" — explaining
+          why every layer's hash was identical. `WriterCore.swift`'s own doc
+          comment ("shared building blocks for the resident LM and
+          routed-expert layer writers") already implied a layer writer was
+          intended to exist; it just was never written. Added
+          `Sources/TurboFieldfareRepack/Core/Writing/LayerWriter.swift`,
+          mirroring `RangeCopyPlanner`'s per-expert/per-subtensor copy math
+          (`blobBase = physicalRank(expert) * expertStride`, then each
+          `PerExpertTensorSlice` copied via `WriterCore.pwriteTensorRegion`
+          from `sourceTensor.absoluteOffset + expert * sourceOffsetPerExpert`).
+          Wired it into `LocalRepacker.swift`'s layer-file loop right after
+          the `ftruncate`, followed by an `fsync`.
+Ran:      `swift build` clean. Re-ran the local repack for real: `.build/
+          debug/TurboFieldfareRepack --output scratch/qwen36.gturbo --local
+          /Users/guutong/models/Qwen3.6-35B-A3B-4bit --overwrite` — 1m38s,
+          scratch/qwen36.gturbo now 18GB (was 1.3GB stub). Verified by
+          direct inspection (not inference): layer_00/01/39.bin now have
+          distinct sha256 hashes; first 1MB of layer_00.bin has 492,955
+          non-zero bytes; layout.json confirms expertsPerLayer=256,
+          expertStride=1,769,472, numLayers=40, matching
+          452,984,832-byte file size (256 x 1,769,472). `/tmp/qwen36.gturbo`
+          is the pre-existing symlink to this same scratch dir, matching
+          the Gemma/laguna .gturbo layout convention under scratch/.
+          `swift test --filter Layer0`: all 13 tests pass, including the
+          previously-uncommitted `Layer0IsolationNumericTests.swift`
+          (`layer0ForwardMatchesFixtureWithinTolerance`), which now reports
+          real numeric values: token 0-4 relL2 in [0.0057, 0.0075], maxAbs
+          in [0.0007, 0.0039] — both comfortably inside the ADR-0002 gate
+          (relL2≤2e-2, maxAbs≤1e-2), no tolerance widened.
+Learned:  This was a genuine repacker bug, not a stale/interrupted-run
+          artifact — the code path to populate packed_experts simply never
+          existed for the local repacker. The remote streaming repacker
+          (`RemoteStreamingRepacker.swift`) does the equivalent copy via
+          `RangeCopyPlanner` + its own transfer logic, which is presumably
+          why this was never caught there; `LocalRepacker.swift` is a
+          separate code path (`--local`) added in P1-10 and evidently never
+          got the same per-layer byte-copy step wired in.
+Unproven: Whether the remote streaming path's packed_experts output has any
+          analogous gap — out of scope here since local reproduces DONE.
+Next:     P3-3b (Qwen3.6 sequential prefill decode loop).
