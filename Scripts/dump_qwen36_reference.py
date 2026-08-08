@@ -181,102 +181,11 @@ def main():
     with open(config_path, "r") as f:
         config = json.load(f)
 
-    # Load model and tokenizer via mlx_lm (handles TokenizersBackend internally)
+    # Load model and tokenizer via mlx_lm. This handles config parsing,
+    # quantization, and weight loading correctly (including renamed/dropped
+    # config keys and quantized weight shapes) -- do not reimplement it.
     from mlx_lm import load
     model, tokenizer = load(model_path)
-    # Load model weights and build architecture
-    import mlx.core as mx
-    import mlx.nn as nn
-
-    # Try to import Qwen3Next model class from mlx_lm
-    try:
-        from mlx_lm.models.qwen3_next import Model as Qwen3NextModel, ModelArgs as Qwen3NextModelArgs
-    except ImportError:
-        # Older mlx_lm doesn't have qwen3_next - download source files
-        import subprocess
-        import tempfile
-        import shutil
-
-        tmpdir = tempfile.mkdtemp()
-        try:
-            # Download the necessary source files from mlx-lm
-            subprocess.run([
-                "curl", "-sL",
-                "https://raw.githubusercontent.com/ml-explore/mlx-lm/main/mlx_lm/models/qwen3_next.py",
-                "-o", os.path.join(tmpdir, "qwen3_next.py")
-            ], check=True)
-            subprocess.run([
-                "curl", "-sL",
-                "https://raw.githubusercontent.com/ml-explore/mlx-lm/main/mlx_lm/models/gated_delta.py",
-                "-o", os.path.join(tmpdir, "gated_delta.py")
-            ], check=True)
-            subprocess.run([
-                "curl", "-sL",
-                "https://raw.githubusercontent.com/ml-explore/mlx-lm/main/mlx_lm/models/rope_utils.py",
-                "-o", os.path.join(tmpdir, "rope_utils.py")
-            ], check=True)
-            subprocess.run([
-                "curl", "-sL",
-                "https://raw.githubusercontent.com/ml-explore/mlx-lm/main/mlx_lm/models/base.py",
-                "-o", os.path.join(tmpdir, "base.py")
-            ], check=True)
-            subprocess.run([
-                "curl", "-sL",
-                "https://raw.githubusercontent.com/ml-explore/mlx-lm/main/mlx_lm/models/activations.py",
-                "-o", os.path.join(tmpdir, "activations.py")
-            ], check=True)
-            subprocess.run([
-                "curl", "-sL",
-                "https://raw.githubusercontent.com/ml-explore/mlx-lm/main/mlx_lm/models/switch_layers.py",
-                "-o", os.path.join(tmpdir, "switch_layers.py")
-            ], check=True)
-            subprocess.run([
-                "curl", "-sL",
-                "https://raw.githubusercontent.com/ml-explore/mlx-lm/main/mlx_lm/models/cache.py",
-                "-o", os.path.join(tmpdir, "cache.py")
-            ], check=True)
-
-            # Add tmpdir to path and import
-            import sys
-            sys.path.insert(0, tmpdir)
-
-            # Create minimal base module
-            os.makedirs(os.path.join(tmpdir, "mlx_lm"), exist_ok=True)
-            os.makedirs(os.path.join(tmpdir, "mlx_lm", "models"), exist_ok=True)
-            open(os.path.join(tmpdir, "mlx_lm", "__init__.py"), "w").close()
-            open(os.path.join(tmpdir, "mlx_lm", "models", "__init__.py"), "w").close()
-
-            from qwen3_next import Model as Qwen3NextModel, ModelArgs as Qwen3NextModelArgs
-        finally:
-            shutil.rmtree(tmpdir, ignore_errors=True)
-
-    # Build config, dropping HF metadata keys (e.g. "architectures") that
-    # aren't accepted by the ModelArgs dataclass.
-    import dataclasses
-    valid_fields = {f.name for f in dataclasses.fields(Qwen3NextModelArgs)}
-    model_args = Qwen3NextModelArgs(**{k: v for k, v in config.items() if k in valid_fields})
-
-    # Create model
-    model = Qwen3NextModel(model_args)
-
-    # Load weights from safetensors (handle sharded files)
-    import glob
-    index_path = os.path.join(model_path, "model.safetensors.index.json")
-    if os.path.exists(index_path):
-        with open(index_path, "r") as f:
-            index = json.load(f)
-        weight_files = sorted(set(index["weight_map"].values()))
-    else:
-        weight_files = sorted(glob.glob(os.path.join(model_path, "*.safetensors")))
-
-    if not weight_files:
-        raise FileNotFoundError(f"No safetensors files found in {model_path}")
-
-    # Load all weights
-    all_weights = {}
-    for wf in weight_files:
-        all_weights.update(mx.load(wf))
-    model.update(all_weights)
 
     print(f"Config layers: {config.get('num_hidden_layers')}, hidden: {config.get('hidden_size')}, vocab: {config.get('vocab_size')}")
 
