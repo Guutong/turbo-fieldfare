@@ -181,9 +181,7 @@ def main():
     with open(config_path, "r") as f:
         config = json.load(f)
 
-    # Load tokenizer
-    from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    # Load model and tokenizer via mlx_lm (handles TokenizersBackend internally)
     from mlx_lm import load
     model, tokenizer = load(model_path)
     # Load model weights and build architecture
@@ -252,8 +250,11 @@ def main():
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
-    # Build config
-    model_args = Qwen3NextModelArgs(**{k: v for k, v in config.items()})
+    # Build config, dropping HF metadata keys (e.g. "architectures") that
+    # aren't accepted by the ModelArgs dataclass.
+    import dataclasses
+    valid_fields = {f.name for f in dataclasses.fields(Qwen3NextModelArgs)}
+    model_args = Qwen3NextModelArgs(**{k: v for k, v in config.items() if k in valid_fields})
 
     # Create model
     model = Qwen3NextModel(model_args)
