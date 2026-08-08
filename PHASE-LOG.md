@@ -75,7 +75,7 @@ smaller tasks in `plan.md`, add them to the board with new IDs, and stop with
 | P1-1 | ArchInfo: root-level config | DONE | fallback to root when text_config absent |
 | P1-2 | ArchInfo: accept linear_attention | DONE | no-op: mask maps non-full_attention→0, no rejection exists |
 | P1-3 | ArchInfo: sliding_window optional | DONE | default 0 when key absent |
-| P1-4 | ArchInfo: register qwen3_5_moe | TODO | needs P0-1 |
+| P1-4 | ArchInfo: register qwen3_5_moe | DONE | no-op: no modelType switch exists in ArchInfo.swift |
 | P1-5 | Manifest: three-way layer kind | TODO | additive only |
 | P1-6 | Repack: split fused gate_up_proj | TODO | |
 | P1-7 | Repack: filter vision tensors | TODO | |
@@ -202,6 +202,13 @@ Ran:      swift build -> clean; swift test -> 648 tests pass (same baseline)
 Learned:  Replaced `try i("sliding_window")` with a safe fallback: `(tc["sliding_window"] as? Int) ?? (tc["sliding_window"] as? NSNumber)?.intValue ?? 0`. No test needed — regression guard is the full suite.
 Unproven: nothing for this task
 Next:     P1-4
+
+### 2026-08-08 — P1-4 — TODO -> DONE
+Did:      No-op — no modelType switch exists in ArchInfo.swift. Model identification is done by comparing config values against known ArchConfig entries (e.g. ArchConfig.gemma4_26B_A4B). Model-specific behavior is handled by config values (hiddenActivation, layer_types, etc.) loaded from config.json.
+Ran:      swift test --filter ArchInfo -> no matching tests (expected, no switch exists)
+Learned:  ArchInfo.swift has no model type discrimination. It just loads config values into ArchInfo struct. The runtime identifies models by comparing ArchInfo values against known ArchConfig entries.
+Unproven: nothing for this task
+Next:     P1-5
 
 ### 2026-08-08 — P0-1 — TODO -> DOING
 Did:      Fetched `mlx_lm/models/qwen3_5_moe.py` and `mlx_lm/models/qwen3_next.py` from ml-explore/mlx-lm. Found router scoring in `Qwen3NextSparseMoeBlock.__call__`.
