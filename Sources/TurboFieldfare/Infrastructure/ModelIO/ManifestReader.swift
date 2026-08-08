@@ -129,7 +129,7 @@ public enum ManifestReader {
         }
         try validateArch(m.arch, expected: expected)
         if let quant = m.quant {
-            try validateQuant(quant)
+            try validateQuant(quant, topology: expected.topology)
         } else if expected.numLayers == ArchConfig.gemma4_26B_A4B.numLayers,
                   expected.hiddenSize == ArchConfig.gemma4_26B_A4B.hiddenSize {
             throw ModelError.indexCorrupt(detail: "manifest.quant is required for the production architecture")
@@ -139,11 +139,13 @@ public enum ManifestReader {
         }
     }
 
-    private static func validateQuant(_ quant: ManifestQuant) throws {
+    private static func validateQuant(_ quant: ManifestQuant,
+                                       topology: LayerTopology = .gemma4) throws {
+        let routerBits: Set<Int> = topology == .qwen36 ? [4, 8] : [8]
         let slots: [(String, ManifestQuantSlot, Set<Int>)] = [
             ("embedding", quant.embedding, [4]),
             ("attention", quant.attention, [4]),
-            ("router", quant.router, [8]),
+            ("router", quant.router, routerBits),
             ("sharedExpert", quant.sharedExpert, [4, 8]),
             ("routedExpert", quant.routedExpert, [4]),
         ]

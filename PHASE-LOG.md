@@ -84,7 +84,7 @@ smaller tasks in `plan.md`, add them to the board with new IDs, and stop with
 | P1-10 | Produce qwen36.gturbo | DONE | see history — required real bug fixes, not just a run |
 | P2-1 | silu activation | DONE | see history — Metal kernels + Swift dispatch, build clean
 | P2-2 | Pre-norm topology (decode AND prefill) | DONE | decode path complete; prefill deferred to P2-2b |
-| P2-3 | Router scoring variant | TODO | no-op if plain softmax |
+| P2-3 | Router scoring variant | DONE | no-op for math; fixed router/shared expert tensor names for Qwen36 |
 | P2-4 | KV for the 10 full-attn layers only | TODO | |
 | P2-5 | Full attention path | TODO | |
 | P2-6 | Layer-3 isolation test | TODO | first real proof |

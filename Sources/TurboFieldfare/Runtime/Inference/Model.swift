@@ -105,20 +105,46 @@ public struct Model {
     public func oProj(layer L: Int) throws -> TensorView {
         try resident(name: "language_model.model.layers.\(L).self_attn.o_proj.weight")
     }
-    /// Writer emits `.router.proj.weight` (no `.mlp.` segment).
+    /// Writer emits `.router.proj.weight` (no `.mlp.` segment) for Gemma 4.
+    /// Qwen3.6 names the router Linear `mlp.gate` — the router IS the gate projection.
     public func router(layer L: Int) throws -> TensorView {
-        try resident(name: "language_model.model.layers.\(L).router.proj.weight")
+        let name: String
+        if config.topology == .qwen36 {
+            name = "language_model.model.layers.\(L).mlp.gate.weight"
+        } else {
+            name = "language_model.model.layers.\(L).router.proj.weight"
+        }
+        return try resident(name: name)
     }
     /// Writer emits the shared-expert FFN as `.mlp.{gate,up,down}_proj.weight`
-    /// without a `.shared_expert.` segment.
+    /// without a `.shared_expert.` segment for Gemma 4.
+    /// Qwen3.6 uses `.mlp.shared_expert.{gate,up,down}_proj.weight`.
     public func sharedExpertGate(layer L: Int) throws -> TensorView {
-        try resident(name: "language_model.model.layers.\(L).mlp.gate_proj.weight")
+        let name: String
+        if config.topology == .qwen36 {
+            name = "language_model.model.layers.\(L).mlp.shared_expert.gate_proj.weight"
+        } else {
+            name = "language_model.model.layers.\(L).mlp.gate_proj.weight"
+        }
+        return try resident(name: name)
     }
     public func sharedExpertUp(layer L: Int) throws -> TensorView {
-        try resident(name: "language_model.model.layers.\(L).mlp.up_proj.weight")
+        let name: String
+        if config.topology == .qwen36 {
+            name = "language_model.model.layers.\(L).mlp.shared_expert.up_proj.weight"
+        } else {
+            name = "language_model.model.layers.\(L).mlp.up_proj.weight"
+        }
+        return try resident(name: name)
     }
     public func sharedExpertDown(layer L: Int) throws -> TensorView {
-        try resident(name: "language_model.model.layers.\(L).mlp.down_proj.weight")
+        let name: String
+        if config.topology == .qwen36 {
+            name = "language_model.model.layers.\(L).mlp.shared_expert.down_proj.weight"
+        } else {
+            name = "language_model.model.layers.\(L).mlp.down_proj.weight"
+        }
+        return try resident(name: name)
     }
     public func inputNorm(layer L: Int) throws -> TensorView {
         try resident(name: "language_model.model.layers.\(L).input_layernorm.weight")
@@ -664,18 +690,36 @@ extension Model {
             try requireAffine("\(prefix).self_attn.o_proj.weight",
                               rows: config.hiddenSize, columns: queryDimension,
                               slot: quant.attention)
-            try requireAffine("\(prefix).mlp.gate_proj.weight",
-                              rows: config.intermediateSize, columns: config.hiddenSize,
-                              slot: quant.sharedExpert)
-            try requireAffine("\(prefix).mlp.up_proj.weight",
-                              rows: config.intermediateSize, columns: config.hiddenSize,
-                              slot: quant.sharedExpert)
-            try requireAffine("\(prefix).mlp.down_proj.weight",
-                              rows: config.hiddenSize, columns: config.intermediateSize,
-                              slot: quant.sharedExpert)
-            try requireAffine("\(prefix).router.proj.weight",
-                              rows: config.numExperts, columns: config.hiddenSize,
-                              slot: quant.router)
+            if config.topology == .qwen36 {
+                try requireAffine("\(prefix).mlp.shared_expert.gate_proj.weight",
+                                  rows: config.intermediateSize, columns: config.hiddenSize,
+                                  slot: quant.sharedExpert)
+                try requireAffine("\(prefix).mlp.shared_expert.up_proj.weight",
+                                  rows: config.intermediateSize, columns: config.hiddenSize,
+                                  slot: quant.sharedExpert)
+                try requireAffine("\(prefix).mlp.shared_expert.down_proj.weight",
+                                  rows: config.hiddenSize, columns: config.intermediateSize,
+                                  slot: quant.sharedExpert)
+            } else {
+                try requireAffine("\(prefix).mlp.gate_proj.weight",
+                                  rows: config.intermediateSize, columns: config.hiddenSize,
+                                  slot: quant.sharedExpert)
+                try requireAffine("\(prefix).mlp.up_proj.weight",
+                                  rows: config.intermediateSize, columns: config.hiddenSize,
+                                  slot: quant.sharedExpert)
+                try requireAffine("\(prefix).mlp.down_proj.weight",
+                                  rows: config.hiddenSize, columns: config.intermediateSize,
+                                  slot: quant.sharedExpert)
+            }
+            if config.topology == .qwen36 {
+                try requireAffine("\(prefix).mlp.gate.weight",
+                                  rows: config.numExperts, columns: config.hiddenSize,
+                                  slot: quant.router)
+            } else {
+                try requireAffine("\(prefix).router.proj.weight",
+                                  rows: config.numExperts, columns: config.hiddenSize,
+                                  slot: quant.router)
+            }
         }
 
         let routedShapes: [(String, Int, Int)] = [
