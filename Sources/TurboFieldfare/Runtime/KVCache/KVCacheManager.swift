@@ -77,7 +77,14 @@ public final class KVCacheManager {
         self.fp16RingEnabled = ringEnabled
 
         let swaStride  = config.numKVHeads     * config.headDim     * Self.fp16Size
-        let fullStride = config.numFullKVHeads * config.fullHeadDim  * Self.fp16Size
+        // Qwen3.6 has numFullKVHeads=0 — full-attention layers reuse the same
+        // 2 KV heads as SWA layers rather than having separate global KV heads.
+        let fullStride: Int
+        if config.numFullKVHeads > 0 {
+            fullStride = config.numFullKVHeads * config.fullHeadDim * Self.fp16Size
+        } else {
+            fullStride = swaStride
+        }
         let swaCapacity = min(maxContext,
                               max(1, fp16RingCapacityOverride
                                   ?? ((slidingWindow ?? config.slidingWindow) + maxPrefillChunkTokens)))
@@ -104,9 +111,20 @@ public final class KVCacheManager {
                 kind = .swa
             }
             let isFull = kind == .full
-            let stride = isFull ? fullStride : swaStride
-            let capacity = ringEnabled && !isFull ? swaCapacity : maxContext
-            let length = capacity * stride
+            let isLinear = kind == .linear
+            // Linear-attention (DeltaNet) layers carry no KV cache — they use
+            // recurrent state instead. Allocate a minimal buffer so layer-indexed
+            // access doesn't bounds-check, but no token slots are ever written.
+            let stride: Int
+            let capacity: Int
+            if isLinear {
+                stride = 0
+                capacity = 0
+            } else {
+                stride = isFull ? fullStride : swaStride
+                capacity = ringEnabled && !isFull ? swaCapacity : maxContext
+            }
+            let length = max(capacity * stride, 1)  // Metal forbids zero-length
 
             guard let kBuf = device.makeBuffer(length: length, options: .storageModeShared) else {
                 throw ModelError.residentBufferWrapFailed
