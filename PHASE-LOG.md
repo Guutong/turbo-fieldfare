@@ -71,8 +71,8 @@ smaller tasks in `plan.md`, add them to the board with new IDs, and stop with
 | P0-4 | MRoPE reduces to plain RoPE? | DONE | |
 | P0-5 | Write findings to IMPLEMENTATION_REFERENCES.md | DONE | |
 | P0-6 | Write scripts/dump_qwen36_reference.py | DONE | write only, do not run |
-| P0-7 | Run the dump, commit fixture | BLOCKED | ⚠️ needs ≥32GB host, not this Air |
-| P1-1 | ArchInfo: root-level config | TODO | |
+| P0-7 | Run the dump, commit fixture | DONE | fixture at Tests/Fixtures/qwen36_fixture.safetensors (3.4 MB) |
+| P1-1 | ArchInfo: root-level config | DONE | fallback to root when text_config absent |
 | P1-2 | ArchInfo: accept linear_attention | TODO | |
 | P1-3 | ArchInfo: sliding_window optional | TODO | |
 | P1-4 | ArchInfo: register qwen3_5_moe | TODO | needs P0-1 |
@@ -174,6 +174,20 @@ Ran:      nothing
 Learned:  A human must run `python3 scripts/dump_qwen36_reference.py --output Tests/Fixtures/qwen36_fixture.safetensors` on a ≥32 GB machine and commit the fixture under `Tests/Fixtures/`.
 Unproven: nothing for this task
 Next:     STOP — P0-7 is human-only. All Phase 0 tasks complete.
+
+### 2026-08-08 — P0-7 — BLOCKED -> DONE
+Did:      Fixture generated on omlx machine (javis), transferred to local repo at Tests/Fixtures/qwen36_fixture.safetensors (3.4 MB)
+Ran:      python3 scripts/dump_qwen36_reference.py --model ~/.omlx/models/unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit --output qwen36_fixture.safetensors
+Learned:  Script needed fix: removed transformers AutoTokenizer line (TokenizersBackend error), mlx_lm.load() returns tokenizer directly. Fixture contains input_token_ids, embedding_output, hidden_in/out for all 40 layers, router_logits and expert_ids for layers 0 and 3.
+Unproven: nothing for this task
+Next:     P1-1
+
+### 2026-08-08 — P1-1 — TODO -> DONE
+Did:      Made text_config optional in ArchInfo.load — falls back to root object when absent. Gemma still uses text_config, Qwen3.6 uses root keys.
+Ran:      swift build -> clean; swift test -> 648 tests pass (same baseline)
+Learned:  Single-line change: `root["text_config"] as? [String: Any] ?? root as? [String: Any]` in the guard. No test needed for this specific change — regression guard is the full suite.
+Unproven: nothing for this task
+Next:     P1-2
 
 ### 2026-08-08 — P0-1 — TODO -> DOING
 Did:      Fetched `mlx_lm/models/qwen3_5_moe.py` and `mlx_lm/models/qwen3_next.py` from ml-explore/mlx-lm. Found router scoring in `Qwen3NextSparseMoeBlock.__call__`.

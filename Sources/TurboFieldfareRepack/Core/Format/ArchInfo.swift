@@ -29,7 +29,7 @@ struct ArchInfo: Sendable, Equatable {
     static func load(configPath: String) throws -> ArchInfo {
         let data = try Data(contentsOf: URL(fileURLWithPath: configPath))
         guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let tc = root["text_config"] as? [String: Any] else {
+              let tc: [String: Any] = root["text_config"] as? [String: Any] ?? root as? [String: Any] else {
             throw RepackError.configJsonInvalid(path: configPath, detail: "no text_config")
         }
         func i(_ k: String) throws -> Int {
