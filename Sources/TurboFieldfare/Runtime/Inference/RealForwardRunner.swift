@@ -854,7 +854,10 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             let views = layerViews[L]
             let isFull = cfg.layerKindMask[L] == 1
             let headDim = isFull ? cfg.fullHeadDim : cfg.headDim
-            let numKVHeads = isFull ? cfg.numFullKVHeads : cfg.numKVHeads
+            // Qwen3.6 has numFullKVHeads=0 — full-attn layers reuse numKVHeads.
+            let effectiveFullKV = cfg.numFullKVHeads > 0
+                ? cfg.numFullKVHeads : cfg.numKVHeads
+            let numKVHeads = isFull ? effectiveFullKV : cfg.numKVHeads
             let qDim = cfg.numHeads * headDim
             let kvDim = numKVHeads * headDim
 
@@ -1379,7 +1382,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         for L in 0..<cfg.numLayers {
             let isFull = cfg.layerKindMask[L] == 1
             let headDimL = isFull ? cfg.fullHeadDim : cfg.headDim
-            let numKVL   = isFull ? cfg.numFullKVHeads : cfg.numKVHeads
+            // Qwen3.6 has numFullKVHeads=0 — full-attn layers reuse numKVHeads.
+            let numKVL   = isFull ? max(cfg.numFullKVHeads, cfg.numKVHeads) : cfg.numKVHeads
             let qDim     = UInt32(cfg.numHeads * headDimL)
             let kvDim    = UInt32(numKVL * headDimL)
             let kSlot    = kv?.kSlot(layer: L, position: position) ?? (buffer: kStage, offset: 0)
