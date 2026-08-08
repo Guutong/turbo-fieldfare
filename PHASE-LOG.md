@@ -85,8 +85,8 @@ smaller tasks in `plan.md`, add them to the board with new IDs, and stop with
 | P2-1 | silu activation | DONE | see history — Metal kernels + Swift dispatch, build clean
 | P2-2 | Pre-norm topology (decode AND prefill) | DONE | decode path complete; prefill deferred to P2-2b |
 | P2-3 | Router scoring variant | DONE | no-op for math; fixed router/shared expert tensor names for Qwen36 |
-| P2-4 | KV for the 10 full-attn layers only | TODO | |
-| P2-5 | Full attention path | TODO | |
+| P2-4 | KV for the 10 full-attn layers only | DONE | skip linear layers, fix fullStride for Qwen36 |
+| P2-5 | Full attention path | DONE | fixed numFullKVHeads=0 fallback; rest already cfg-driven |
 | P2-6 | Layer-3 isolation test | TODO | first real proof |
 | P6b-1 | Expert LRU cache with pinning | TODO | kimi-k3 inspired |
 | P6b-2 | Batch expert prefetch disk-offset order | TODO | kimi-k3 inspired |
