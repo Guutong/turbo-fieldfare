@@ -24,6 +24,8 @@ struct ArchInfo: Sendable, Equatable {
     let attentionKEqV: Bool
     /// 1 if `full_attention`, 0 if `sliding_attention`. Indexed by layer.
     let fullAttentionLayerMask: [UInt8]
+    /// Three-way layer kind: 0=sliding, 1=full, 2=linear. Indexed by layer.
+    let layerKindMask: [UInt8]
     let hiddenActivation: String
 
     static func load(configPath: String) throws -> ArchInfo {
@@ -46,6 +48,14 @@ struct ArchInfo: Sendable, Equatable {
         }
         let layerTypes = (tc["layer_types"] as? [String]) ?? []
         let mask = layerTypes.map { UInt8($0 == "full_attention" ? 1 : 0) }
+        let kindMask = layerTypes.map { s in
+            switch s {
+            case "full_attention": return UInt8(1)
+            case "sliding_attention": return UInt8(0)
+            case "linear_attention": return UInt8(2)
+            default: return UInt8(0)
+            }
+        }
         let rope = (tc["rope_parameters"] as? [String: Any]) ?? [:]
         let ropeFull = (rope["full_attention"] as? [String: Any]) ?? [:]
         let ropeSWA  = (rope["sliding_attention"] as? [String: Any]) ?? [:]
@@ -79,6 +89,7 @@ struct ArchInfo: Sendable, Equatable {
             tieWordEmbeddings: tie,
             attentionKEqV: kEqV,
             fullAttentionLayerMask: mask,
+            layerKindMask: kindMask,
             hiddenActivation: act)
     }
 }

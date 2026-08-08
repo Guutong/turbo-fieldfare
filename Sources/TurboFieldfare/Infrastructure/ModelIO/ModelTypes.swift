@@ -24,6 +24,7 @@ public struct ArchConfig: Sendable, Equatable {
     public let tieWordEmbeddings: Bool
     public let attentionKEqV: Bool
     public let fullAttentionLayerMask: [UInt8]
+    public let layerKindMask: [UInt8]
     public let hiddenActivation: String
 
     public init(
@@ -47,6 +48,7 @@ public struct ArchConfig: Sendable, Equatable {
         tieWordEmbeddings: Bool,
         attentionKEqV: Bool,
         fullAttentionLayerMask: [UInt8],
+        layerKindMask: [UInt8],
         hiddenActivation: String
     ) {
         self.hiddenSize = hiddenSize
@@ -69,6 +71,7 @@ public struct ArchConfig: Sendable, Equatable {
         self.tieWordEmbeddings = tieWordEmbeddings
         self.attentionKEqV = attentionKEqV
         self.fullAttentionLayerMask = fullAttentionLayerMask
+        self.layerKindMask = layerKindMask
         self.hiddenActivation = hiddenActivation
     }
 
@@ -96,6 +99,7 @@ public struct ArchConfig: Sendable, Equatable {
         tieWordEmbeddings: true,
         attentionKEqV: true,
         fullAttentionLayerMask: Self.gemma4LayerMask(),
+        layerKindMask: Self.gemma4LayerMask(),
         hiddenActivation: "gelu_pytorch_tanh"
     )
 

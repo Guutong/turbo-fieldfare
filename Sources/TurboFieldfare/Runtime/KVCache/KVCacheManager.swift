@@ -5,7 +5,7 @@ import Metal
 /// Which attention variant a layer runs. Gemma 4 interleaves 25 sliding-window
 /// layers with 5 full-attention layers (the latter carry the K=V shared-tensor
 /// quirk). Sourced from `ArchConfig.fullAttentionLayerMask`.
-public enum LayerKind: Sendable { case swa, full }
+public enum LayerKind: Sendable { case swa, full, linear }
 
 /// A read view the attention kernels bind. `offset` stays 0; ring-enabled SWA
 /// layers expose the physical start slot for diagnostics while kernels map
@@ -94,7 +94,16 @@ public final class KVCacheManager {
         caps.reserveCapacity(config.numLayers)
 
         for layer in 0..<config.numLayers {
-            let isFull = config.fullAttentionLayerMask[layer] != 0
+            let kind: LayerKind
+            let kindVal = config.layerKindMask[layer]
+            if kindVal == 1 {
+                kind = .full
+            } else if kindVal == 2 {
+                kind = .linear
+            } else {
+                kind = .swa
+            }
+            let isFull = kind == .full
             let stride = isFull ? fullStride : swaStride
             let capacity = ringEnabled && !isFull ? swaCapacity : maxContext
             let length = capacity * stride
@@ -112,7 +121,7 @@ public final class KVCacheManager {
             vs.append(vBuf)
 
             st.append(stride)
-            kd.append(isFull ? .full : .swa)
+            kd.append(kind)
             caps.append(capacity)
         }
 

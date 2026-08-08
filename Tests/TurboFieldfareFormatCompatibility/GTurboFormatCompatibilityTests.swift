@@ -57,7 +57,7 @@ import Testing
             hash(frozenIndex),
         ]
         #expect(hashes == [
-            "f0c4d01ac7f1747416a0274dd26bb585e2e43ae294b02a8daf272e7129d46dce",
+            "4c3c7fb722c8de7c66cf313261a1ff875a9b4376abd2434bcee42363d686f68a",
             "acf57a355128d1d8afb1d09b75dc1aa7fef98687871b1ff9f738dd511cb6e341",
             "aa705246112c17d4b60422a2705bda53e96553f7ff96e09b00e6fbb5a4ffa594",
         ], "fixture hashes: \(hashes)")
@@ -84,7 +84,7 @@ import Testing
             ropeTheta: 10_000, fullRopeTheta: 1_000_000,
             partialRotaryFactor: 0.25, numLayers: 1, numExperts: 2,
             topKExperts: 1, tieWordEmbeddings: true, attentionKEqV: true,
-            fullAttentionLayerMask: [0], hiddenActivation: "gelu_pytorch_tanh")
+            fullAttentionLayerMask: [0], layerKindMask: [0], hiddenActivation: "gelu_pytorch_tanh")
         let arch = ArchInfo(
             hiddenSize: config.hiddenSize,
             intermediateSize: config.intermediateSize,
@@ -106,6 +106,7 @@ import Testing
             tieWordEmbeddings: config.tieWordEmbeddings,
             attentionKEqV: config.attentionKEqV,
             fullAttentionLayerMask: config.fullAttentionLayerMask,
+            layerKindMask: config.layerKindMask,
             hiddenActivation: config.hiddenActivation)
         let source = SourceTensor(
             name: "fixture.weight", shardPath: "/dev/null", dtype: .u32,

@@ -314,6 +314,7 @@ extension ArchConfig {
             tieWordEmbeddings: true,
             attentionKEqV: true,
             fullAttentionLayerMask: [0, 1],
+            layerKindMask: [0, 1],
             hiddenActivation: "gelu_pytorch_tanh"
         )
     }

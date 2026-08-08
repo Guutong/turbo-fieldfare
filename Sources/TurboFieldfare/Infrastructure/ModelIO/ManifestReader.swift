@@ -28,6 +28,7 @@ public struct ManifestArch: Decodable, Equatable, Sendable {
     public let attentionKEqV: Bool
     public let hiddenActivation: String
     public let fullAttentionLayerMask: [Int]
+    public let layerKindMask: [Int]?
 }
 
 public struct ManifestQuantSlot: Decodable, Equatable, Sendable {
@@ -191,6 +192,11 @@ public enum ManifestReader {
         try check("fullAttentionLayerMask",
                   actualMask.description,
                   e.fullAttentionLayerMask.description)
+        if let actualKind = a.layerKindMask, !actualKind.isEmpty {
+            try check("layerKindMask",
+                      actualKind.description,
+                      e.layerKindMask.description)
+        }
     }
 }
 
@@ -222,7 +228,8 @@ private extension ManifestArch {
                   tieWordEmbeddings: wire.tieWordEmbeddings,
                   attentionKEqV: wire.attentionKEqV,
                   hiddenActivation: wire.hiddenActivation,
-                  fullAttentionLayerMask: wire.fullAttentionLayerMask)
+                   fullAttentionLayerMask: wire.fullAttentionLayerMask,
+                   layerKindMask: wire.layerKindMask)
     }
 }
 

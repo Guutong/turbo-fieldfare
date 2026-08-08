@@ -187,6 +187,7 @@ import Testing
             tieWordEmbeddings: toy.tieWordEmbeddings,
             attentionKEqV: toy.attentionKEqV,
             fullAttentionLayerMask: toy.fullAttentionLayerMask,
+            layerKindMask: toy.layerKindMask,
             hiddenActivation: toy.hiddenActivation)
         #expect(throws: ModelError.self) {
             try Model.validateRuntimeSchema(

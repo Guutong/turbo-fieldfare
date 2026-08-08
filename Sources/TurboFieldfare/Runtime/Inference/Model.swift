@@ -616,7 +616,7 @@ extension Model {
 
         for layer in 0..<config.numLayers {
             let prefix = "language_model.model.layers.\(layer)"
-            let isFull = config.fullAttentionLayerMask[layer] != 0
+            let isFull = config.layerKindMask[layer] == 1
             let headDimension = isFull ? config.fullHeadDim : config.headDim
             let kvHeads = isFull ? config.numFullKVHeads : config.numKVHeads
             let queryDimension = try checkedIntMultiply(

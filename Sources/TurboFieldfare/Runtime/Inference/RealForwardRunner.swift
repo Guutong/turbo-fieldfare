@@ -602,7 +602,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         }
 
         let layerViews = try (0..<cfg.numLayers).map { L in
-            let isFull = cfg.fullAttentionLayerMask[L] != 0
+            let isFull = cfg.layerKindMask[L] == 1
             return LayerPrefillQKVViews(
                 inputNorm: try model.inputNorm(layer: L),
                 q: try model.qProj(layer: L),
@@ -780,7 +780,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         for L in 0..<cfg.numLayers {
             model.beginOpeningRoutedExpertStreamer(layer: L)
             let views = layerViews[L]
-            let isFull = cfg.fullAttentionLayerMask[L] != 0
+            let isFull = cfg.layerKindMask[L] == 1
             let headDim = isFull ? cfg.fullHeadDim : cfg.headDim
             let numKVHeads = isFull ? cfg.numFullKVHeads : cfg.numKVHeads
             let qDim = cfg.numHeads * headDim
@@ -1305,7 +1305,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         }
 
         for L in 0..<cfg.numLayers {
-            let isFull = cfg.fullAttentionLayerMask[L] != 0
+            let isFull = cfg.layerKindMask[L] == 1
             let headDimL = isFull ? cfg.fullHeadDim : cfg.headDim
             let numKVL   = isFull ? cfg.numFullKVHeads : cfg.numKVHeads
             let qDim     = UInt32(cfg.numHeads * headDimL)

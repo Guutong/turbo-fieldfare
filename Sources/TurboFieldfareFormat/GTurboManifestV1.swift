@@ -32,6 +32,7 @@ package struct GTurboManifestArchV1: Codable, Equatable, Sendable {
     package let attentionKEqV: Bool
     package let hiddenActivation: String
     package let fullAttentionLayerMask: [Int]
+    package let layerKindMask: [Int]?
 
     package init(hiddenSize: Int, ffnIntermediate: Int, moeIntermediateSize: Int,
                  numHeads: Int, numKVHeads: Int, numFullKVHeads: Int,
@@ -40,7 +41,8 @@ package struct GTurboManifestArchV1: Codable, Equatable, Sendable {
                  ropeTheta: Double, fullRopeTheta: Double,
                  partialRotaryFactor: Double, numLayers: Int, numExperts: Int,
                  topKExperts: Int, tieWordEmbeddings: Bool, attentionKEqV: Bool,
-                 hiddenActivation: String, fullAttentionLayerMask: [Int]) {
+                 hiddenActivation: String, fullAttentionLayerMask: [Int],
+                 layerKindMask: [Int]? = nil) {
         self.hiddenSize = hiddenSize
         self.ffnIntermediate = ffnIntermediate
         self.moeIntermediateSize = moeIntermediateSize
@@ -62,6 +64,7 @@ package struct GTurboManifestArchV1: Codable, Equatable, Sendable {
         self.attentionKEqV = attentionKEqV
         self.hiddenActivation = hiddenActivation
         self.fullAttentionLayerMask = fullAttentionLayerMask
+        self.layerKindMask = layerKindMask
     }
 }
 
