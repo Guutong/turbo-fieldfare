@@ -191,6 +191,18 @@ public struct ArchConfig: Sendable, Equatable {
         for i in stride(from: 3, to: 40, by: 4) { mask[i] = 1 }  // full-attention
         return mask
     }
+
+    /// Auto-detect the expected architecture from a few high-signal fields
+    /// that differ between known model families. Falls back to `.gemma4_26B_A4B`.
+    public static func detect(hiddenSize: Int, numLayers: Int, numExperts: Int,
+                              numKVHeads: Int, numFullKVHeads: Int) -> ArchConfig {
+        if numLayers == 40 && numExperts == 256
+            && numKVHeads == 2 && numFullKVHeads == 0
+            && hiddenSize == 2048 {
+            return .qwen36_35B_A3B
+        }
+        return .gemma4_26B_A4B
+    }
 }
 
 /// Failure modes for the validation gates in `Model.load`.

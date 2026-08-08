@@ -19,7 +19,21 @@ public enum AppModelInstallationProbe {
         }
 
         do {
-            let manifest = try ManifestReader.load(directoryURL: directory, expecting: .gemma4_26B_A4B)
+            // Auto-detect model family from manifest arch before validation.
+            let manifestData = try Data(contentsOf: manifestURL)
+            let expectedArch: ArchConfig
+            if let root = try JSONSerialization.jsonObject(with: manifestData) as? [String: Any],
+               let arch = root["arch"] as? [String: Any] {
+                expectedArch = ArchConfig.detect(
+                    hiddenSize: arch["hiddenSize"] as? Int ?? 0,
+                    numLayers: arch["numLayers"] as? Int ?? 0,
+                    numExperts: arch["numExperts"] as? Int ?? 0,
+                    numKVHeads: arch["numKVHeads"] as? Int ?? 0,
+                    numFullKVHeads: arch["numFullKVHeads"] as? Int ?? 0)
+            } else {
+                expectedArch = .gemma4_26B_A4B
+            }
+            let manifest = try ManifestReader.load(directoryURL: directory, expecting: expectedArch)
             let expectedSource = "sha256:" + descriptor.sourceIndexSHA256
             guard manifest.sourceSnapshotHash == expectedSource else {
                 return .partial("installed checkpoint does not match \(descriptor.displayName)")

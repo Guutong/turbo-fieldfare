@@ -671,26 +671,32 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         let isQwen36Prefill = cfg.topology == .qwen36
         let layerViews = try (0..<cfg.numLayers).map { L in
             let isFull = cfg.layerKindMask[L] == 1
+            let isLinear = cfg.layerKindMask[L] == 2
             // Qwen36 has only input_layernorm + post_attention_layernorm;
             // alias the missing norms to postAttention so the prefill loop
             // doesn't crash — they're unused in the Qwen36 topology branch.
             let postAttnV = try model.postAttnNorm(layer: L)
+            // DeltaNet layers (linear) have no self_attn — alias to postAttnV.
+            let attnQ = isLinear ? postAttnV : (try model.qProj(layer: L))
+            let attnK = isLinear ? postAttnV : (try model.kProj(layer: L))
+            let attnV = isLinear ? postAttnV : (isFull ? attnK : (try model.vProj(layer: L)))
+            let attnO = isLinear ? postAttnV : (try model.oProj(layer: L))
             return LayerPrefillQKVViews(
                 inputNorm: try model.inputNorm(layer: L),
-                q: try model.qProj(layer: L),
-                k: try model.kProj(layer: L),
-                v: isFull ? (try model.kProj(layer: L)) : (try model.vProj(layer: L)),
-                o: try model.oProj(layer: L),
+                q: attnQ,
+                k: attnK,
+                v: attnV,
+                o: attnO,
                 postAttention: postAttnV,
                 preFFN: isQwen36Prefill ? postAttnV : (try model.preFFN(layer: L)),
                 preFFN2: isQwen36Prefill ? postAttnV : (try model.preFFN2(layer: L)),
                 postFFN2: isQwen36Prefill ? postAttnV : (try model.postFFN2(layer: L)),
                 postFFN: isQwen36Prefill ? postAttnV : (try model.postFFN(layer: L)),
                 layerScalar: isQwen36Prefill ? postAttnV : (try model.layerScalar(layer: L)),
-                qNorm: try model.qNorm(layer: L),
-                kNorm: try model.kNorm(layer: L),
+                qNorm: isLinear ? postAttnV : (try model.qNorm(layer: L)),
+                kNorm: isLinear ? postAttnV : (try model.kNorm(layer: L)),
                 router: try model.router(layer: L),
-                routerPerExpertScale: try model.routerPerExpertScale(layer: L))
+                routerPerExpertScale: isQwen36Prefill ? postAttnV : (try model.routerPerExpertScale(layer: L)))
         }
 
         let tokenIDs = tokens.map { UInt32(bitPattern: $0) }
@@ -1381,6 +1387,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
 
         for L in 0..<cfg.numLayers {
             let isFull = cfg.layerKindMask[L] == 1
+            let isLinear = cfg.layerKindMask[L] == 2
             let headDimL = isFull ? cfg.fullHeadDim : cfg.headDim
             // Qwen3.6 has numFullKVHeads=0 — full-attn layers reuse numKVHeads.
             let numKVL   = isFull ? max(cfg.numFullKVHeads, cfg.numKVHeads) : cfg.numKVHeads
@@ -1391,14 +1398,29 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             let seqLen   = UInt32(position + 1)
 
             let inNorm   = try model.inputNorm(layer: L)
-            let q        = try model.qProj(layer: L)
-            let k        = try model.kProj(layer: L)
-            // v_proj only exists on SWA layers; full layers reuse k_proj.
-            let vProj    = isFull ? k : (try model.vProj(layer: L))
-            let o        = try model.oProj(layer: L)
             let postAttn = try model.postAttnNorm(layer: L)
-            let qNorm    = try model.qNorm(layer: L)
-            let kNorm    = try model.kNorm(layer: L)
+            // DeltaNet layers have no self_attn — alias to postAttn as dummy.
+            // Attention closures are skipped at runtime (isLinear guard).
+            let q: TensorView
+            let k: TensorView
+            let vProj: TensorView
+            let o: TensorView
+            if isLinear {
+                q = postAttn; k = postAttn; vProj = postAttn; o = postAttn
+            } else {
+                q = try model.qProj(layer: L)
+                k = try model.kProj(layer: L)
+                vProj = isFull ? k : (try model.vProj(layer: L))
+                o = try model.oProj(layer: L)
+            }
+            let qNorm: TensorView
+            let kNorm: TensorView
+            if isLinear {
+                qNorm = postAttn; kNorm = postAttn
+            } else {
+                qNorm = try model.qNorm(layer: L)
+                kNorm = try model.kNorm(layer: L)
+            }
             let sharedProj = sharedExpertProjections[L]
             let routerW  = try model.router(layer: L)
             let isQwen36 = cfg.topology == .qwen36
@@ -1522,8 +1544,11 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             let gPostAttnSetup: (MTLCommandBuffer) -> Void = { [self] cb in
                 if isQwen36 {
                     // Pre-norm: raw residual + single pre-FFN norm.
-                    elementwiseAdd.encode(commandBuffer: cb,
-                                          a: hidden, b: oOut, count: D)
+                    // DeltaNet layers skip attention — no oOut to add.
+                    if !isLinear {
+                        elementwiseAdd.encode(commandBuffer: cb,
+                                              a: hidden, b: oOut, count: D)
+                    }
                     rms.encodeBF16W(commandBuffer: cb,
                                     x: hidden,
                                     weight: postAttn.buffer,
@@ -1563,10 +1588,12 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
 
             let cb = ctx.queue.makeCommandBuffer()!
             gInputNorm(cb)
-            gQKV(cb)
-            gQKVEpilogue(cb)
-            gAttention(cb)
-            gOProj(cb)
+            if !isLinear {
+                gQKV(cb)
+                gQKVEpilogue(cb)
+                gAttention(cb)
+                gOProj(cb)
+            }
             gPostAttnSetup(cb)
             gRouter(cb)
             cb.commit()
@@ -1699,7 +1726,6 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 gSharedFFN(sharedCB)
                 sharedCB.commit()
             }
-            sharedCB.commit()
             if let cb = phase1HitCB {
                 cb.commit()
             }

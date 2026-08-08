@@ -118,8 +118,10 @@ public final class KVCacheManager {
             let stride: Int
             let capacity: Int
             if isLinear {
-                stride = 0
-                capacity = 0
+                // DeltaNet layers carry no KV cache but kSlot/vSlot are called
+                // unconditionally — give them a minimal allocation to avoid div-by-zero.
+                stride = 32  // minimal: 1 × fp16 × padding
+                capacity = 1
             } else {
                 stride = isFull ? fullStride : swaStride
                 capacity = ringEnabled && !isFull ? swaCapacity : maxContext

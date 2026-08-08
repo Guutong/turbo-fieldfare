@@ -60,9 +60,25 @@ public func run(args: Args,
             return errored(stderr, "no Metal device", 1)
         }
         let context = try MetalContext()
+        // Auto-detect model family from manifest arch.
+        let manifestURL = modelURL.appendingPathComponent("manifest.json")
+        let manifestData = try Data(contentsOf: manifestURL)
+        let expectedArch: ArchConfig
+        if let root = try JSONSerialization.jsonObject(with: manifestData) as? [String: Any],
+           let arch = root["arch"] as? [String: Any] {
+            expectedArch = ArchConfig.detect(
+                hiddenSize: arch["hiddenSize"] as? Int ?? 0,
+                numLayers: arch["numLayers"] as? Int ?? 0,
+                numExperts: arch["numExperts"] as? Int ?? 0,
+                numKVHeads: arch["numKVHeads"] as? Int ?? 0,
+                numFullKVHeads: arch["numFullKVHeads"] as? Int ?? 0)
+        } else {
+            expectedArch = .gemma4_26B_A4B
+        }
         let model = try Model.load(
             directoryURL: modelURL,
             device: context.device,
+            expecting: expectedArch,
             streamingMode: .pread(slotCount: runtime.expertCacheSlots),
             expertCachePolicy: runtime.modelExpertCachePolicy,
             integrityPolicy: .fullSha256)
