@@ -178,6 +178,13 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     private let normed: MTLBuffer        // [D] FP16
     private let attnOut: MTLBuffer       // [N_HEADS * head_dim] FP16
     private let qScratch: MTLBuffer      // [N_HEADS * head_dim] FP16
+    /// Qwen3.6 gated attention: `q_proj` emits `[N_HEADS, 2 * head_dim]` —
+    /// per head the first `head_dim` lanes are the query and the second are the
+    /// output gate. `qRawScratch` takes the full 2x projection, which is then
+    /// de-interleaved into `qScratch` (query) and `qGateScratch` (gate).
+    /// Unused (and zero-length) for topologies without gated attention.
+    private let qRawScratch: MTLBuffer
+    private let qGateScratch: MTLBuffer
     private let kStage: MTLBuffer        // [max KV heads * head_dim] FP16, current token
     private let vStage: MTLBuffer        // [max KV heads * head_dim] FP16, current token
     private let oOut: MTLBuffer          // [D] FP16
@@ -214,6 +221,16 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     /// Dummy all-ones per_expert_scale for Qwen3.6 (Gemma uses real tensor).
     private let dummyPerExpertScale: MTLBuffer?
     private let sharedExpertProjections: [LayerSharedExpertProjections]
+
+    // P3-4: plain-Swift-fp32 DeltaNet (ADR-0001) for Qwen3.6's 30 linear
+    // layers. nil for topologies with no DeltaNet layers (e.g. Gemma).
+    private let deltaNetDims: DeltaNetDimensions?
+    private let deltaNetWeights: DeltaNetCPUBlock.WeightsCache?
+    private let deltaNetState: DeltaNetStateStore?
+
+    /// Qwen3.6's per-token sigmoid gate on the shared expert. nil for Gemma,
+    /// which has no `mlp.shared_expert_gate`.
+    private var sharedExpertGate: SharedExpertGateWeights?
 
     public let maxContext: Int
 
@@ -303,6 +320,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         self.normed        = try buf(D)
         self.attnOut       = try buf(maxQ)
         self.qScratch      = try buf(maxQ)
+        self.qRawScratch   = try buf(cfg.topology == .qwen36 ? 2 * maxQ : 0)
+        self.qGateScratch  = try buf(cfg.topology == .qwen36 ? maxQ : 0)
         self.kStage        = try buf(max(cfg.numKVHeads * cfg.headDim,
                                          cfg.numFullKVHeads * cfg.fullHeadDim))
         self.vStage        = try buf(max(cfg.numKVHeads * cfg.headDim,
@@ -441,10 +460,56 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             perLayer.append(buf)
         }
         self.effectiveScaleBuffers = perLayer
+
+        if cfg.topology == .qwen36 {
+            let dims = DeltaNetDimensions.qwen36_35B_A3B
+            let layerKindMask = cfg.layerKindMask
+            let isLinearLayer = (0..<cfg.numLayers).map { layerKindMask[$0] == 2 }
+            self.deltaNetDims = dims
+            self.deltaNetWeights = DeltaNetCPUBlock.WeightsCache(model: model, hiddenSize: D, dims: dims)
+            self.deltaNetState = DeltaNetStateStore(numLayers: cfg.numLayers, dims: dims,
+                                                     isLinearLayer: isLinearLayer)
+            self.sharedExpertGate = SharedExpertGateWeights(model: model, hiddenSize: Int(D))
+        } else {
+            self.deltaNetDims = nil
+            self.deltaNetWeights = nil
+            self.deltaNetState = nil
+            self.sharedExpertGate = nil
+        }
+    }
+
+    /// Splits `qRawScratch`'s `[numHeads, 2 * headDim]` gated q_proj output into
+    /// `qScratch` (query, first half of each head) and `qGateScratch` (output
+    /// gate, second half) — the layout `mx.split(..., 2, axis=-1)` produces in
+    /// `Qwen3NextAttention`.
+    private func splitGatedQProjection(qDim: Int, headDim: Int) {
+        let raw = qRawScratch.contents().assumingMemoryBound(to: Float16.self)
+        let q = qScratch.contents().assumingMemoryBound(to: Float16.self)
+        let gate = qGateScratch.contents().assumingMemoryBound(to: Float16.self)
+        let heads = qDim / headDim
+        for h in 0..<heads {
+            let src = h * 2 * headDim
+            let dst = h * headDim
+            for j in 0..<headDim {
+                q[dst + j] = raw[src + j]
+                gate[dst + j] = raw[src + headDim + j]
+            }
+        }
+    }
+
+    /// `attnOut *= sigmoid(gate)`, applied before o_proj.
+    private func applyAttentionOutputGate(qDim: Int) {
+        let out = attnOut.contents().assumingMemoryBound(to: Float16.self)
+        let gate = qGateScratch.contents().assumingMemoryBound(to: Float16.self)
+        for i in 0..<qDim {
+            let g = 1 / (1 + exp(-Float(gate[i])))
+            out[i] = Float16(Float(out[i]) * g)
+        }
     }
 
     public func reset() {
         kv?.reset()
+        deltaNetState?.reset()
         resetTransientState()
     }
 
@@ -762,7 +827,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         }
         let D = cfg.hiddenSize
         let eps: Float = 1e-6
-        let sqrtHidden = Float(D).squareRoot()
+        // Gemma scales the embedding by sqrt(hidden_size); Qwen3.6 does not.
+        let sqrtHidden = cfg.topology == .qwen36 ? 1 : Float(D).squareRoot()
         let t = tokens.count
         let emb = model.embedding
 
@@ -1390,7 +1456,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         let D    = UInt32(cfg.hiddenSize)
         let FmoE = UInt32(cfg.moeIntermediateSize)
         let eps: Float = 1e-6
-        let sqrtHidden = Float(cfg.hiddenSize).squareRoot()
+        // Gemma scales the embedding by sqrt(hidden_size); Qwen3.6 does not.
+        let sqrtHidden = cfg.topology == .qwen36
+            ? 1 : Float(cfg.hiddenSize).squareRoot()
         struct PendingRoutedCommand {
             let cb: MTLCommandBuffer
             let sharedCB: MTLCommandBuffer?
@@ -1465,7 +1533,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             } else {
                 q = try model.qProj(layer: L)
                 k = try model.kProj(layer: L)
-                vProj = isFull ? k : (try model.vProj(layer: L))
+                // Gemma's full-attention layers reuse k_proj as v_proj
+                // (`attentionKEqV`); Qwen3.6 has a real v_proj on every layer.
+                vProj = (isFull && cfg.attentionKEqV) ? k : (try model.vProj(layer: L))
                 o = try model.oProj(layer: L)
             }
             let qNorm: TensorView
@@ -1479,6 +1549,10 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             let sharedProj = sharedExpertProjections[L]
             let routerW  = try model.router(layer: L)
             let isQwen36 = cfg.topology == .qwen36
+            // Qwen3.6's full-attention layers use Qwen3-Next gated attention:
+            // q_proj emits query AND a per-head output gate, and the attention
+            // result is scaled by sigmoid(gate) before o_proj.
+            let isGatedAttn = isQwen36 && isFull
             // Gemma-only tensors — Qwen3.6 pre-norm skips these.
             let preFFN   = isQwen36 ? postAttn : (try model.preFFN(layer: L))
             let preFFN2  = isQwen36 ? postAttn : (try model.preFFN2(layer: L))
@@ -1523,10 +1597,10 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                     vScales: vProj.buffer, vScalesOffset: Int(vProj.scaleOffset),
                                     vBiases: vProj.buffer, vBiasesOffset: Int(vProj.biasOffset),
                                     x: normed,
-                                    qOut: qScratch,
+                                    qOut: isGatedAttn ? qRawScratch : qScratch,
                                     kOut: kSlot.buffer, kOutOffset: kSlot.offset,
                                     vOut: vSlot.buffer, vOutOffset: vSlot.offset,
-                                    qRows: qDim,
+                                    qRows: isGatedAttn ? 2 * qDim : qDim,
                                     kvRows: kvDim,
                                     n: D)
             }
@@ -1551,7 +1625,10 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                         position: UInt32(position),
                                         theta: isFull ? Float(cfg.fullRopeTheta) : Float(cfg.ropeTheta),
                                         rotatedPairs: rotated,
-                                        eps: eps)
+                                        eps: eps,
+                                        ropePairStride: isQwen36 ? rotated : nil,
+                                        ropeFreqDim: isQwen36 ? 2 * rotated : nil,
+                                        normalizeV: !isQwen36)
             }
 
             let gAttention: (MTLCommandBuffer) -> Void = { [self] cb in
@@ -1568,7 +1645,10 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                          numQHeads: UInt32(cfg.numHeads),
                                          numKVHeads: UInt32(numKVL),
                                          seqLen: seqLen,
-                                         scale: 1.0)
+                                         // Gemma folds 1/sqrt(head_dim) into
+                                         // its q_norm weights; Qwen3.6 does not.
+                                         scale: isQwen36
+                                             ? 1 / Float(headDimL).squareRoot() : 1.0)
                 } else {
                     let ringCapacity = kv?.ringCapacity(layer: L) ?? 0
                     let activeRingCapacity = ringCapacity > 0 && Int(seqLen) > ringCapacity
@@ -1641,12 +1721,66 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     numExperts: UInt32(cfg.numExperts), d: D, topK: UInt32(cfg.topKExperts))
             }
 
-            let cb = ctx.queue.makeCommandBuffer()!
-            gInputNorm(cb)
+            if isLinear {
+                // P3-4: real plain-Swift-fp32 DeltaNet (ADR-0001), replacing
+                // the P3-3b identity passthrough. `hidden` is FP16-backed
+                // shared-storage Metal memory; safe to read/write directly
+                // from the CPU here ONLY once any still-in-flight routed-MoE
+                // tail from the PREVIOUS layer (which writes `hidden`
+                // asynchronously via `pendingRoutedCommand`, deliberately
+                // left un-waited for pipelining) has actually completed —
+                // the ordinary per-layer `waitUntilCompleted(cb)` below is
+                // NOT sufficient by itself, since that only covers the
+                // current layer's own norm/attention/router command buffer,
+                // not the previous layer's deferred MoE combine.
+                if let pending = pendingRoutedCommand {
+                    try finishPendingRoutedCommand(pending, waitIfNeeded: true)
+                    pendingRoutedCommand = nil
+                }
+                guard let dims = deltaNetDims, let weightsCache = deltaNetWeights,
+                      let stateStore = deltaNetState else {
+                    preconditionFailure("qwen36 topology requires DeltaNet state/weights")
+                }
+                let ptr = hidden.contents().assumingMemoryBound(to: Float16.self)
+                var x = [Float](repeating: 0, count: Int(D))
+                for i in 0..<Int(D) { x[i] = Float(ptr[i]) }
+
+                let layerWeights = try weightsCache.weights(layer: L)
+                let deltaOut = DeltaNetCPUBlock.forward(
+                    x: x, weights: layerWeights, dims: dims,
+                    convState: &stateStore.convState[L],
+                    recurrentState: &stateStore.recurrentState[L])
+
+                for i in 0..<Int(D) { ptr[i] = Float16(x[i] + deltaOut[i]) }
+            }
+
+            var cb = ctx.queue.makeCommandBuffer()!
             if !isLinear {
+                gInputNorm(cb)
                 gQKV(cb)
-                gQKVEpilogue(cb)
-                gAttention(cb)
+                if isGatedAttn {
+                    // De-interleaving the per-head [query | gate] halves and
+                    // applying sigmoid(gate) are CPU steps (ADR-0001: plain and
+                    // obviously correct), so the layer's attention work splits
+                    // into three command buffers instead of one.
+                    cb.commit()
+                    waitUntilCompleted(cb)
+                    try checkCommandBufferError(cb.error)
+                    splitGatedQProjection(qDim: Int(qDim), headDim: headDimL)
+
+                    cb = ctx.queue.makeCommandBuffer()!
+                    gQKVEpilogue(cb)
+                    gAttention(cb)
+                    cb.commit()
+                    waitUntilCompleted(cb)
+                    try checkCommandBufferError(cb.error)
+                    applyAttentionOutputGate(qDim: Int(qDim))
+
+                    cb = ctx.queue.makeCommandBuffer()!
+                } else {
+                    gQKVEpilogue(cb)
+                    gAttention(cb)
+                }
                 gOProj(cb)
             }
             gPostAttnSetup(cb)
@@ -1780,6 +1914,23 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 sharedCB = ctx.queue.makeCommandBuffer()!
                 gSharedFFN(sharedCB)
                 sharedCB.commit()
+                // Qwen3.5-MoE gates the shared expert by a per-token scalar
+                // sigmoid(shared_expert_gate . denseX) that Gemma has no
+                // analogue for. Applied on the CPU (ADR-0001) once the shared
+                // FFN has landed in h1Buf and before the routed CB's gTail
+                // folds h1Buf into the residual. denseX was written by
+                // gPostAttnSetup in `cb`, already waited on above.
+                if var gateWeights = sharedExpertGate {
+                    let w = try gateWeights.weight(layer: L)
+                    sharedExpertGate = gateWeights  // persist the weight cache
+                    let dx = denseX.contents().assumingMemoryBound(to: Float16.self)
+                    let gate = SharedExpertGateWeights.gateValue(
+                        weight: w, x: dx, count: Int(D))
+                    waitUntilCompleted(sharedCB)
+                    try checkCommandBufferError(sharedCB.error)
+                    let h1 = h1Buf.contents().assumingMemoryBound(to: Float16.self)
+                    for i in 0..<Int(D) { h1[i] = Float16(Float(h1[i]) * gate) }
+                }
             }
             if let cb = phase1HitCB {
                 cb.commit()
@@ -1897,7 +2048,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         // The fused head skips the vocab buffer and leaves a greedy token in
         // greedyTokenBuf; the logits path writes the complete vector.
         let fNorm = model.finalNorm
-        let lm    = model.embedding
+        let lm    = model.lmHead
         let gFinalNorm: (MTLCommandBuffer) -> Void = { cb in
             self.rms.encodeBF16W(commandBuffer: cb, x: self.hidden,
                                  weight: fNorm.buffer, weightOffset: Int(fNorm.offset),

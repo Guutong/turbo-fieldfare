@@ -33,6 +33,10 @@ public struct GFTokenizer: @unchecked Sendable {
     public static let toolChatTemplateIdentity = "gemma4-it-tools-jinja-v1"
 
     public let bosID: Int32
+    /// Whether this vocabulary has a real beginning-of-sequence token.
+    /// Gemma does (`<bos>`); Qwen3.6 does not — its `bosID` is the chat marker
+    /// `<|im_start|>`, which must never be prepended to a raw completion prompt.
+    public let hasBOS: Bool
     public let eosID: Int32
     public let padID: Int32
     public let endOfTurnID: Int32
@@ -135,6 +139,7 @@ public struct GFTokenizer: @unchecked Sendable {
         let channelEnd = tokenizer.convertTokenToId("<channel|>") ?? 0
 
         self.bosID = Int32(bos)
+        self.hasBOS = !isQwenVocab
         self.eosID = Int32(eos)
         self.padID = Int32(pad)
         self.endOfTurnID = Int32(eot)
@@ -148,7 +153,8 @@ public struct GFTokenizer: @unchecked Sendable {
         self.vocabSize = 262_144
     }
 
-    /// Encode UTF-8 text to token IDs. `addBOS = true` prepends `<bos>`.
+    /// Encode UTF-8 text to token IDs. `addBOS = true` prepends `<bos>` — but
+    /// only for vocabularies that actually have one (see `hasBOS`).
     ///
     /// The library's `addSpecialTokens: true` flag is a no-op for the Gemma 4 IT
     /// tokenizer (its config has `add_bos_token = false`; BOS is expected to come
@@ -156,7 +162,7 @@ public struct GFTokenizer: @unchecked Sendable {
     /// the same regardless of upstream defaults.
     public func encode(_ text: String, addBOS: Bool = true) -> [Int32] {
         let base = tokenizer.encode(text: text, addSpecialTokens: false).map(Int32.init)
-        return addBOS ? [bosID] + base : base
+        return (addBOS && hasBOS) ? [bosID] + base : base
     }
 
     /// Decode token IDs to text. `skipSpecialTokens` strips BOS/EOS/turn markers from the output.

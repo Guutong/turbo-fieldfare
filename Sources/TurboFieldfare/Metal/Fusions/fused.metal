@@ -96,6 +96,12 @@ void fused_qkv_epilogue(
     constant     float&  theta_base     [[buffer(9)]],
     constant     uint&   rotated_pairs  [[buffer(10)]],
     constant     float&  rms_eps        [[buffer(11)]],
+    // NeoX pairing stride and frequency denominator. Gemma passes
+    // (head_dim/2, head_dim) — full-width NeoX. Qwen3.6's partial rotary
+    // rotates only the leading `2*rotated_pairs` lanes, pairing i with
+    // i + rotated_pairs and using 2*rotated_pairs as the exponent base.
+    constant     uint&   rope_pair_stride [[buffer(12)]],
+    constant     uint&   rope_freq_dim    [[buffer(13)]],
     uint  lid              [[thread_position_in_threadgroup]],
     uint  lsize            [[threads_per_threadgroup]],
     uint  simd_lane_id     [[thread_index_in_simdgroup]],
@@ -160,15 +166,18 @@ void fused_qkv_epilogue(
         return;
     }
 
-    const uint half_dim = HD / 2u;
-    for (uint pair = lid; pair < half_dim; pair += lsize) {
+    const uint stride = rope_pair_stride;
+    const uint freq_dim = rope_freq_dim;
+    for (uint i = lid; i < HD; i += lsize) {
+        dst[i] = head_tg[i];
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    for (uint pair = lid; pair < RP; pair += lsize) {
         float x0 = float(head_tg[pair]);
-        float x1 = float(head_tg[half_dim + pair]);
-        if (pair < RP) {
-            fused_rope_neox_pair(x0, x1, pair, HD, float(position), theta_base);
-        }
+        float x1 = float(head_tg[stride + pair]);
+        fused_rope_neox_pair(x0, x1, pair, freq_dim, float(position), theta_base);
         dst[pair] = half(x0);
-        dst[half_dim + pair] = half(x1);
+        dst[stride + pair] = half(x1);
     }
 }
 

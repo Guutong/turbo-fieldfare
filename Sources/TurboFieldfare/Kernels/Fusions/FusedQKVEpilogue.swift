@@ -56,7 +56,16 @@ final class FusedQKVEpilogue {
                        position: UInt32,
                        theta: Float,
                        rotatedPairs: UInt32,
-                       eps: Float) {
+                       eps: Float,
+                       // Gemma: full-width NeoX pairing (i, i + headDim/2) with
+                       // headDim as the frequency denominator. Qwen3.6's partial
+                       // rotary pairs (i, i + rotatedPairs) over 2*rotatedPairs
+                       // lanes. Defaults preserve the Gemma behaviour.
+                       ropePairStride: UInt32? = nil,
+                       ropeFreqDim: UInt32? = nil,
+                       // Gemma applies a no-scale per-head RMSNorm to V;
+                       // Qwen3.6 uses raw V.
+                       normalizeV: Bool = true) {
         precondition(headDim <= 512,
                      "headDim > 512 exceeds the fused QKV epilogue scratch")
         precondition(rotatedPairs * 2 <= headDim,
@@ -86,9 +95,13 @@ final class FusedQKVEpilogue {
         enc.setBytes(&thetaVar,   length: MemoryLayout<Float>.size,  index: 9)
         enc.setBytes(&rotatedVar, length: MemoryLayout<UInt32>.size, index: 10)
         enc.setBytes(&epsVar,     length: MemoryLayout<Float>.size,  index: 11)
+        var strideVar = ropePairStride ?? (headDim / 2)
+        var freqDimVar = ropeFreqDim ?? headDim
+        enc.setBytes(&strideVar,  length: MemoryLayout<UInt32>.size, index: 12)
+        enc.setBytes(&freqDimVar, length: MemoryLayout<UInt32>.size, index: 13)
 
         let threads = min(Int(pso.maxTotalThreadsPerThreadgroup), 256)
-        let groups = Int(numQHeads + 2 * numKVHeads)
+        let groups = Int(numQHeads + (normalizeV ? 2 : 1) * numKVHeads)
         enc.dispatchThreadgroups(MTLSize(width: groups, height: 1, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: threads, height: 1, depth: 1))
         enc.endEncoding()
