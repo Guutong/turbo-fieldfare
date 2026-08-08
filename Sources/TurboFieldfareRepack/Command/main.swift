@@ -4,6 +4,7 @@ import TurboFieldfareRepackCore
 private let usage = """
 Usage:
   TurboFieldfareRepack --output <model.gturbo> [--overwrite] [--resume]
+  TurboFieldfareRepack --output <model.gturbo> --local <snapshot_dir>
   TurboFieldfareRepack --discard-partial --output <model.gturbo>
   TurboFieldfareRepack --verify-install --input-gturbo <model.gturbo>
   TurboFieldfareRepack --help
@@ -12,6 +13,7 @@ The installer streams the supported Gemma 4 checkpoint from Hugging Face and
 repackages it without materializing the source checkpoint on disk. Set HF_TOKEN
 only if Hugging Face requests authentication. A cancelled or interrupted
 download can be continued with --resume or removed with --discard-partial.
+Use --local <snapshot_dir> to repack a checkpoint already on disk.
 """
 
 private struct Arguments {
@@ -21,6 +23,7 @@ private struct Arguments {
     var discardPartial = false
     var verifyInstall = false
     var inputGTurbo: String?
+    var localSnapshotDir: String?
 
     static func parse(_ values: [String]) throws -> Arguments {
         var parsed = Arguments()
@@ -42,6 +45,12 @@ private struct Arguments {
             case "--verify-install":
                 parsed.verifyInstall = true
                 index += 1
+            case "--local":
+                guard index + 1 < values.count else {
+                    throw ParseError.missingValue(flag)
+                }
+                parsed.localSnapshotDir = values[index + 1]
+                index += 2
             case "--output", "--input-gturbo":
                 guard index + 1 < values.count else {
                     throw ParseError.missingValue(flag)
@@ -59,6 +68,9 @@ private struct Arguments {
 
         guard !(parsed.resume && parsed.discardPartial) else {
             throw ParseError.invalidMode("--resume and --discard-partial are mutually exclusive")
+        }
+        guard !(parsed.resume && parsed.localSnapshotDir != nil) else {
+            throw ParseError.invalidMode("--resume and --local are mutually exclusive")
         }
         if parsed.discardPartial {
             guard parsed.output != nil else {
@@ -147,6 +159,21 @@ private func run(_ values: [String]) async -> Int32 {
     }
 
     guard let output = arguments.output else { return 2 }
+    if let localDir = arguments.localSnapshotDir {
+        do {
+            let result = try LocalRepacker.repack(
+                snapshotDir: localDir,
+                outputDirectory: output,
+                overwrite: arguments.overwrite)
+            print("Installed \(result.displayName)")
+            print("Source revision: \(result.resolvedCommit)")
+            print("Model: \(result.outputDir)")
+            return 0
+        } catch {
+            printError("install failed: \(error)")
+            return 1
+        }
+    }
     let options = SupportedModelSource.installOptions(
         outputDirectory: URL(fileURLWithPath: output),
         overwrite: arguments.overwrite,

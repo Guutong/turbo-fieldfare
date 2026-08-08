@@ -195,11 +195,14 @@ package enum GTurboManifestCodec {
                 field: "manifest.arch", reason: "dimensions disagree with streaming metadata")
         }
         let arch = manifest.arch
+        // numFullKVHeads and slidingWindow are 0 for architectures with no
+        // separate full/sliding attention split (e.g. Qwen3.6, which mixes
+        // full_attention with linear_attention rather than sliding_attention).
         guard arch.hiddenSize > 0, arch.ffnIntermediate > 0,
               arch.moeIntermediateSize > 0, arch.numHeads > 0,
-              arch.numKVHeads > 0, arch.numFullKVHeads > 0,
+              arch.numKVHeads > 0, arch.numFullKVHeads >= 0,
               arch.headDim > 0, arch.fullHeadDim > 0,
-              arch.vocabSize > 0, arch.slidingWindow > 0,
+              arch.vocabSize > 0, arch.slidingWindow >= 0,
               arch.topKExperts > 0, arch.topKExperts <= arch.numExperts,
               arch.finalLogitSoftcap.isFinite,
               arch.ropeTheta.isFinite, arch.ropeTheta > 0,

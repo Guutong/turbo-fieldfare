@@ -56,9 +56,13 @@ struct ArchInfo: Sendable, Equatable {
             default: return UInt8(0)
             }
         }
+        // Gemma nests per-layer-kind rope params under full_attention/sliding_attention
+        // sub-keys; Qwen3.6's rope_parameters is flat (single rope_theta for the whole
+        // model, since it has no sliding-attention layers). Fall back to the flat dict
+        // itself when the nested sub-keys are absent.
         let rope = (tc["rope_parameters"] as? [String: Any]) ?? [:]
-        let ropeFull = (rope["full_attention"] as? [String: Any]) ?? [:]
-        let ropeSWA  = (rope["sliding_attention"] as? [String: Any]) ?? [:]
+        let ropeFull = (rope["full_attention"] as? [String: Any]) ?? rope
+        let ropeSWA  = (rope["sliding_attention"] as? [String: Any]) ?? rope
         let prf = (ropeFull["partial_rotary_factor"] as? Double)
             ?? (ropeFull["partial_rotary_factor"] as? NSNumber)?.doubleValue ?? 0.25
         let fullTheta = (ropeFull["rope_theta"] as? Double)
@@ -67,25 +71,32 @@ struct ArchInfo: Sendable, Equatable {
             ?? (ropeSWA["rope_theta"] as? NSNumber)?.doubleValue ?? 10_000.0
         let kEqV = (tc["attention_k_eq_v"] as? Bool) ?? false
         let tie = (tc["tie_word_embeddings"] as? Bool) ?? false
-        let act = (tc["hidden_activation"] as? String) ?? "gelu_pytorch_tanh"
+        let act = (tc["hidden_act"] as? String) ?? (tc["hidden_activation"] as? String) ?? "gelu_pytorch_tanh"
+        let headDim = try i("head_dim")
         return ArchInfo(
             hiddenSize: try i("hidden_size"),
-            intermediateSize: try i("intermediate_size"),
+            // "shared expert FFN" size: Gemma uses intermediate_size; Qwen3.6 has no
+            // shared-mlp dense layer, only a shared *expert* sized by
+            // shared_expert_intermediate_size (moe_intermediate_size is the per-routed-
+            // expert size — a different field that is coincidentally equal here).
+            intermediateSize: (try? i("intermediate_size"))
+                ?? (try? i("shared_expert_intermediate_size"))
+                ?? (try? i("moe_intermediate_size")) ?? 0,
             moeIntermediateSize: try i("moe_intermediate_size"),
             numHeads: try i("num_attention_heads"),
             numKVHeads: try i("num_key_value_heads"),
-            numFullKVHeads: try i("num_global_key_value_heads"),
-            headDim: try i("head_dim"),
-            fullHeadDim: try i("global_head_dim"),
+            numFullKVHeads: (try? i("num_global_key_value_heads")) ?? 0,
+            headDim: headDim,
+            fullHeadDim: (try? i("global_head_dim")) ?? headDim,
             vocabSize: try i("vocab_size"),
             slidingWindow: (tc["sliding_window"] as? Int) ?? (tc["sliding_window"] as? NSNumber)?.intValue ?? 0,
-            finalLogitSoftcap: try d("final_logit_softcapping"),
+            finalLogitSoftcap: (try? d("final_logit_softcapping")) ?? 0.0,
             ropeTheta: swaTheta,
             fullRopeTheta: fullTheta,
             partialRotaryFactor: prf,
             numLayers: try i("num_hidden_layers"),
             numExperts: try i("num_experts"),
-            topKExperts: try i("top_k_experts"),
+            topKExperts: (try? i("top_k_experts")) ?? (try? i("num_experts_per_tok")) ?? 1,
             tieWordEmbeddings: tie,
             attentionKEqV: kEqV,
             fullAttentionLayerMask: mask,

@@ -79,9 +79,9 @@ smaller tasks in `plan.md`, add them to the board with new IDs, and stop with
 | P1-5 | Manifest: three-way layer kind | DONE | additive layerKindMask field, fixture regenerated (2219→2258B) |
 | P1-6 | Repack: split fused gate_up_proj | DONE | synthetic gate_proj/up_proj from fused gate_up_proj, 648 tests pass |
 | P1-7 | Repack: filter vision tensors | DONE | model.visual. prefix added to isMultimodalTensorName |
-| P1-8 | Expert layout at 10,240 entries | DONE | no-op: UInt64 offsets + Int counts, no explicit limits |
-| P1-9 | Quant group size accepted | TODO | |
-| P1-10 | Produce qwen36.gturbo | TODO | needs ~20GB free |
+| P1-8 | Expert layout at 10,240 entries | DONE | UInt64 offsets/Int counts don't overflow, but see P1-10: the *serialized* layout.json did hit a 16MB byte cap — raised to 64MB |
+| P1-9 | Quant group size accepted | DONE | no-op: groupSize > 0 only, IndexLoader reads from config.json |
+| P1-10 | Produce qwen36.gturbo | DONE | see history — required real bug fixes, not just a run |
 | P2-1 | silu activation | TODO | |
 | P2-2 | Pre-norm topology (decode AND prefill) | TODO | prefill half is a known trap |
 | P2-3 | Router scoring variant | TODO | no-op if plain softmax |
@@ -208,7 +208,81 @@ Did:      No-op — no modelType switch exists in ArchInfo.swift. Model identifi
 Ran:      swift test --filter ArchInfo -> no matching tests (expected, no switch exists)
 Learned:  ArchInfo.swift has no model type discrimination. It just loads config values into ArchInfo struct. The runtime identifies models by comparing ArchInfo values against known ArchConfig entries.
 Unproven: nothing for this task
-Next:     P1-9
+Next:     P1-10
+
+### 2026-08-08 — P1-10 — TODO -> DONE
+Did:      Added `--local <snapshot_dir>` to the CLI (`LocalRepacker.swift`) to repack a
+          checkpoint already on disk, since the 35B/4bit model only exists on `javis`
+          and can't be downloaded again through the HF streaming path there. Ran it
+          against the real `unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit` snapshot on `javis` —
+          this immediately surfaced five real bugs that synthetic-fixture tests had been
+          silently signing off on:
+          1. `ArchInfo.load`'s `rope_parameters` parsing assumed Gemma's nested
+             `{full_attention: {...}, sliding_attention: {...}}` shape. Qwen3.6's is
+             flat (`{rope_theta: 10000000, partial_rotary_factor: 0.25, ...}`), so both
+             `ropeFull`/`ropeSWA` silently fell through to hardcoded defaults —
+             `fullRopeTheta` would have been baked into the manifest as 1,000,000
+             instead of the real 10,000,000, which `RealForwardRunner.swift:846`
+             actually uses for the 10 real full-attention layers. Fixed by falling back
+             to the flat dict itself when the nested sub-keys are absent.
+          2. `hidden_act` (real key, value `"silu"`) was being read as
+             `hidden_activation` (doesn't exist for this checkpoint), always silently
+             defaulting to `"gelu_pytorch_tanh"`. Not yet load-bearing (P2-1 hasn't
+             wired activation selection into the runtime yet) but wrong in the manifest.
+          3. `intermediateSize` ("shared expert FFN" per its own doc comment) fell back
+             to `moe_intermediate_size` (per-*routed*-expert size) when `intermediate_size`
+             was absent — numerically right by coincidence here (both 512) but the wrong
+             field; fixed to prefer `shared_expert_intermediate_size`.
+          4. `RepackPlanner.routedExpertRole` only matched Gemma's
+             `.experts.switch_glu.{gate,up,down}_proj` tensor names. Qwen3.6's real
+             on-disk tensor names are `.switch_mlp.{gate,up,down}_proj.weight` (already
+             split, not fused — P1-6's `splitFusedGateUpProj` was solving a problem this
+             checkpoint doesn't have). With no match, every layer got
+             `expertsPerLayer: 0` and `expertStride` came out `0`, tripping the "invalid
+             dimensions or stride" layout validator. Fixed by matching either pattern.
+          5. `LocalRepacker.swift`'s safetensors header parsing loaded each ~5GB shard
+             entirely into memory and guessed the header/binary boundary by scanning for
+             byte values (`0x00`, `}`) — wrong on real multi-tensor headers (stops at the
+             first tensor's closing brace, not the header's). Fixed to read the correct
+             8-byte little-endian length prefix and read exactly that many bytes, mirroring
+             `RemoteSnapshotLoader.swift`'s proven approach.
+          Also found and fixed: `packed_experts/layout.json`'s 16MB read cap
+          (`VerifiedInstallTool.swift`, `GTurboLayoutValidator.swift`, and — this one
+          matters, it's in the actual runtime loader — `PackedExpertsLayout.swift`) is
+          too small for Qwen3.6's scale (256 experts x 40 layers = 22.5MB real file).
+          P1-8's "no explicit limits" conclusion only checked integer overflow, not this
+          byte-size cap. Raised to a shared `GTurboFormatV1.layoutMaxBytes = 64MB`
+          constant used by all three sites instead of three independent literals.
+          Also: `LocalRepacker.swift` was copying the raw source `.safetensors` shards
+          into the output directory — nothing in `Sources/TurboFieldfare` (the runtime)
+          ever reads a `.safetensors` file, so this just wasted ~20GB and made
+          `--verify-install`'s unexpected-entries check unhappy. Removed. Also switched
+          from placeholder all-zero SHA-256 hashes to real ones via `WriterCore.hashEntireFile`
+          (`--verify-install` re-hashes every declared file, so placeholders would have
+          failed verification the moment hashing was reached).
+Ran:      On `javis` (has the checkpoint, 166GB free): `swift build` clean, `swift test`
+          648/648 pass (both machines, at every step below). Then, iterating on the five
+          bugs above one at a time:
+          `./.build/.../TurboFieldfareRepack --output /tmp/qwen36_gturbo_out --local
+          ~/.omlx/models/unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit` → succeeded, "Installed
+          Qwen3.6-35B-A3B-4bit". Then `--verify-install --input-gturbo
+          /tmp/qwen36_gturbo_out` → "Verified 43 files (20764181264 bytes)". Manually
+          diffed `manifest.json`'s `arch` block against the real `config.json` on
+          `javis` field by field: hiddenSize=2048, numHeads=16, numKVHeads=2,
+          headDim=256, vocabSize=248320, numExperts=256, topKExperts=8,
+          moeIntermediateSize=512, numLayers=40, fullRopeTheta=10000000,
+          partialRotaryFactor=0.25, hiddenActivation=silu — all match.
+Learned:  Never trust a "DONE" from a synthetic fixture that was written to match the
+          code instead of a real checkpoint (`SyntheticSnapshot.swift`'s `rope_parameters`
+          and expert-tensor names both encoded the same Gemma-only assumptions the real
+          code had — the tests could never have caught any of bugs 1-4). P1-1 and P1-6's
+          "DONE" marks were real progress but not actually checkpoint-verified; this
+          entry is the first task in the whole board that ran against real weights, and
+          it's why the board's own doctrine says a command must prove DONE.
+Unproven: The produced `qwen36.gturbo` has never been loaded by the actual runtime
+          (`TurboFieldfareMac`/CLI) — P2-1 onward is what will first exercise inference
+          against it. `/tmp/qwen36_gturbo_out` on `javis` is scratch, not committed.
+Next:     P2-1
 
 ### 2026-08-08 — P0-1 — TODO -> DOING
 Did:      Fetched `mlx_lm/models/qwen3_5_moe.py` and `mlx_lm/models/qwen3_next.py` from ml-explore/mlx-lm. Found router scoring in `Qwen3NextSparseMoeBlock.__call__`.

@@ -122,7 +122,9 @@ enum RepackPlanner {
     }
 
     private static func routedExpertRole(in name: String) -> String? {
-        guard name.contains(".experts.switch_glu.") else { return nil }
+        // Gemma: "...experts.switch_glu.{gate,up,down}_proj...".
+        // Qwen3.6: "...switch_mlp.{gate,up,down}_proj..." (no "experts." segment).
+        guard name.contains(".experts.switch_glu.") || name.contains(".switch_mlp.") else { return nil }
         if name.contains(".gate_proj.") { return "gate" }
         if name.contains(".up_proj.")   { return "up" }
         if name.contains(".down_proj.") { return "down" }

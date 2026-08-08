@@ -8,6 +8,9 @@ package enum GTurboFormatV1 {
     package static let residentHeaderBytes = 24
     package static let residentEntryBytes = 72
     package static let residentIndexMaxBytes: UInt64 = 16 * 1024 * 1024
+    /// packed_experts/layout.json can be large for architectures with many
+    /// experts per layer (e.g. Qwen3.6: 256 experts x 40 layers is ~22 MB).
+    package static let layoutMaxBytes: UInt64 = 64 * 1024 * 1024
 
     package static let knownFlags: Set<String> = [
         "streamingPresent", "turboQuantKV", "aneSharedExpert",
