@@ -170,6 +170,41 @@ public struct Model {
         try resident(name: "language_model.model.layers.\(L).self_attn.k_norm.weight")
     }
 
+    // MARK: - DeltaNet (linear_attn) tensors
+    //
+    // Qwen3.6 DeltaNet layers replace `self_attn` with a gated linear-
+    // attention block: fused QKV + z + a + b input projections (affine INT4),
+    // causal depthwise conv1d, per-head RMSNorm weight, decay parameter
+    // `A_log` and `dt_bias` (all BF16), and the INT4 output projection.
+
+    public func deltaQKVProj(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).linear_attn.in_proj_qkv.weight")
+    }
+    public func deltaZProj(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).linear_attn.in_proj_z.weight")
+    }
+    public func deltaAProj(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).linear_attn.in_proj_a.weight")
+    }
+    public func deltaBProj(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).linear_attn.in_proj_b.weight")
+    }
+    public func deltaOutProj(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).linear_attn.out_proj.weight")
+    }
+    public func deltaConv1d(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).linear_attn.conv1d.weight")
+    }
+    public func deltaNorm(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).linear_attn.norm.weight")
+    }
+    public func deltaALog(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).linear_attn.A_log")
+    }
+    public func deltaDtBias(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).linear_attn.dt_bias")
+    }
+
     // MARK: - Feed-forward norms
     //
     // The Gemma 4 sandwich wraps two parallel FFN branches:
@@ -638,6 +673,38 @@ extension Model {
             rows: config.vocabSize,
             columns: config.hiddenSize,
             slot: quant.embedding)
+        // Qwen3.6 DeltaNet linear-attn dimension constants.
+        enum Qwen36LinearAttn {
+            static let keyHeads = 16
+            static let keyHeadDim = 128
+            static let valueHeads = 32
+            static let valueHeadDim = 128
+            static let convKernel = 4
+            static let keyDim = keyHeads * keyHeadDim       // 2048
+            static let valueDim = valueHeads * valueHeadDim // 4096
+            static let qkvDim = keyDim + keyDim + valueDim  // 8192
+        }
+
+        func requireBF16Conv1d(_ name: String, channels: Int, kernel: Int) throws {
+            guard let entry = residentIndex.entries[name] else {
+                throw ModelError.indexCorrupt(
+                    detail: "missing required resident tensor \(name)")
+            }
+            let expectedBytes = try checkedMultiply(
+                UInt64(channels), UInt64(kernel), field: name)
+            let bf16Bytes = try checkedMultiply(expectedBytes, 2, field: "\(name) bf16")
+            guard entry.dtype == GTurboFormatV1.DType.bf16.rawValue,
+                  entry.shape.0 == UInt32(channels),
+                  entry.shape.1 == UInt32(kernel),
+                  entry.shape.2 == 0, entry.shape.3 == 0,
+                  entry.sizeBytes == bf16Bytes,
+                  entry.scaleOffset == 0, entry.scaleSize == 0,
+                  entry.biasOffset == 0, entry.biasSize == 0 else {
+                throw ModelError.indexCorrupt(
+                    detail: "\(name) does not match the required BF16 conv1d schema")
+            }
+        }
+
         try requireBF16("language_model.model.norm.weight", count: config.hiddenSize)
 
         for layer in 0..<config.numLayers {
@@ -699,7 +766,7 @@ extension Model {
             }
 
             // Self-attention projections exist only on full-attention layers.
-            // Qwen3.6 DeltaNet layers use linear_attn.* instead (deferred to Phase 3).
+            // Qwen3.6 DeltaNet layers use linear_attn.* instead (validated below).
             if !isQwen36 || isFull {
                 try requireAffine("\(prefix).self_attn.q_proj.weight",
                                   rows: queryWeightRows, columns: config.hiddenSize,
@@ -716,6 +783,33 @@ extension Model {
                                   rows: config.hiddenSize, columns: queryDimension,
                                   slot: quant.attention)
             }
+
+            // DeltaNet (linear_attn) block — present on Qwen3.6 non-full-attn layers.
+            // 5 affine INT4 projections (quant slot = attention) + conv1d/norm/A_log/dt_bias BF16.
+            if isQwen36 && !isFull {
+                let lin = Qwen36LinearAttn.self
+                try requireAffine("\(prefix).linear_attn.in_proj_qkv.weight",
+                                  rows: lin.qkvDim, columns: config.hiddenSize,
+                                  slot: quant.attention)
+                try requireAffine("\(prefix).linear_attn.in_proj_z.weight",
+                                  rows: lin.valueDim, columns: config.hiddenSize,
+                                  slot: quant.attention)
+                try requireAffine("\(prefix).linear_attn.in_proj_a.weight",
+                                  rows: lin.valueHeads, columns: config.hiddenSize,
+                                  slot: quant.attention)
+                try requireAffine("\(prefix).linear_attn.in_proj_b.weight",
+                                  rows: lin.valueHeads, columns: config.hiddenSize,
+                                  slot: quant.attention)
+                try requireAffine("\(prefix).linear_attn.out_proj.weight",
+                                  rows: config.hiddenSize, columns: lin.valueDim,
+                                  slot: quant.attention)
+                try requireBF16Conv1d("\(prefix).linear_attn.conv1d.weight",
+                                      channels: lin.qkvDim, kernel: lin.convKernel)
+                try requireBF16("\(prefix).linear_attn.norm.weight", count: lin.keyHeadDim)
+                try requireBF16("\(prefix).linear_attn.A_log", count: lin.valueHeads)
+                try requireBF16("\(prefix).linear_attn.dt_bias", count: lin.valueHeads)
+            }
+
             if config.topology == .qwen36 {
                 try requireAffine("\(prefix).mlp.shared_expert.gate_proj.weight",
                                   rows: config.intermediateSize, columns: config.hiddenSize,
