@@ -301,7 +301,8 @@ enum RepackPlanner {
     private static func isMultimodalTensorName(_ name: String) -> Bool {
         name.hasPrefix("vision_tower.") ||
             name.hasPrefix("embed_vision.") ||
-            name.hasPrefix("audio_tower.")
+            name.hasPrefix("audio_tower.") ||
+            name.hasPrefix("model.visual.")
     }
 
     // MARK: - Resident planning

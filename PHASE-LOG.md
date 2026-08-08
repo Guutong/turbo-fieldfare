@@ -77,7 +77,7 @@ smaller tasks in `plan.md`, add them to the board with new IDs, and stop with
 | P1-3 | ArchInfo: sliding_window optional | DONE | default 0 when key absent |
 | P1-4 | ArchInfo: register qwen3_5_moe | DONE | no-op: no modelType switch exists in ArchInfo.swift |
 | P1-5 | Manifest: three-way layer kind | DONE | additive layerKindMask field, fixture regenerated (2219→2258B) |
-| P1-6 | Repack: split fused gate_up_proj | TODO | |
+| P1-6 | Repack: split fused gate_up_proj | DONE | synthetic gate_proj/up_proj from fused gate_up_proj, 648 tests pass |
 | P1-7 | Repack: filter vision tensors | TODO | |
 | P1-8 | Expert layout at 10,240 entries | TODO | |
 | P1-9 | Quant group size accepted | TODO | |
@@ -208,7 +208,7 @@ Did:      No-op — no modelType switch exists in ArchInfo.swift. Model identifi
 Ran:      swift test --filter ArchInfo -> no matching tests (expected, no switch exists)
 Learned:  ArchInfo.swift has no model type discrimination. It just loads config values into ArchInfo struct. The runtime identifies models by comparing ArchInfo values against known ArchConfig entries.
 Unproven: nothing for this task
-Next:     P1-6
+Next:     P1-7
 
 ### 2026-08-08 — P0-1 — TODO -> DOING
 Did:      Fetched `mlx_lm/models/qwen3_5_moe.py` and `mlx_lm/models/qwen3_next.py` from ml-explore/mlx-lm. Found router scoring in `Qwen3NextSparseMoeBlock.__call__`.
