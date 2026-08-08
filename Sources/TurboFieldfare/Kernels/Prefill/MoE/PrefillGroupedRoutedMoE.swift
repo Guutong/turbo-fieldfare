@@ -338,8 +338,10 @@ enum PrefillGroupedRoutedMoEError: Error, Equatable, CustomStringConvertible {
 
 final class PrefillGroupedRoutedMoE {
     private let batchedPhase1PSO: MTLComputePipelineState
+    private let batchedPhase1SiluPSO: MTLComputePipelineState
     private let batchedDownPSO: MTLComputePipelineState
     private let streamedArgEncoder: MTLArgumentEncoder
+    private let activation: ActivationType
 
     func makeStreamedArgumentBuffer(device: MTLDevice,
                                            binding: PrefillStreamedTileBinding) throws -> PrefillStreamedTileArgumentBuffer {
@@ -358,8 +360,14 @@ final class PrefillGroupedRoutedMoE {
         return PrefillStreamedTileArgumentBuffer(buffer: buffer)
     }
 
-    init(context: MetalContext) throws {
+    init(context: MetalContext, activation: ActivationType = .geluPytorchTanh) throws {
+        self.activation = activation
         self.batchedPhase1PSO = try context.pipeline("prefill_grouped_routed_moe_batched_phase1")
+        self.batchedPhase1SiluPSO = try context.pipeline(
+            "prefill_grouped_routed_moe_batched_phase1",
+            constants: [
+                MetalFunctionConstant(index: 77, value: .bool(true)),
+            ])
         self.batchedDownPSO = try context.pipeline("prefill_grouped_routed_moe_batched_down")
         guard let streamedFn = context.library.makeFunction(name: "prefill_grouped_routed_moe_batched_phase1") else {
             throw MetalError.missingFunction("prefill_grouped_routed_moe_batched_phase1")
@@ -410,7 +418,8 @@ final class PrefillGroupedRoutedMoE {
             p.pairCount = min(UInt32(pairMicrobatchRows), params.pairCount - consumed)
 
             if let enc = commandBuffer.makeComputeCommandEncoder() {
-                enc.setComputePipelineState(batchedPhase1PSO)
+                enc.setComputePipelineState(
+                    activation == .silu ? batchedPhase1SiluPSO : batchedPhase1PSO)
                 enc.setBuffer(hidden, offset: hiddenOffset, index: PrefillGroupedRoutedMoEBufferIndex.hidden)
                 enc.setBuffer(sortedPairs, offset: sortedPairsOffset, index: PrefillGroupedRoutedMoEBufferIndex.sortedPairs)
                 enc.setBuffer(gateUpActScratch, offset: gateUpActScratchOffset,

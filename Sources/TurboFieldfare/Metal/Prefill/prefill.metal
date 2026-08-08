@@ -16,12 +16,17 @@ constant constexpr uint kPrefillMaxTileExperts = 16;
 constant constexpr float kPrefillGeluSqrt2OverPi = 0.7978845608028654f;
 constant constexpr float kPrefillGeluCubicCoeff = 0.044715f;
 constant uint FC_PREFILL_KV_RING_CAP [[function_constant(76)]];
+constant bool FC_PREFILL_ACT_SILU [[function_constant(77)]];
 
 static inline float prefill_gelu_pytorch_tanh(float x) {
     const float x3 = x * x * x;
     float inner = kPrefillGeluSqrt2OverPi * (x + kPrefillGeluCubicCoeff * x3);
     inner = clamp(inner, -20.0f, 20.0f);
     return 0.5f * x * (1.0f + tanh(inner));
+}
+
+static inline float prefill_silu(float x) {
+    return x / (1.0f + precise::exp(-x));
 }
 kernel void prefill_embed_lookup_int4_block(
     device const uint8_t* table     [[buffer(0)]],
@@ -632,8 +637,10 @@ kernel void prefill_grouped_routed_moe_batched_phase1(
     const uint index = pair_local * p.F + f;
     gate_up_act_scratch[index] = half(gate);
     gate_up_act_scratch[row_elements + index] = half(up);
+    float act = (is_function_constant_defined(FC_PREFILL_ACT_SILU) && FC_PREFILL_ACT_SILU)
+        ? prefill_silu(gate) : prefill_gelu_pytorch_tanh(gate);
     gate_up_act_scratch[2u * row_elements + index] =
-        half(prefill_gelu_pytorch_tanh(gate) * up);
+        half(act * up);
 }
 
 kernel void prefill_grouped_routed_moe_batched_down(

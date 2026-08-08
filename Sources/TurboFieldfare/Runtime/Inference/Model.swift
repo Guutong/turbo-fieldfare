@@ -627,19 +627,28 @@ extension Model {
             for name in [
                 "input_layernorm.weight",
                 "post_attention_layernorm.weight",
-                "pre_feedforward_layernorm.weight",
-                "pre_feedforward_layernorm_2.weight",
-                "post_feedforward_layernorm_1.weight",
-                "post_feedforward_layernorm_2.weight",
-                "post_feedforward_layernorm.weight",
-                "router.scale",
             ] {
                 try requireBF16("\(prefix).\(name)", count: config.hiddenSize)
             }
             try requireBF16("\(prefix).self_attn.q_norm.weight", count: headDimension)
             try requireBF16("\(prefix).self_attn.k_norm.weight", count: headDimension)
-            try requireBF16("\(prefix).router.per_expert_scale", count: config.numExperts)
-            try requireBF16("\(prefix).layer_scalar", count: 1)
+
+            // Gemma 4 sandwich norms — extra FFN norms, router aux, layer scalar.
+            // Qwen3.6 pre-norm topology does not have these.
+            if config.topology == .gemma4 {
+                for name in [
+                    "pre_feedforward_layernorm.weight",
+                    "pre_feedforward_layernorm_2.weight",
+                    "post_feedforward_layernorm_1.weight",
+                    "post_feedforward_layernorm_2.weight",
+                    "post_feedforward_layernorm.weight",
+                    "router.scale",
+                ] {
+                    try requireBF16("\(prefix).\(name)", count: config.hiddenSize)
+                }
+                try requireBF16("\(prefix).router.per_expert_scale", count: config.numExperts)
+                try requireBF16("\(prefix).layer_scalar", count: 1)
+            }
 
             try requireAffine("\(prefix).self_attn.q_proj.weight",
                               rows: queryDimension, columns: config.hiddenSize,

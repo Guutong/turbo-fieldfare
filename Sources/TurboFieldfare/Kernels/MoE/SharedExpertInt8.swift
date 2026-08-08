@@ -56,6 +56,8 @@ final class SharedExpertInt8 {
     private let int8: DequantInt8GEMV
     private let fusedGateUpActPSO: MTLComputePipelineState
     private let specializedFusedGateUpActPSO: MTLComputePipelineState?
+    private let fusedGateUpActSiluPSO: MTLComputePipelineState
+    private let specializedFusedGateUpActSiluPSO: MTLComputePipelineState?
 
     init(context: MetalContext) throws {
         self.int8 = try DequantInt8GEMV(context: context)
@@ -68,6 +70,18 @@ final class SharedExpertInt8 {
                 MetalFunctionConstant(index: 72, value: .bool(true)),
                 MetalFunctionConstant(index: 73, value: .uint32(8)),
             ])
+        self.fusedGateUpActSiluPSO = try context.pipeline(
+            "shared_int8_gate_up_act_simd",
+            constants: [MetalFunctionConstant(index: 74, value: .bool(true))])
+        self.specializedFusedGateUpActSiluPSO = try? context.pipeline(
+            "shared_int8_gate_up_act_simd",
+            constants: [
+                MetalFunctionConstant(index: 70, value: .uint32(2112)),
+                MetalFunctionConstant(index: 71, value: .uint32(2816)),
+                MetalFunctionConstant(index: 72, value: .bool(true)),
+                MetalFunctionConstant(index: 73, value: .uint32(8)),
+                MetalFunctionConstant(index: 74, value: .bool(true)),
+            ])
     }
 
     func encode(commandBuffer cb: MTLCommandBuffer,
@@ -76,7 +90,8 @@ final class SharedExpertInt8 {
                        up:   SharedExpertInt8Proj,
                        down: SharedExpertInt8Proj,
                        y: MTLBuffer, yOffset: Int = 0,
-                       scratchAct:  MTLBuffer, scratchActOffset:  Int = 0) throws {
+                       scratchAct:  MTLBuffer, scratchActOffset:  Int = 0,
+                       activation: ActivationType = .geluPytorchTanh) throws {
         guard gate.rows == up.rows, gate.cols == up.cols else {
             throw SharedExpertInt8Error.dimensionMismatch(
                 "gate/up shapes differ: gate=(\(gate.rows),\(gate.cols)) up=(\(up.rows),\(up.cols))")
@@ -107,7 +122,8 @@ final class SharedExpertInt8 {
                          gate: gate,
                          up: up,
                          scratchAct: scratchAct,
-                         scratchActOffset: scratchActOffset)
+                         scratchActOffset: scratchActOffset,
+                         activation: activation)
 
         try encodeDown(commandBuffer: cb,
                        down: down,
@@ -123,7 +139,8 @@ final class SharedExpertInt8 {
                              gate: SharedExpertInt8Proj,
                              up: SharedExpertInt8Proj,
                              scratchAct: MTLBuffer,
-                             scratchActOffset: Int = 0) throws {
+                             scratchActOffset: Int = 0,
+                             activation: ActivationType = .geluPytorchTanh) throws {
         guard gate.rows == up.rows, gate.cols == up.cols else {
             throw SharedExpertInt8Error.dimensionMismatch(
                 "gate/up shapes differ: gate=(\(gate.rows),\(gate.cols)) up=(\(up.rows),\(up.cols))")
@@ -145,7 +162,8 @@ final class SharedExpertInt8 {
                                  gate: gate,
                                  up: up,
                                  scratchAct: scratchAct,
-                                 scratchActOffset: scratchActOffset)
+                                 scratchActOffset: scratchActOffset,
+                                 activation: activation)
     }
 
     func encodeDown(commandBuffer cb: MTLCommandBuffer,
@@ -179,13 +197,22 @@ final class SharedExpertInt8 {
                                       gate: SharedExpertInt8Proj,
                                       up: SharedExpertInt8Proj,
                                       scratchAct: MTLBuffer,
-                                      scratchActOffset: Int) throws {
+                                      scratchActOffset: Int,
+                                      activation: ActivationType) throws {
         guard let enc = cb.makeComputeCommandEncoder() else {
             throw SharedExpertInt8Error.dimensionMismatch("encoder alloc failed")
         }
-        enc.setComputePipelineState(
-            (gate.rows == 2112 && gate.cols == 2816 ? specializedFusedGateUpActPSO : nil)
-            ?? fusedGateUpActPSO)
+        let isSilu = activation == .silu
+        let isSpecialized = gate.rows == 2112 && gate.cols == 2816
+        let pso: MTLComputePipelineState
+        if isSilu {
+            pso = (isSpecialized ? specializedFusedGateUpActSiluPSO : nil)
+                ?? fusedGateUpActSiluPSO
+        } else {
+            pso = (isSpecialized ? specializedFusedGateUpActPSO : nil)
+                ?? fusedGateUpActPSO
+        }
+        enc.setComputePipelineState(pso)
         enc.setBuffer(gate.weights, offset: gate.weightsOffset, index: 0)
         enc.setBuffer(gate.scales,  offset: gate.scalesOffset,  index: 1)
         enc.setBuffer(gate.biases,  offset: gate.biasesOffset,  index: 2)

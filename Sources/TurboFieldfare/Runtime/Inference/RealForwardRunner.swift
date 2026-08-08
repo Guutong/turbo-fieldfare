@@ -155,6 +155,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     private let fusedQKVEpilogue: FusedQKVEpilogue
     private let fusedPostAttentionSetup: FusedPostAttentionSetup
     private let fusedTail: FusedLayerTail
+    private let elementwiseAdd: ElementwiseAdd
 
     // Prefill kernels. These are initialized once per runner so the chunk path
     // cannot accidentally rebuild PSOs inside a per-layer loop.
@@ -208,8 +209,10 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
 
     /// Per-layer `router.scale * D^-0.5` pre-folded into one BF16 buffer
     /// allocation per layer. ~168 KB total at 30 layers × 2816 BF16 — bounded
-    /// host work done once at init.
+    /// host work done once at init. For Qwen3.6 (no router.scale), all-ones.
     private let effectiveScaleBuffers: [MTLBuffer]
+    /// Dummy all-ones per_expert_scale for Qwen3.6 (Gemma uses real tensor).
+    private let dummyPerExpertScale: MTLBuffer?
     private let sharedExpertProjections: [LayerSharedExpertProjections]
 
     public let maxContext: Int
@@ -254,8 +257,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         self.int4      = try DequantInt4GEMV(context: context)
         self.attention = try Attention(context: context)
         self.shared    = try SharedExpertRuntime(context: context,
-                                                  weightBits: model.sharedExpertWeightBits)
-        self.moe       = try MoE(context: context)
+                                                  weightBits: model.sharedExpertWeightBits,
+                                                  activation: cfg.activation)
+        self.moe       = try MoE(context: context, activation: cfg.activation)
         self.fusionHead = try LMHeadChainInt4(context: context,
                                               maxD: cfg.hiddenSize,
                                               maxVocab: cfg.vocabSize)
@@ -263,6 +267,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         self.fusedQKVEpilogue = try FusedQKVEpilogue(context: context)
         self.fusedPostAttentionSetup = try FusedPostAttentionSetup(context: context)
         self.fusedTail = try FusedLayerTail(context: context)
+        self.elementwiseAdd = try ElementwiseAdd(context: context)
         self.prefillEmbed = try PrefillEmbedLookupInt4(context: context)
         self.prefillRMS = try PrefillRMSNorm(context: context)
         self.prefillQMM = try PrefillInt4QMM(context: context)
@@ -273,8 +278,10 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         self.prefillRouter = try PrefillRouter(context: context)
         self.prefillSharedExpert = try PrefillSharedExpert(
             context: context,
-            weightBits: model.sharedExpertWeightBits)
-        self.prefillGroupedMoE = try PrefillGroupedRoutedMoE(context: context)
+            weightBits: model.sharedExpertWeightBits,
+            activation: cfg.activation)
+        self.prefillGroupedMoE = try PrefillGroupedRoutedMoE(context: context,
+                                                              activation: cfg.activation)
         self.prefillMoE = try PrefillMoE(context: context)
         self.prefillLayerTail = try PrefillLayerTail(context: context)
         self.prefillFinalRowHead = try PrefillFinalRowHeadInt4(context: context,
@@ -335,42 +342,102 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                  rows: rows,
                                  cols: cols)
         }
+        // Dummy per_expert_scale for Qwen3.6 (all-ones; Gemma uses real tensor).
+        if cfg.topology == .qwen36 {
+            guard let buf = device.makeBuffer(
+                length: cfg.numExperts * MemoryLayout<UInt16>.size,
+                options: .storageModeShared) else {
+                throw ModelError.residentBufferWrapFailed
+            }
+            let dst = buf.contents().assumingMemoryBound(to: UInt16.self)
+            let bf16One = Quantization.bf16Bits(1.0)
+            for i in 0..<cfg.numExperts { dst[i] = bf16One }
+            buf.label = "dummy.per_expert_scale"
+            self.dummyPerExpertScale = buf
+        } else {
+            self.dummyPerExpertScale = nil
+        }
+
+        // Dummy postF1 TensorView for Qwen3.6 (unused — pre-norm skips post_ffn_1).
+        let dummyPostF1: TensorView
+        if cfg.topology == .qwen36 {
+            guard let buf = device.makeBuffer(
+                length: MemoryLayout<UInt16>.size,
+                options: .storageModeShared) else {
+                throw ModelError.residentBufferWrapFailed
+            }
+            buf.contents().assumingMemoryBound(to: UInt16.self)[0] = Quantization.bf16Bits(1.0)
+            buf.label = "dummy.postF1"
+            dummyPostF1 = TensorView(buffer: buf, offset: 0, length: UInt64(MemoryLayout<UInt16>.size),
+                                     scaleOffset: 0, scaleLength: 0,
+                                     biasOffset: 0, biasLength: 0,
+                                     shape: (1, 1, 1, 1), dtype: 2)
+        } else {
+            // Will be overwritten per layer — placeholder.
+            dummyPostF1 = TensorView(buffer: device.makeBuffer(length: 1)!,
+                                     offset: 0, length: 1,
+                                     scaleOffset: 0, scaleLength: 0,
+                                     biasOffset: 0, biasLength: 0,
+                                     shape: (0,0,0,0), dtype: 2)
+        }
+
         var sharedViews: [LayerSharedExpertProjections] = []
         sharedViews.reserveCapacity(cfg.numLayers)
         for L in 0..<cfg.numLayers {
             let gate = try model.sharedExpertGate(layer: L)
             let up = try model.sharedExpertUp(layer: L)
             let down = try model.sharedExpertDown(layer: L)
+            let postF1View: TensorView
+            if cfg.topology == .qwen36 {
+                postF1View = dummyPostF1  // unused in pre-norm path
+            } else {
+                postF1View = try model.postFFN1(layer: L)
+            }
             sharedViews.append(LayerSharedExpertProjections(
                 gate: sharedProj(gate, rows: UInt32(F), cols: UInt32(D)),
                 up: sharedProj(up, rows: UInt32(F), cols: UInt32(D)),
                 down: sharedProj(down, rows: UInt32(D), cols: UInt32(F)),
-                postF1: try model.postFFN1(layer: L)))
+                postF1: postF1View))
         }
         self.sharedExpertProjections = sharedViews
 
         // Pre-fold 1/sqrt(D) into router.scale per layer. Each layer gets its
         // own BF16 [D] buffer — the kernel reads `effective_scale[i]` and we
         // pay for the multiply once per generation, not per token.
+        // Qwen3.6 has no router.scale — use all-ones (identity scaling).
         var perLayer: [MTLBuffer] = []
         perLayer.reserveCapacity(cfg.numLayers)
         let invSqrtD = Float(1.0) / Float(D).squareRoot()
         let dInts = D
+        let bf16One = Quantization.bf16Bits(1.0)
         for L in 0..<cfg.numLayers {
-            let scaleView = try model.routerScale(layer: L)
-            guard let buf = device.makeBuffer(length: dInts * MemoryLayout<UInt16>.size,
-                                              options: .storageModeShared) else {
-                throw ModelError.residentBufferWrapFailed
+            let buf: MTLBuffer
+            if cfg.topology == .qwen36 {
+                guard let b = device.makeBuffer(length: dInts * MemoryLayout<UInt16>.size,
+                                                options: .storageModeShared) else {
+                    throw ModelError.residentBufferWrapFailed
+                }
+                let dst = b.contents().assumingMemoryBound(to: UInt16.self)
+                for i in 0..<dInts { dst[i] = bf16One }
+                b.label = "effective_scale_dummy.L\(L)"
+                buf = b
+            } else {
+                let scaleView = try model.routerScale(layer: L)
+                guard let b = device.makeBuffer(length: dInts * MemoryLayout<UInt16>.size,
+                                                options: .storageModeShared) else {
+                    throw ModelError.residentBufferWrapFailed
+                }
+                let src = scaleView.buffer.contents()
+                    .advanced(by: Int(scaleView.offset))
+                    .assumingMemoryBound(to: UInt16.self)
+                let dst = b.contents().assumingMemoryBound(to: UInt16.self)
+                for i in 0..<dInts {
+                    let v = Quantization.bf16ToFloat(src[i]) * invSqrtD
+                    dst[i] = Quantization.bf16Bits(v)
+                }
+                b.label = "effective_scale.L\(L)"
+                buf = b
             }
-            let src = scaleView.buffer.contents()
-                .advanced(by: Int(scaleView.offset))
-                .assumingMemoryBound(to: UInt16.self)
-            let dst = buf.contents().assumingMemoryBound(to: UInt16.self)
-            for i in 0..<dInts {
-                let v = Quantization.bf16ToFloat(src[i]) * invSqrtD
-                dst[i] = Quantization.bf16Bits(v)
-            }
-            buf.label = "effective_scale.L\(L)"
             perLayer.append(buf)
         }
         self.effectiveScaleBuffers = perLayer
@@ -601,20 +668,25 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             let routerPerExpertScale: TensorView
         }
 
+        let isQwen36Prefill = cfg.topology == .qwen36
         let layerViews = try (0..<cfg.numLayers).map { L in
             let isFull = cfg.layerKindMask[L] == 1
+            // Qwen36 has only input_layernorm + post_attention_layernorm;
+            // alias the missing norms to postAttention so the prefill loop
+            // doesn't crash — they're unused in the Qwen36 topology branch.
+            let postAttnV = try model.postAttnNorm(layer: L)
             return LayerPrefillQKVViews(
                 inputNorm: try model.inputNorm(layer: L),
                 q: try model.qProj(layer: L),
                 k: try model.kProj(layer: L),
                 v: isFull ? (try model.kProj(layer: L)) : (try model.vProj(layer: L)),
                 o: try model.oProj(layer: L),
-                postAttention: try model.postAttnNorm(layer: L),
-                preFFN: try model.preFFN(layer: L),
-                preFFN2: try model.preFFN2(layer: L),
-                postFFN2: try model.postFFN2(layer: L),
-                postFFN: try model.postFFN(layer: L),
-                layerScalar: try model.layerScalar(layer: L),
+                postAttention: postAttnV,
+                preFFN: isQwen36Prefill ? postAttnV : (try model.preFFN(layer: L)),
+                preFFN2: isQwen36Prefill ? postAttnV : (try model.preFFN2(layer: L)),
+                postFFN2: isQwen36Prefill ? postAttnV : (try model.postFFN2(layer: L)),
+                postFFN: isQwen36Prefill ? postAttnV : (try model.postFFN(layer: L)),
+                layerScalar: isQwen36Prefill ? postAttnV : (try model.layerScalar(layer: L)),
                 qNorm: try model.qNorm(layer: L),
                 kNorm: try model.kNorm(layer: L),
                 router: try model.router(layer: L),
@@ -1323,14 +1395,28 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             let postAttn = try model.postAttnNorm(layer: L)
             let qNorm    = try model.qNorm(layer: L)
             let kNorm    = try model.kNorm(layer: L)
-            let preFFN   = try model.preFFN(layer: L)
-            let preFFN2  = try model.preFFN2(layer: L)
             let sharedProj = sharedExpertProjections[L]
-            let postF2   = try model.postFFN2(layer: L)
-            let postF    = try model.postFFN(layer: L)
             let routerW  = try model.router(layer: L)
-            let perExpertScale = try model.routerPerExpertScale(layer: L)
-            let layerScalarView = try model.layerScalar(layer: L)
+            let isQwen36 = cfg.topology == .qwen36
+            // Gemma-only tensors — Qwen3.6 pre-norm skips these.
+            let preFFN   = isQwen36 ? postAttn : (try model.preFFN(layer: L))
+            let preFFN2  = isQwen36 ? postAttn : (try model.preFFN2(layer: L))
+            let postF2   = isQwen36 ? postAttn : (try model.postFFN2(layer: L))
+            let postF    = isQwen36 ? postAttn : (try model.postFFN(layer: L))
+            let perExpertScale: TensorView
+            let layerScalarView: TensorView
+            if isQwen36 {
+                perExpertScale = TensorView(
+                    buffer: dummyPerExpertScale!, offset: 0,
+                    length: UInt64(cfg.numExperts * MemoryLayout<UInt16>.size),
+                    scaleOffset: 0, scaleLength: 0,
+                    biasOffset: 0, biasLength: 0,
+                    shape: (UInt32(cfg.numExperts), 1, 1, 1), dtype: 2)
+                layerScalarView = postAttn  // unused in pre-norm
+            } else {
+                perExpertScale = try model.routerPerExpertScale(layer: L)
+                layerScalarView = try model.layerScalar(layer: L)
+            }
 
             let tCb1Start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
             // Everything up to and including the router runs in a single CB:
@@ -1430,20 +1516,32 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             }
 
             let gPostAttnSetup: (MTLCommandBuffer) -> Void = { [self] cb in
-                fusedPostAttentionSetup.encode(commandBuffer: cb,
-                                               hidden: hidden,
-                                               attn: oOut,
-                                               denseX: denseX,
-                                               routedX: routedX,
-                                               routerX: routerInput,
-                                               postAttentionWeight: postAttn.buffer,
-                                               postAttentionWeightOffset: Int(postAttn.offset),
-                                               preFFNWeight: preFFN.buffer,
-                                               preFFNWeightOffset: Int(preFFN.offset),
-                                               preFFN2Weight: preFFN2.buffer,
-                                               preFFN2WeightOffset: Int(preFFN2.offset),
-                                               d: D,
-                                               eps: eps)
+                if isQwen36 {
+                    // Pre-norm: raw residual + single pre-FFN norm.
+                    elementwiseAdd.encode(commandBuffer: cb,
+                                          a: hidden, b: oOut, count: D)
+                    rms.encodeBF16W(commandBuffer: cb,
+                                    x: hidden,
+                                    weight: postAttn.buffer,
+                                    weightOffset: Int(postAttn.offset),
+                                    out: denseX,  // ffInput reused in denseX
+                                    d: D, eps: eps)
+                } else {
+                    fusedPostAttentionSetup.encode(commandBuffer: cb,
+                                                   hidden: hidden,
+                                                   attn: oOut,
+                                                   denseX: denseX,
+                                                   routedX: routedX,
+                                                   routerX: routerInput,
+                                                   postAttentionWeight: postAttn.buffer,
+                                                   postAttentionWeightOffset: Int(postAttn.offset),
+                                                   preFFNWeight: preFFN.buffer,
+                                                   preFFNWeightOffset: Int(preFFN.offset),
+                                                   preFFN2Weight: preFFN2.buffer,
+                                                   preFFN2WeightOffset: Int(preFFN2.offset),
+                                                   d: D,
+                                                   eps: eps)
+                }
             }
 
             let gRouter: (MTLCommandBuffer) -> Void = { [self] cb in
@@ -1451,7 +1549,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     weights: routerW.buffer, weightsOffset: Int(routerW.offset),
                     scales:  routerW.buffer, scalesOffset:  Int(routerW.scaleOffset),
                     biases:  routerW.buffer, biasesOffset:  Int(routerW.biasOffset),
-                    hidden: routerInput,
+                    hidden: isQwen36 ? denseX : routerInput,
                     effectiveScale: effectiveScaleBuffers[L],
                     perExpertScale: perExpertScale.buffer,
                     perExpertScaleOffset: Int(perExpertScale.offset),
@@ -1515,7 +1613,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                                         routedArgBuffer: argBuf,
                                                         routedBlobs: routedBufs,
                                                         routedOffsets: routedOffsets,
-                                                        x: routedX,
+                                                        x: isQwen36 ? denseX : routedX,
                                                         acts: moeActs,
                                                         d: D,
                                                         f: FmoE,
@@ -1535,7 +1633,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     routedArgBuffer: argBuf,
                     routedBlobs: routedBufs,
                     routedOffsets: routedOffsets,
-                    x: routedX,
+                    x: isQwen36 ? denseX : routedX,
                     acts: moeActs,
                     activeSlots: activeSlots,
                     activeSlotIndices: activeSlotIndices,
@@ -1582,15 +1680,21 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                    scratchUp: denseScratchUp,
                                    scratchAct: denseScratchAct)
             }
-            let gSharedNorm: (MTLCommandBuffer) -> Void = { [self] cb in
-                rms.encodeBF16W(commandBuffer: cb, x: h1Buf,
+            // Qwen3.6 pre-norm skips the post-FFN norm — h1Buf is raw MLP output.
+            let sharedCB: MTLCommandBuffer
+            if !isQwen36 {
+                sharedCB = ctx.queue.makeCommandBuffer()!
+                gSharedFFN(sharedCB)
+                rms.encodeBF16W(commandBuffer: sharedCB, x: h1Buf,
                                 weight: sharedProj.postF1.buffer,
                                 weightOffset: Int(sharedProj.postF1.offset),
                                 out: h1Buf, d: D, eps: eps)
+                sharedCB.commit()
+            } else {
+                sharedCB = ctx.queue.makeCommandBuffer()!
+                gSharedFFN(sharedCB)
+                sharedCB.commit()
             }
-            let sharedCB = ctx.queue.makeCommandBuffer()!
-            gSharedFFN(sharedCB)
-            gSharedNorm(sharedCB)
             sharedCB.commit()
             if let cb = phase1HitCB {
                 cb.commit()
@@ -1637,17 +1741,25 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             let layerScalar = Quantization.bf16ToFloat(scalarPtr[0])
 
             let gTail: (MTLCommandBuffer) -> Void = { [self] cb in
-                fusedTail.encode(commandBuffer: cb,
-                                 h2: h2Buf,
-                                 h1: h1Buf,
-                                 hidden: hidden,
-                                 postFFN2Weight: postF2.buffer,
-                                 postFFN2WeightOffset: Int(postF2.offset),
-                                 postFFNWeight: postF.buffer,
-                                 postFFNWeightOffset: Int(postF.offset),
-                                 d: D,
-                                 eps: eps,
-                                 layerScalar: layerScalar)
+                if isQwen36 {
+                    // Pre-norm: raw combines, no norms, no layer scalar.
+                    elementwiseAdd.encode(commandBuffer: cb,
+                                          a: h1Buf, b: h2Buf, count: D)
+                    elementwiseAdd.encode(commandBuffer: cb,
+                                          a: hidden, b: h1Buf, count: D)
+                } else {
+                    fusedTail.encode(commandBuffer: cb,
+                                     h2: h2Buf,
+                                     h1: h1Buf,
+                                     hidden: hidden,
+                                     postFFN2Weight: postF2.buffer,
+                                     postFFN2WeightOffset: Int(postF2.offset),
+                                     postFFNWeight: postF.buffer,
+                                     postFFNWeightOffset: Int(postF.offset),
+                                     d: D,
+                                     eps: eps,
+                                     layerScalar: layerScalar)
+                }
             }
             let routedCB = ctx.queue.makeCommandBuffer()!
             let splitArgBuf = phase1HitCB != nil && !phase1MissSlots.isEmpty

@@ -1,6 +1,33 @@
 import Foundation
 import Metal
 
+/// Activation function used by the MLP layers (shared expert, routed MoE).
+/// Mirrors the `hidden_act` / `hidden_activation` field from the HuggingFace
+/// config.json, carried through the manifest and validated at load time.
+public enum ActivationType: String, Sendable, Equatable, CustomStringConvertible {
+    case geluPytorchTanh = "gelu_pytorch_tanh"
+    case silu = "silu"
+
+    public var description: String { rawValue }
+
+    /// Parse from a manifest/config string. Unknown values default to the
+    /// Gemma 4 baseline so existing models continue to work.
+    public static func parse(_ raw: String) -> ActivationType {
+        ActivationType(rawValue: raw) ?? .geluPytorchTanh
+    }
+}
+
+/// Layer topology — controls the norm/residual structure of the decode and
+/// prefill loops. Gemma 4 uses a "sandwich" (norms before AND after each
+/// sublayer); Qwen3.6 uses pure pre-norm (one norm before each sublayer,
+/// raw residuals).
+public enum LayerTopology: String, Sendable, Equatable, CustomStringConvertible {
+    case gemma4
+    case qwen36
+
+    public var description: String { rawValue }
+}
+
 /// Compile-time architecture baseline. `manifest.json -> arch` must match this
 /// field-by-field at load time; mismatches throw `ModelError.archMismatch`.
 public struct ArchConfig: Sendable, Equatable {
@@ -73,6 +100,23 @@ public struct ArchConfig: Sendable, Equatable {
         self.fullAttentionLayerMask = fullAttentionLayerMask
         self.layerKindMask = layerKindMask
         self.hiddenActivation = hiddenActivation
+    }
+
+    /// Parsed activation type, defaults to `.geluPytorchTanh` for unknown
+    /// values so existing models continue to work without changes.
+    public var activation: ActivationType {
+        ActivationType.parse(hiddenActivation)
+    }
+
+    /// Layer topology. Qwen3.6 is identified by its distinctive architecture
+    /// signature: 40 layers, 256 experts, 2 KV heads, 0 full-attention KV heads.
+    /// Everything else defaults to the Gemma 4 sandwich.
+    public var topology: LayerTopology {
+        if numLayers == 40 && numExperts == 256
+            && numKVHeads == 2 && numFullKVHeads == 0 {
+            return .qwen36
+        }
+        return .gemma4
     }
 
     /// Canonical Gemma 4 26B-A4B baseline, checked against the installed

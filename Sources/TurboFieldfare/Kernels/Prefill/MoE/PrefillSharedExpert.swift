@@ -4,8 +4,11 @@ import Metal
 final class PrefillSharedExpert {
     private let shared: SharedExpertRuntime
 
-    init(context: MetalContext, weightBits: Int = 8) throws {
-        self.shared = try SharedExpertRuntime(context: context, weightBits: weightBits)
+    init(context: MetalContext, weightBits: Int = 8,
+         activation: ActivationType = .geluPytorchTanh) throws {
+        self.shared = try SharedExpertRuntime(context: context,
+                                              weightBits: weightBits,
+                                              activation: activation)
     }
 
     func encodeBlock(commandBuffer cb: MTLCommandBuffer,

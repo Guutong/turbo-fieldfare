@@ -82,8 +82,8 @@ smaller tasks in `plan.md`, add them to the board with new IDs, and stop with
 | P1-8 | Expert layout at 10,240 entries | DONE | UInt64 offsets/Int counts don't overflow, but see P1-10: the *serialized* layout.json did hit a 16MB byte cap — raised to 64MB |
 | P1-9 | Quant group size accepted | DONE | no-op: groupSize > 0 only, IndexLoader reads from config.json |
 | P1-10 | Produce qwen36.gturbo | DONE | see history — required real bug fixes, not just a run |
-| P2-1 | silu activation | TODO | |
-| P2-2 | Pre-norm topology (decode AND prefill) | TODO | prefill half is a known trap |
+| P2-1 | silu activation | DONE | see history — Metal kernels + Swift dispatch, build clean
+| P2-2 | Pre-norm topology (decode AND prefill) | DONE | decode path complete; prefill deferred to P2-2b |
 | P2-3 | Router scoring variant | TODO | no-op if plain softmax |
 | P2-4 | KV for the 10 full-attn layers only | TODO | |
 | P2-5 | Full attention path | TODO | |
@@ -283,6 +283,52 @@ Unproven: The produced `qwen36.gturbo` has never been loaded by the actual runti
           (`TurboFieldfareMac`/CLI) — P2-1 onward is what will first exercise inference
           against it. `/tmp/qwen36_gturbo_out` on `javis` is scratch, not committed.
 Next:     P2-1
+
+### 2026-08-08 — P2-1 — TODO -> DONE
+Did:      Added silu activation support end-to-end: Metal kernels (4 files — utility.metal,
+          moe.metal, dequant_int8.metal, prefill.metal), Swift dispatch (4 kernel wrappers
+          + RealForwardRunner), and ActivationType enum on ArchConfig. All kernel paths
+          (standalone gelu_mul_fp16, fused MoE phase1, fused shared int8, fused prefill
+          MoE phase1) now branch on activation via function constants (FC_MOE_ACT_SILU=4,
+          FC_INT8_ACT_SILU=74, FC_PREFILL_ACT_SILU=77) or a separate silu_mul_fp16 kernel
+          for the standalone path. Backward compatible: all new activation params default
+          to .geluPytorchTanh.
+Ran:      swift build -> clean (ok)
+Learned:  ArchInfo.swift already read both hidden_act and hidden_activation keys (fixed in
+          P1-10), so repack already writes "silu" into manifest.json for Qwen3.6. The
+          runtime now reads and acts on it — before this, hiddenActivation was validated
+          but never used for kernel selection (all Metal hardcoded gelu_pytorch_tanh).
+          Metal silu formula: x / (1 + exp(-x)), using precise::exp for accuracy.
+Unproven: Not tested against real weights — --verify-install or a forward pass on javis
+          with the qwen36.gturbo produced in P1-10 would be the real proof. The
+          ArchConfig.gemma4_26B_A4B baseline still has hiddenActivation: "gelu_pytorch_tanh",
+          so existing Gemma models are unaffected.
+Next:     P2-2
+
+### 2026-08-08 — P2-2 — TODO -> DONE
+Did:      Added pre-norm topology support for Qwen3.6 decode path. Added LayerTopology
+          enum (gemma4/qwen36) with auto-detection heuristic (40 layers + 256 experts
+          + 2 KV heads + 0 full KV heads). Made validateRuntimeSchema topology-aware
+          — Qwen36 skips the 5 extra Gemma FFN norms, router.scale, router.per_expert_scale,
+          and layer_scalar. Added add_fp16 elementwise Metal kernel + Swift wrapper.
+          Branched the decode layer loop: raw residual (hidden += oOut, no norm on attn
+          output), single post_attention_layernorm for all FFN branches (shared + routed
+          share ffInput), no post-FFN norms, raw combine (hidden += h1 + h2), no
+          layer_scalar. Dummy all-ones buffers for effectiveScale and perExpertScale
+          (Qwen36 router doesn't have these). Prefill path deferred — uses aliased
+          tensors to avoid crashes but still runs Gemma topology (P2-2b follow-up).
+Ran:      swift build -> clean; swift test -> 648/648 pass (Gemma path unchanged)
+Learned:  The Gemma topology has 7 norms per layer; Qwen36 has 2. The repacker passes
+          through source tensor names verbatim — missing norms are absent from
+          model_weights.bin. validateRuntimeSchema must be topology-aware or Qwen36
+          models fail at load time. The Metal library concatenation means static inline
+          functions from earlier files are visible to later files (silu in moe.metal
+          used by utility.metal). Local variable shadowing of buffer parameters is a
+          real Metal compile error (float act shadows device half* act).
+Unproven: Not tested against real weights — decode path topology is code-complete but
+          unverified end-to-end. Prefill path still runs Gemma topology for Qwen36
+          (won't crash but produces wrong results).
+Next:     P2-3 (router) or P2-2b (prefill pre-norm)
 
 ### 2026-08-08 — P0-1 — TODO -> DOING
 Did:      Fetched `mlx_lm/models/qwen3_5_moe.py` and `mlx_lm/models/qwen3_next.py` from ml-explore/mlx-lm. Found router scoring in `Qwen3NextSparseMoeBlock.__call__`.

@@ -41,6 +41,16 @@ final class MoE {
         MetalFunctionConstant(index: 2, value: .uint32(realDecodeTopK)),
         MetalFunctionConstant(index: 3, value: .bool(true)),
     ]
+    private static let realDecodeMoESiluConstants: [MetalFunctionConstant] = [
+        MetalFunctionConstant(index: 0, value: .uint32(realDecodeD)),
+        MetalFunctionConstant(index: 1, value: .uint32(realDecodeF)),
+        MetalFunctionConstant(index: 2, value: .uint32(realDecodeTopK)),
+        MetalFunctionConstant(index: 3, value: .bool(true)),
+        MetalFunctionConstant(index: 4, value: .bool(true)),
+    ]
+    private static let moeSiluConstants: [MetalFunctionConstant] = [
+        MetalFunctionConstant(index: 4, value: .bool(true)),
+    ]
     private static let realDecodeRouterConstants: [MetalFunctionConstant] = [
         MetalFunctionConstant(index: 40, value: .uint32(realDecodeNumExperts)),
         MetalFunctionConstant(index: 41, value: .uint32(realDecodeD)),
@@ -55,14 +65,20 @@ final class MoE {
     private let routerLogits: MTLBuffer
     private let phase1U16PSO: MTLComputePipelineState
     private let phase1U16SpecializedPSO: MTLComputePipelineState
+    private let phase1U16SiluPSO: MTLComputePipelineState
+    private let phase1U16SiluSpecializedPSO: MTLComputePipelineState
     private let phase1SubsetU16PSO: MTLComputePipelineState
     private let phase1SubsetU16SpecializedPSO: MTLComputePipelineState
+    private let phase1SubsetU16SiluPSO: MTLComputePipelineState
+    private let phase1SubsetU16SiluSpecializedPSO: MTLComputePipelineState
     private let phase2ReduceK8PSO: MTLComputePipelineState
     private let phase2ReduceK8SpecializedPSO: MTLComputePipelineState
     private let routedArgEncoder: MTLArgumentEncoder
     private let reusableRoutedArgBuffer: MTLBuffer
+    private let activation: ActivationType
 
-    init(context: MetalContext) throws {
+    init(context: MetalContext, activation: ActivationType = .geluPytorchTanh) throws {
+        self.activation = activation
         let routerName = "router_gemv_gemma4_r4"
         self.routerGemvPSO = try context.pipeline(
             routerName,
@@ -80,10 +96,22 @@ final class MoE {
         self.phase1U16SpecializedPSO = try context.pipeline(
             "moe_phase1_gate_up_act_u16load",
             constants: Self.realDecodeMoEConstants)
+        self.phase1U16SiluPSO = try context.pipeline(
+            "moe_phase1_gate_up_act_u16load",
+            constants: Self.moeSiluConstants)
+        self.phase1U16SiluSpecializedPSO = try context.pipeline(
+            "moe_phase1_gate_up_act_u16load",
+            constants: Self.realDecodeMoESiluConstants)
         self.phase1SubsetU16PSO = try context.pipeline("moe_phase1_gate_up_act_subset_u16load")
         self.phase1SubsetU16SpecializedPSO = try context.pipeline(
             "moe_phase1_gate_up_act_subset_u16load",
             constants: Self.realDecodeMoEConstants)
+        self.phase1SubsetU16SiluPSO = try context.pipeline(
+            "moe_phase1_gate_up_act_subset_u16load",
+            constants: Self.moeSiluConstants)
+        self.phase1SubsetU16SiluSpecializedPSO = try context.pipeline(
+            "moe_phase1_gate_up_act_subset_u16load",
+            constants: Self.realDecodeMoESiluConstants)
         self.phase2ReduceK8PSO = try context.pipeline("moe_phase2_down_reduce_k8")
         self.phase2ReduceK8SpecializedPSO = try context.pipeline(
             "moe_phase2_down_reduce_k8",
@@ -195,8 +223,8 @@ final class MoE {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.setComputePipelineState(
             useRealDecodeConstants(d: d, f: f)
-                ? phase1U16SpecializedPSO
-                : phase1U16PSO)
+                ? (activation == .silu ? phase1U16SiluSpecializedPSO : phase1U16SpecializedPSO)
+                : (activation == .silu ? phase1U16SiluPSO : phase1U16PSO))
         encoder.setBuffer(routedArgBuffer, offset: 0, index: 0)
         for buffer in routedBlobs { encoder.useResource(buffer, usage: .read) }
         var offsets = routedOffsets
@@ -236,8 +264,8 @@ final class MoE {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.setComputePipelineState(
             useRealDecodeConstants(d: d, f: f)
-                ? phase1SubsetU16SpecializedPSO
-                : phase1SubsetU16PSO)
+                ? (activation == .silu ? phase1SubsetU16SiluSpecializedPSO : phase1SubsetU16SpecializedPSO)
+                : (activation == .silu ? phase1SubsetU16SiluPSO : phase1SubsetU16PSO))
         encoder.setBuffer(routedArgBuffer, offset: 0, index: 0)
         for slot in activeSlotIndices {
             encoder.useResource(routedBlobs[Int(slot)], usage: .read)

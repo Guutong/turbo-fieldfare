@@ -21,10 +21,12 @@ public enum SharedExpertError: Error, CustomStringConvertible {
 public final class SharedExpertInt4 {
     private let int4: DequantInt4GEMV
     private let geluMulPSO: MTLComputePipelineState
+    private let siluMulPSO: MTLComputePipelineState
 
     public init(context: MetalContext) throws {
         self.int4 = try DequantInt4GEMV(context: context)
         self.geluMulPSO = try context.pipeline("gelu_mul_fp16")
+        self.siluMulPSO = try context.pipeline("silu_mul_fp16")
     }
 
     public func encode(commandBuffer cb: MTLCommandBuffer,
@@ -35,7 +37,8 @@ public final class SharedExpertInt4 {
                        y: MTLBuffer, yOffset: Int = 0,
                        scratchGate: MTLBuffer, scratchGateOffset: Int = 0,
                        scratchUp: MTLBuffer, scratchUpOffset: Int = 0,
-                       scratchAct: MTLBuffer, scratchActOffset: Int = 0) throws {
+                       scratchAct: MTLBuffer, scratchActOffset: Int = 0,
+                       activation: ActivationType = .geluPytorchTanh) throws {
         guard gate.rows == up.rows, gate.cols == up.cols,
               down.rows == gate.cols, down.cols == gate.rows else {
             throw SharedExpertError.dimensionMismatch(
@@ -73,13 +76,14 @@ public final class SharedExpertInt4 {
                     m: up.rows, n: up.cols)
 
         guard let encoder = cb.makeComputeCommandEncoder() else { return }
-        encoder.setComputePipelineState(geluMulPSO)
+        let actPSO = activation == .silu ? siluMulPSO : geluMulPSO
+        encoder.setComputePipelineState(actPSO)
         encoder.setBuffer(scratchGate, offset: scratchGateOffset, index: 0)
         encoder.setBuffer(scratchUp, offset: scratchUpOffset, index: 1)
         encoder.setBuffer(scratchAct, offset: scratchActOffset, index: 2)
         var count = UInt32(intermediate)
         encoder.setBytes(&count, length: MemoryLayout<UInt32>.size, index: 3)
-        let width = min(geluMulPSO.maxTotalThreadsPerThreadgroup, 256)
+        let width = min(actPSO.maxTotalThreadsPerThreadgroup, 256)
         encoder.dispatchThreads(MTLSize(width: intermediate, height: 1, depth: 1),
                                 threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1))
         encoder.endEncoding()
@@ -102,9 +106,12 @@ public final class SharedExpertRuntime {
 
     private let implementation: Implementation
     public let weightBits: Int
+    private let activation: ActivationType
 
-    public init(context: MetalContext, weightBits: Int) throws {
+    public init(context: MetalContext, weightBits: Int,
+                activation: ActivationType = .geluPytorchTanh) throws {
         self.weightBits = weightBits
+        self.activation = activation
         switch weightBits {
         case 4: self.implementation = .int4(try SharedExpertInt4(context: context))
         case 8: self.implementation = .int8(try SharedExpertInt8(context: context))
@@ -127,11 +134,13 @@ public final class SharedExpertRuntime {
                                gate: gate, up: up, down: down, y: y, yOffset: yOffset,
                                scratchGate: scratchGate, scratchGateOffset: scratchGateOffset,
                                scratchUp: scratchUp, scratchUpOffset: scratchUpOffset,
-                               scratchAct: scratchAct, scratchActOffset: scratchActOffset)
+                               scratchAct: scratchAct, scratchActOffset: scratchActOffset,
+                               activation: activation)
         case .int8(let runtime):
             try runtime.encode(commandBuffer: commandBuffer, x: x, xOffset: xOffset,
                                gate: gate, up: up, down: down, y: y, yOffset: yOffset,
-                               scratchAct: scratchAct, scratchActOffset: scratchActOffset)
+                               scratchAct: scratchAct, scratchActOffset: scratchActOffset,
+                               activation: activation)
         }
     }
 }
