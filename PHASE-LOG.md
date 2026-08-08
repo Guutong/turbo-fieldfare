@@ -95,7 +95,7 @@ smaller tasks in `plan.md`, add them to the board with new IDs, and stop with
 | P3-1 | DeltaNet conv1d + state (Swift) | DONE | 5 hand-checked tests; 662/662 suite |
 | P3-2 | Delta rule + gating (Swift) | DONE | 16 tests; 678/678 suite; oracle-verified |
 | P3-3 | Layer-0 isolation test | DONE | Real repack (LayerWriter fix) into scratch/qwen36.gturbo; gate passes relL2≤0.0075, maxAbs≤0.0039 — see History |
-| P3-3b | Qwen36 sequential prefill (decode loop) | TODO | pulled forward from P5-1 · ⚠️ frontier only |
+| P3-3b | Qwen36 sequential prefill (decode loop) | DONE | routes via PrefillRoutePolicy; 694/694 pass; proves the route, not the math — see History |
 | P3-4 | Full 40-layer forward, coherent text | TODO | ⚠️ frontier only · milestone |
 | P4-1 | Port recurrence to Metal | TODO | ⚠️ frontier only |
 | P4-2 | Diff Metal vs Swift path | TODO | ⚠️ frontier only |
