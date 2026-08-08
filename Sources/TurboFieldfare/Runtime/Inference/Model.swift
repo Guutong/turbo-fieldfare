@@ -696,10 +696,11 @@ extension Model {
             guard entry.dtype == GTurboFormatV1.DType.bf16.rawValue,
                   entry.shape.0 == UInt32(channels),
                   entry.shape.1 == UInt32(kernel),
-                  entry.shape.2 == 0, entry.shape.3 == 0,
+                  entry.shape.2 == 1, entry.shape.3 == 0,
                   entry.sizeBytes == bf16Bytes,
                   entry.scaleOffset == 0, entry.scaleSize == 0,
-                  entry.biasOffset == 0, entry.biasSize == 0 else {
+                  entry.biasOffset == 0, entry.biasSize == 0,
+                  entry.fileOffset % UInt64(MemoryLayout<UInt16>.alignment) == 0 else {
                 throw ModelError.indexCorrupt(
                     detail: "\(name) does not match the required BF16 conv1d schema")
             }
