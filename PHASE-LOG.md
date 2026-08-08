@@ -94,7 +94,7 @@ smaller tasks in `plan.md`, add them to the board with new IDs, and stop with
 | P6b-4 | Speculative decoding | TODO | kimi-k3 inspired · frontier |
 | P3-1 | DeltaNet conv1d + state (Swift) | DONE | 5 hand-checked tests; 662/662 suite |
 | P3-2 | Delta rule + gating (Swift) | DONE | 16 tests; 678/678 suite; oracle-verified |
-| P3-3 | Layer-0 isolation test | TODO | ⚠️ frontier only |
+| P3-3 | Layer-0 isolation test | FAILED | rel-L2 0.32 / max-abs 0.051 vs gate 2e-2/1e-2 — see History · ⚠️ frontier only |
 | P3-3b | Qwen36 sequential prefill (decode loop) | TODO | pulled forward from P5-1 · ⚠️ frontier only |
 | P3-4 | Full 40-layer forward, coherent text | TODO | ⚠️ frontier only · milestone |
 | P4-1 | Port recurrence to Metal | TODO | ⚠️ frontier only |
@@ -474,3 +474,73 @@ Learned:  Swift #expect macro needs a single interpolated string for its comment
 Unproven: Layer-0 fixture comparison (P3-3) is where these modules meet real weights;
           until then this is verified-math-only.
 Next:     P3-3
+
+### 2026-08-08 — P3-3 — TODO -> FAILED
+Did:      Wrote the layer-0 injection test (Tests/TurboFieldfare/Core/Kernels/
+          Layer0IsolationNumericTests.swift): loads hidden_in.0 from the P0-7
+          fixture, runs a real plain-Swift-fp32 forward pass of layer 0
+          (input_layernorm -> DeltaNet block using the P3-1/P3-2 modules ->
+          residual -> post_attention_layernorm -> router + shared expert +
+          routed MoE (int4/int8 CPU dequant read straight from the resident
+          index and packed_experts/layout.json) -> residual), and compares
+          against hidden_out.0 + expert_ids.0. No Model accessor existed for
+          `mlp.shared_expert_gate` (the scalar sigmoid gate) — read via
+          `model.resident(name:)` directly (int8-affine, confirmed by exact
+          byte-size arithmetic against the resident index).
+Ran:      swift build -> clean; swift test --filter Layer0 -> the 12 P3-1
+          shape tests still pass; the new numeric test FAILS:
+            token 0: relL2=0.407 maxAbs=0.0513  experts OK
+            token 1: relL2=0.301 maxAbs=0.0273  experts MISMATCH (got 72 instead of 231)
+            token 2: relL2=0.363 maxAbs=0.0368  experts OK
+            token 3: relL2=0.241 maxAbs=0.0242  experts MISMATCH (got 5,19 instead of 71,230)
+            token 4: relL2=0.251 maxAbs=0.0191  experts OK
+          Aggregate: rel-L2 0.3226 (gate 2e-2), max-abs 0.0513 (gate 1e-2).
+          Cross-checked against `router_logits.0` (the fixture's post-softmax
+          router probabilities, which depend only on the DeltaNet block's
+          output): relL2 there is already 0.06-0.23 per token, so the
+          divergence originates before the MLP, inside/around the DeltaNet
+          block, not solely in the routed-MoE combine.
+Learned:  Verified every DeltaNet formula line-by-line against the real
+          mlx_lm source (cached wheel copies of qwen3_5.py, gated_delta.py,
+          qwen3_next.py — `GatedDeltaNet.__call__`, `_gated_delta_step_ops`,
+          `gated_delta_update`, `Qwen3NextRMSNormGated`/`_precise_swiglu`):
+          conv1d tap order (empirically confirmed — reversing it makes relL2
+          jump to 0.8-3.9, so the current oldest-to-newest tap order is
+          right), q/k RMS-scale (algebraically proved the P3-2 headDim-mean
+          form equals the source's raw-sum form — also confirmed numerically:
+          normalized q/k head norms land exactly on the predicted
+          1/sqrt(128) and 1.0), repeat_interleave head expansion, beta/g
+          gating (`a`→decay, `b`→beta, not swapped), write-then-read
+          recurrence order, and the output RMSNormGated+swiglu all match the
+          source exactly. Int4/int8 CPU dequant (nibble order, groupSize 64,
+          per-row scale/bias) matches `dequant_int4.metal`'s convention
+          exactly, and every resident/expert tensor's byte size was verified
+          by hand against the actual resident index and
+          `packed_experts/layout.json` for layer 0 (no shape/offset
+          mismatches). Built a fast standalone Python cross-check
+          (scratch/debug_layer0.py, gitignored) reading the same raw bytes,
+          which reproduces the Swift numbers exactly — ruling out a
+          Swift-vs-spec transcription slip as the culprit.
+Unproven: The remaining ~10-40% relative divergence has no diagnosed root
+          cause. Leading candidates not yet ruled out: (1) int4/int8
+          quantization noise compounding across DeltaNet's unusually deep,
+          small-signal composition (qkv/z/a/b projections -> conv -> two
+          RMS-norms -> bilinear recurrence -> gated RMSNorm -> out_proj, all
+          on a layer whose hidden_out.0 has rms ~0.02) may simply exceed the
+          2e-2 gate even with a correct implementation; (2) a bug in how
+          `.gturbo` int4/int8 tensors were actually written by the repacker
+          for DeltaNet-specific tensors (as opposed to attention tensors,
+          which P2-6 already exercises via the production Metal kernels) —
+          untested by any other passing test; (3) an MLX quantization
+          convention difference not caught by the source review (e.g.
+          `mx.fast.rms_norm`'s exact eps/mean formula vs the hand-derived
+          one). Per ADR-0002, tolerance was NOT widened; the test file is
+          left UNCOMMITTED (Tests/TurboFieldfare/Core/Kernels/
+          Layer0IsolationNumericTests.swift) rather than committed failing.
+Next:     Escalate to the owner per ADR-0002's "knife-edge routing escalates
+          to owner" clause — this is closer to a genuine numeric wall than a
+          knife-edge, but the same escalation path applies. A frontier
+          session with GPU/mlx access could bisect by dumping mlx's own
+          intermediate DeltaNet tensors (not just layer boundaries) for a
+          true apples-to-apples comparison instead of inferring from the
+          layer-boundary fixture alone.
