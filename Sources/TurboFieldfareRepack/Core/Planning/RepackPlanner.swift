@@ -137,6 +137,74 @@ enum RepackPlanner {
         return Int(tail[tail.startIndex..<dot])
     }
 
+    /// Detect fused gate_up_proj tensors and split them into separate gate/up entries.
+    /// Qwen3.6 stores switch_mlp.gate_up_proj.weight as a single tensor; the repacker
+    /// expects two separate tensors. This function creates synthetic SourceTensor entries
+    /// for the split halves and removes the original fused tensor from the registry.
+    private static func splitFusedGateUpProj(registry: [String: SourceTensor],
+                                              arch: ArchInfo) throws -> [String: SourceTensor] {
+        var result = registry
+        var namesToRemove: [String] = []
+
+        for (name, tensor) in registry {
+            // Match pattern: language_model.layers.<N>.switch_mlp.gate_up_proj.weight
+            guard name.contains(".switch_mlp.gate_up_proj.") else { continue }
+            guard let layer = layerIndex(in: name),
+                  layer >= 0 && layer < arch.numLayers else { continue }
+
+            // Shape is [num_experts, hidden_size * 2] for fused gate+up
+            // Split along the last dimension: mid = shape[-2] // 2
+            // gate = [..., :mid, :], up = [..., mid:, :]
+            guard tensor.shape.count >= 2 else {
+                throw RepackError.configurationInvalid(
+                    detail: "fused gate_up_proj \(name) has fewer than 2 dimensions: \(tensor.shape)")
+            }
+
+            let numExperts = tensor.shape[0]
+            let fusedDim = tensor.shape[1]
+            guard fusedDim % 2 == 0 else {
+                throw RepackError.configurationInvalid(
+                    detail: "fused gate_up_proj \(name) last dimension \(fusedDim) is not even")
+            }
+            let halfDim = fusedDim / 2
+
+            let elementBytes = tensor.dtype.elementBytes
+            let gateOffset = tensor.absoluteOffset
+            let upOffset = tensor.absoluteOffset + UInt64(numExperts) * UInt64(halfDim) * UInt64(elementBytes)
+
+            let gateName = name.replacingOccurrences(of: "gate_up_proj", with: "gate_proj")
+            let upName = name.replacingOccurrences(of: "gate_up_proj", with: "up_proj")
+
+            let gateTensor = SourceTensor(
+                name: gateName,
+                shardPath: tensor.shardPath,
+                dtype: tensor.dtype,
+                shape: [numExperts, halfDim],
+                absoluteOffset: gateOffset,
+                sizeBytes: UInt64(numExperts) * UInt64(halfDim) * UInt64(elementBytes)
+            )
+
+            let upTensor = SourceTensor(
+                name: upName,
+                shardPath: tensor.shardPath,
+                dtype: tensor.dtype,
+                shape: [numExperts, halfDim],
+                absoluteOffset: upOffset,
+                sizeBytes: UInt64(numExperts) * UInt64(halfDim) * UInt64(elementBytes)
+            )
+
+            result[gateName] = gateTensor
+            result[upName] = upTensor
+            namesToRemove.append(name)
+        }
+
+        for name in namesToRemove {
+            result.removeValue(forKey: name)
+        }
+
+        return result
+    }
+
     /// Build the plan from parsed shard headers + source metadata.
     /// - throws: classification + companion + override count failures.
     static func plan(meta: IndexLoader.SourceMetadata,
@@ -151,6 +219,9 @@ enum RepackPlanner {
         for h in shardHeaders {
             for t in h.tensors { registry[t.name] = t }
         }
+
+        // Split fused gate_up_proj tensors (Qwen3.6 pattern).
+        registry = try splitFusedGateUpProj(registry: registry, arch: arch)
 
         // Source allowlisting owns exact fingerprint validation. Preserve the
         // declared override count for the output manifest audit.
