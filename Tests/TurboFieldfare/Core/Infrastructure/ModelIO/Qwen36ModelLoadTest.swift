@@ -6,6 +6,10 @@ import Testing
 struct Qwen36ModelLoadTest {
     @Test func loadRepackedModel() throws {
         let modelDir = URL(fileURLWithPath: "/tmp/qwen36.gturbo")
+        guard FileManager.default.fileExists(atPath: modelDir.path) else {
+            print("SKIP: /tmp/qwen36.gturbo not found — repack first with --local")
+            return
+        }
         let device = MTLCreateSystemDefaultDevice()!
         let model = try Model.load(directoryURL: modelDir,
                                    device: device,
