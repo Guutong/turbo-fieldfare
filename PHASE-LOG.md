@@ -88,6 +88,10 @@ smaller tasks in `plan.md`, add them to the board with new IDs, and stop with
 | P2-4 | KV for the 10 full-attn layers only | TODO | |
 | P2-5 | Full attention path | TODO | |
 | P2-6 | Layer-3 isolation test | TODO | first real proof |
+| P6b-1 | Expert LRU cache with pinning | TODO | kimi-k3 inspired |
+| P6b-2 | Batch expert prefetch disk-offset order | TODO | kimi-k3 inspired |
+| P6b-3 | Prefill expert dedup | TODO | kimi-k3 inspired |
+| P6b-4 | Speculative decoding | TODO | kimi-k3 inspired · frontier |
 | P3-1 | DeltaNet conv1d + state (Swift) | TODO | ⚠️ frontier only |
 | P3-2 | Delta rule + gating (Swift) | TODO | ⚠️ frontier only |
 | P3-3 | Layer-0 isolation test | TODO | ⚠️ frontier only |

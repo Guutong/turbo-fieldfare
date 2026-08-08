@@ -363,3 +363,47 @@ Needs: P6-2 · Runner: mixed
 Do: Measure resident memory and decode speed.
 Verify: ≤2 GB resident at 8–16K context, ≥4 tok/s.
 Done when: both met — and then the mission is complete.
+
+---
+
+# Phase 6b — Speed (inspired by kimi-k3-in-c)
+
+Ideas sourced from `FareedKhan-dev/kimi-k3-in-c` — an existence proof that streaming-MoE
+on one machine can hit usable tokens-per-second with careful I/O engineering.
+
+### P6b-1 — Expert LRU cache with pinning
+Needs: P6-1 · Runner: mixed
+Do: Add an LRU cache for recently-used routed experts. Experts that are selected again
+within a short window stay resident and skip disk I/O entirely. Pinning prevents the
+expert currently being computed from being evicted mid-encode. Track hit rate and
+eviction count per layer.
+Why: kimi-k3's `k3_cache.c` does exactly this — LRU with pinning + INFLIGHT slot state.
+Repeated expert selections (common for consecutive tokens on similar topics) save
+~17.55 MB per expert pread.
+Verify: `swift test --filter ExpertCache`; re-measure hit rate vs P6-1 baseline.
+
+### P6b-2 — Batch expert prefetch in disk-offset order
+Needs: P6b-1 · Runner: mixed
+Do: When the router selects top-K experts, issue a single batched pread for all misses
+sorted by disk offset (seek minimization). kimi-k3's `getmany` uses 3-phase acquire:
+serial reserve slots → parallel preads sorted by offset → serial publish. Queue depth 16.
+Why: Sorting preads by disk offset cuts rotational/seek latency vs issuing them in
+expert-index order. kimi-k3 measures this as the difference between usable and
+unusable streaming throughput.
+Verify: benchmark showing reduced I/O wall time per token.
+
+### P6b-3 — Prefill expert dedup
+Needs: P5-1 · Runner: mixed
+Do: During prefill, route all tokens in a chunk → collect unique expert IDs → fetch
+each expert once → reuse across all tokens that need it. kimi-k3 does this in
+`k3_moe_prefill` with a 64-token chunk, getting 3–4× less expert I/O.
+Verify: prefill I/O bytes reduced by ≥2× vs per-token fetch on a 64-token prompt.
+
+### P6b-4 — Speculative decoding
+Needs: P5-2 · Runner: frontier
+Do: Implement n-gram speculative decoding: find repeated token sequences in prior
+context, draft up to K tokens, verify in one batched forward pass. kimi-k3 uses
+evidence-gated longest-suffix matching (length ≥4→3), verified greedily in one sweep.
+Output is byte-identical to serial decode by construction. Measured: +22% cost per
+extra verified token. Target: ≥1.5 tokens per decode step.
+Verify: output matches serial decode exactly; measured acceptance rate ≥50%.
