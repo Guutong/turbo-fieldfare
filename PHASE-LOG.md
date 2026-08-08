@@ -93,7 +93,7 @@ smaller tasks in `plan.md`, add them to the board with new IDs, and stop with
 | P6b-3 | Prefill expert dedup | TODO | kimi-k3 inspired |
 | P6b-4 | Speculative decoding | TODO | kimi-k3 inspired · frontier |
 | P3-1 | DeltaNet conv1d + state (Swift) | DONE | 5 hand-checked tests; 662/662 suite |
-| P3-2 | Delta rule + gating (Swift) | TODO | ⚠️ frontier only |
+| P3-2 | Delta rule + gating (Swift) | DONE | 16 tests; 678/678 suite; oracle-verified |
 | P3-3 | Layer-0 isolation test | TODO | ⚠️ frontier only |
 | P3-3b | Qwen36 sequential prefill (decode loop) | TODO | pulled forward from P5-1 · ⚠️ frontier only |
 | P3-4 | Full 40-layer forward, coherent text | TODO | ⚠️ frontier only · milestone |
@@ -449,3 +449,28 @@ Learned:  Metal inventory (subagent): all five DeltaNet projections reuse
 Unproven: conv tap order / state ordering vs real mlx — source-verification agent still
           running; P3-3's fixture comparison is the real proof either way.
 Next:     P3-2
+
+### 2026-08-08 — P3-2 — TODO -> DONE
+Did:      Gated delta rule recurrence + all gating math in plain Swift fp32:
+          Runtime/DeltaNet/DeltaNetRecurrence.swift with five modules —
+          DeltaNetGate (sigmoid/softplus/beta/decay), DeltaNetQKNorm (fixed-scale
+          RMSNorm, 1/Dk for q and 1/sqrt(Dk) for k), DeltaNetHeadExpansion
+          (repeat_interleave 16->32 heads), DeltaNetRecurrence.step (write-then-read
+          ordering exactly as mlx _gated_delta_step_ops), DeltaNetOutputGate
+          (silu(z)·rmsnorm(y, weight) in fp32 as mlx _precise_swiglu).
+          Oracle scripts/deltanet_oracle.py (pure Python naive loop, cited against
+          mlx_lm qwen3_5.py + gated_delta.py + qwen3_next.py) generates reference
+          constants; t0 was also hand-verified by pencil (q_norm [0.3162, 0.6325],
+          y [0.1581, 0, 0, 0.1581] both check out from first principles).
+Ran:      swift build -> clean; swift test --filter DeltaNetRule -> 16/16 pass
+          (gate hand-checks, scalar recurrence walks, QKNorm vs oracle, head expansion
+          repeat_interleave, full 3-token sequence vs oracle within 1e-4, Qwen3.6-shape
+          smoke test finite); swift test -> 678/678 pass (662 prior + 16 new).
+Learned:  Swift #expect macro needs a single interpolated string for its comment
+          parameter — `+` string concatenation does not type-check as Comment?.
+          (Same trap will apply to any future test.) The steady-state scalar
+          recurrence (q=k=v=beta=1, g=0.5) is invariant: delta always restores state
+          to 1.0, so y=1 at every step — a clean sanity check.
+Unproven: Layer-0 fixture comparison (P3-3) is where these modules meet real weights;
+          until then this is verified-math-only.
+Next:     P3-3
