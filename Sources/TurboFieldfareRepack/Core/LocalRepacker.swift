@@ -58,7 +58,7 @@ public enum LocalRepacker {
                   headerData.count == headerSize else {
                 throw RepackError.safetensorsHeaderInvalid(path: shard, detail: "short header body")
             }
-            shardHeaders.append(try Safetensors.parseHeaderBytes(path: shard,
+            shardHeaders.append(try Safetensors.parseHeaderBytes(path: shardPath,
                                                                   fileSize: fileSize,
                                                                   headerBytes: headerData))
         }
@@ -78,14 +78,13 @@ public enum LocalRepacker {
             bytes: outputBytes + UInt64(RemoteChunkPolicy.defaultBytes),
             reserveBytes: 1 * 1024 * 1024 * 1024)
 
-        // Create output files
+        // Create and populate output files
         let residentPath = (outputDirectory as NSString).appendingPathComponent("model_weights.bin")
-        FileManager.default.createFile(atPath: residentPath,
-                                       contents: Data(),
-                                       attributes: [.posixPermissions: 0o644])
-        let residentFD = try Posix.openCreateRW(residentPath)
-        defer { close(residentFD) }
-        try Posix.ftruncate(residentFD, path: residentPath, size: plan.resident.totalSize)
+        let audit = RepackAudit()
+        var shardsByPath: [String: MmapHandle] = [:]
+        let residentFile = try ResidentWriter.write(plan: plan.resident,
+                                                     shardsByPath: &shardsByPath,
+                                                     audit: audit)
 
         let layersDir = (outputDirectory as NSString).appendingPathComponent("packed_experts")
         try FileManager.default.createDirectory(at: URL(fileURLWithPath: layersDir),
@@ -100,6 +99,7 @@ public enum LocalRepacker {
             defer { close(layerFD) }
             try Posix.ftruncate(layerFD, path: layerPath, size: layerPlan.fileSize)
         }
+        shardsByPath.removeAll()
 
         // Write layout.json
         let expertStride = plan.layers.first(where: { $0.expertsPerLayer > 0 })?.expertStride ?? 0
@@ -108,16 +108,15 @@ public enum LocalRepacker {
         try layout.write(to: URL(fileURLWithPath: layoutPath), options: Data.WritingOptions.atomic)
         try GTurboLayoutValidator.validate(path: layoutPath, plan: plan)
 
-        // Write manifest.json — every entry carries its real SHA-256 so
-        // --verify-install (which re-hashes every declared file) passes.
-        let audit = RepackAudit()
+        // Collect file entries with real SHA-256s.
         func hashedEntry(path: String) throws -> GTurboJSON.FileEntry {
             let size = try FileManager.default.attributesOfItem(atPath: path)[.size] as? UInt64 ?? 0
             let sha = try WriterCore.hashEntireFile(path: path, size: size, audit: audit)
             return GTurboJSON.FileEntry(size: size, sha256: sha)
         }
         var files: [(relativePath: String, info: GTurboJSON.FileEntry)] = []
-        files.append(("model_weights.bin", try hashedEntry(path: residentPath)))
+        files.append(("model_weights.bin", GTurboJSON.FileEntry(
+            size: residentFile.size, sha256: residentFile.sha256)))
         for layerPlan in plan.layers {
             let fileName = (layerPlan.path as NSString).lastPathComponent
             files.append(("packed_experts/\(fileName)", try hashedEntry(path: layerPlan.path)))
@@ -135,8 +134,8 @@ public enum LocalRepacker {
             bitWidths: GTurboJSON.QuantBitWidths(
                 embedding: metadata.baseBits,
                 attention: metadata.baseBits,
-                router: metadata.baseBits,
-                sharedExpert: metadata.baseBits,
+                router: quantBits(forSlot: "router", meta: metadata),
+                sharedExpert: quantBits(forSlot: "sharedExpert", meta: metadata),
                 routedExpert: metadata.baseBits))
 
         try manifestData.write(to: URL(fileURLWithPath: (outputDirectory as NSString).appendingPathComponent("manifest.json")),
@@ -145,5 +144,23 @@ public enum LocalRepacker {
         return LocalRepackResult(displayName: "Qwen3.6-35B-A3B-4bit",
                                  resolvedCommit: metadata.indexSha256Hex,
                                  outputDir: outputDirectory)
+    }
+
+    /// Scan tensor overrides for any entry matching the given quant slot.
+    /// Returns the highest bits found, or the base bits if no override exists.
+    private static func quantBits(forSlot slot: String, meta: IndexLoader.SourceMetadata) -> Int {
+        var bits = meta.baseBits
+        for (name, spec) in meta.bitsOverrides {
+            // Match router: mlp.gate (Qwen3.6) or router.proj (Gemma).
+            // Exclude mlp.shared_expert_gate (scalar, different tensor).
+            if slot == "router" && name.hasSuffix(".mlp.gate") {
+                bits = max(bits, spec.bits)
+            } else if slot == "sharedExpert"
+                        && name.contains(".mlp.shared_expert.")
+                        && !name.hasSuffix("_gate") {
+                bits = max(bits, spec.bits)
+            }
+        }
+        return bits
     }
 }

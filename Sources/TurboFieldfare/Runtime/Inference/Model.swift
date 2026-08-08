@@ -643,10 +643,28 @@ extension Model {
         for layer in 0..<config.numLayers {
             let prefix = "language_model.model.layers.\(layer)"
             let isFull = config.layerKindMask[layer] == 1
+            let isQwen36 = config.topology == .qwen36
             let headDimension = isFull ? config.fullHeadDim : config.headDim
-            let kvHeads = isFull ? config.numFullKVHeads : config.numKVHeads
+            // Qwen3.6: numFullKVHeads=0 → full-attn layers reuse numKVHeads (2).
+            let kvHeads: Int
+            if isFull && config.numFullKVHeads > 0 {
+                kvHeads = config.numFullKVHeads
+            } else if isFull {
+                kvHeads = config.numKVHeads
+            } else {
+                kvHeads = config.numKVHeads
+            }
             let queryDimension = try checkedIntMultiply(
                 config.numHeads, headDimension, field: "layer \(layer) query")
+            // Qwen3.6 full-attention q_proj has 2× rows (8192 vs expected 4096) —
+            // likely a combined Q + auxiliary projection. Accept the doubled size.
+            let queryWeightRows: Int
+            if isQwen36 && isFull {
+                queryWeightRows = try checkedIntMultiply(
+                    queryDimension, 2, field: "layer \(layer) q_proj double")
+            } else {
+                queryWeightRows = queryDimension
+            }
             let kvDimension = try checkedIntMultiply(
                 kvHeads, headDimension, field: "layer \(layer) key/value")
 
@@ -656,8 +674,12 @@ extension Model {
             ] {
                 try requireBF16("\(prefix).\(name)", count: config.hiddenSize)
             }
-            try requireBF16("\(prefix).self_attn.q_norm.weight", count: headDimension)
-            try requireBF16("\(prefix).self_attn.k_norm.weight", count: headDimension)
+            // q_norm/k_norm exist only on full-attention layers.
+            // DeltaNet layers (Qwen3.6) use linear_attn.* instead.
+            if !isQwen36 || isFull {
+                try requireBF16("\(prefix).self_attn.q_norm.weight", count: headDimension)
+                try requireBF16("\(prefix).self_attn.k_norm.weight", count: headDimension)
+            }
 
             // Gemma 4 sandwich norms — extra FFN norms, router aux, layer scalar.
             // Qwen3.6 pre-norm topology does not have these.
@@ -676,20 +698,24 @@ extension Model {
                 try requireBF16("\(prefix).layer_scalar", count: 1)
             }
 
-            try requireAffine("\(prefix).self_attn.q_proj.weight",
-                              rows: queryDimension, columns: config.hiddenSize,
-                              slot: quant.attention)
-            try requireAffine("\(prefix).self_attn.k_proj.weight",
-                              rows: kvDimension, columns: config.hiddenSize,
-                              slot: quant.attention)
-            if !isFull {
-                try requireAffine("\(prefix).self_attn.v_proj.weight",
+            // Self-attention projections exist only on full-attention layers.
+            // Qwen3.6 DeltaNet layers use linear_attn.* instead (deferred to Phase 3).
+            if !isQwen36 || isFull {
+                try requireAffine("\(prefix).self_attn.q_proj.weight",
+                                  rows: queryWeightRows, columns: config.hiddenSize,
+                                  slot: quant.attention)
+                try requireAffine("\(prefix).self_attn.k_proj.weight",
                                   rows: kvDimension, columns: config.hiddenSize,
                                   slot: quant.attention)
+                if !isFull {
+                    try requireAffine("\(prefix).self_attn.v_proj.weight",
+                                      rows: kvDimension, columns: config.hiddenSize,
+                                      slot: quant.attention)
+                }
+                try requireAffine("\(prefix).self_attn.o_proj.weight",
+                                  rows: config.hiddenSize, columns: queryDimension,
+                                  slot: quant.attention)
             }
-            try requireAffine("\(prefix).self_attn.o_proj.weight",
-                              rows: config.hiddenSize, columns: queryDimension,
-                              slot: quant.attention)
             if config.topology == .qwen36 {
                 try requireAffine("\(prefix).mlp.shared_expert.gate_proj.weight",
                                   rows: config.intermediateSize, columns: config.hiddenSize,

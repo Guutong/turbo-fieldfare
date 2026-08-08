@@ -147,9 +147,48 @@ public struct ArchConfig: Sendable, Equatable {
         hiddenActivation: "gelu_pytorch_tanh"
     )
 
+    /// Qwen3.6-35B-A3B-4bit baseline — 40 layers, 256 experts, pre-norm topology,
+    /// silu activation, 10 full-attention layers interleaved with 30 DeltaNet layers.
+    public static let qwen36_35B_A3B = ArchConfig(
+        hiddenSize: 2048,
+        intermediateSize: 512,
+        moeIntermediateSize: 512,
+        numHeads: 16,
+        numKVHeads: 2,
+        numFullKVHeads: 0,
+        headDim: 256,
+        fullHeadDim: 256,
+        vocabSize: 248320,
+        slidingWindow: 0,
+        finalLogitSoftcap: 0.0,
+        ropeTheta: 10_000_000.0,
+        fullRopeTheta: 10_000_000.0,
+        partialRotaryFactor: 0.25,
+        numLayers: 40,
+        numExperts: 256,
+        topKExperts: 8,
+        tieWordEmbeddings: false,
+        attentionKEqV: false,
+        fullAttentionLayerMask: Self.qwen36FullAttentionMask(),
+        layerKindMask: Self.qwen36LayerKindMask(),
+        hiddenActivation: "silu"
+    )
+
     private static func gemma4LayerMask() -> [UInt8] {
         var mask = [UInt8](repeating: 0, count: 30)
         for i in stride(from: 5, to: 30, by: 6) { mask[i] = 1 }
+        return mask
+    }
+
+    private static func qwen36FullAttentionMask() -> [UInt8] {
+        var mask = [UInt8](repeating: 0, count: 40)
+        for i in stride(from: 3, to: 40, by: 4) { mask[i] = 1 }
+        return mask
+    }
+
+    private static func qwen36LayerKindMask() -> [UInt8] {
+        var mask = [UInt8](repeating: 2, count: 40)  // default: linear/DeltaNet
+        for i in stride(from: 3, to: 40, by: 4) { mask[i] = 1 }  // full-attention
         return mask
     }
 }
