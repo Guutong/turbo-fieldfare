@@ -92,9 +92,10 @@ smaller tasks in `plan.md`, add them to the board with new IDs, and stop with
 | P6b-2 | Batch expert prefetch disk-offset order | TODO | kimi-k3 inspired |
 | P6b-3 | Prefill expert dedup | TODO | kimi-k3 inspired |
 | P6b-4 | Speculative decoding | TODO | kimi-k3 inspired · frontier |
-| P3-1 | DeltaNet conv1d + state (Swift) | TODO | ⚠️ frontier only |
+| P3-1 | DeltaNet conv1d + state (Swift) | DONE | 5 hand-checked tests; 662/662 suite |
 | P3-2 | Delta rule + gating (Swift) | TODO | ⚠️ frontier only |
 | P3-3 | Layer-0 isolation test | TODO | ⚠️ frontier only |
+| P3-3b | Qwen36 sequential prefill (decode loop) | TODO | pulled forward from P5-1 · ⚠️ frontier only |
 | P3-4 | Full 40-layer forward, coherent text | TODO | ⚠️ frontier only · milestone |
 | P4-1 | Port recurrence to Metal | TODO | ⚠️ frontier only |
 | P4-2 | Diff Metal vs Swift path | TODO | ⚠️ frontier only |
@@ -396,3 +397,55 @@ Unproven: Output is garbage (EOS every time) — 30 DeltaNet layers are identity
           passthrough. Real coherent text requires Phase 3 DeltaNet. Full Metal
           forward pass against P0-7 fixture deferred (needs 8+ kernel orchestration).
 Next:     P3-1 (frontier) or P2-2b (prefill pre-norm)
+
+### 2026-08-08 — P3-1 — TODO -> DOING
+Did:      Pre-implementation grilling session fixed every Phase 3 decision before code;
+          all recorded durably: new CONTEXT.md glossary + docs/adr/ (ADR-0001 hybrid
+          compute split, ADR-0002 pre-committed parity gate). Decisions: (1) frontier
+          gate confirmed by owner — qwen3.8-max[1m] is the frontier here; (2) sequential
+          decode-loop prefill for Qwen36, P2-2b stays TODO, new task P3-3b owns it;
+          (3) hybrid compute split — five projections on Metal int4 GEMV kernels,
+          conv1d/recurrence/gating in Swift fp32 on CPU; (4) P3-3 gate fixed before
+          code: rel-L2 ≤ 2e-2 + max-abs ≤ 1e-2 on hidden_out.0, expert_ids exact,
+          never widen, knife-edge routing escalates to owner; (5) unit oracles =
+          hand-computed conv constants + committed numpy oracle script for the
+          recurrence; (6) subagents do research/oracle/judging only — code stays
+          single-threaded, one task one commit. Board updated: P3-3b row added,
+          P3-4 Needs -> P3-3b, P5-1 note.
+Ran:      git status --short -> clean apart from the new docs above
+Learned:  DeltaNet weights verified present in /tmp/qwen36.gturbo resident index — all
+          9 tensors × 30 layers (in_proj_qkv/z/a/b + out_proj are 4-bit quantized with
+          scale+bias payloads; conv1d/A_log/dt_bias/norm are bf16). Zero DeltaNet code
+          exists in Sources/ yet. The fixture is a 5-token SEQUENCE capture (hidden_in/out
+          shaped [5,2048], hidden_out.0 rms 0.022 / max 0.64), so the isolation test must
+          run all 5 tokens and its legitimacy rests on sequential-recurrence ≡
+          masked-prefill equivalence.
+Unproven: three load-bearing facts delegated to source-verification agents: MLX affine
+          int4 dequant convention; sequential ≡ masked equivalence for gated_delta_update;
+          exact RMSNormGated + z-gate ordering.
+Next:     P3-1
+
+### 2026-08-08 — P3-1 — DOING -> DONE
+Did:      DeltaNet conv1d (width 4, causal, silu) + per-layer state container in plain
+          Swift fp32: Runtime/DeltaNet/{DeltaNetConv,DeltaNetState}.swift. Conv step is
+          tap-0-oldest cross-correlation over concat(conv_state, qkv), matching the mlx
+          decode semantics recorded in P0-2; state store keys by GLOBAL layer index so
+          the decode loop needs no rank mapping, full-attn layers hold empty arrays,
+          reset() zeroes only linear layers. 5 hand-checked unit tests, pencil
+          derivation in the test header. Grilling outcomes (CONTEXT.md, ADR-0001/0002)
+          committed separately just before this.
+Ran:      swift build -> clean; swift test --filter DeltaNetConv -> 5/5 pass;
+          swift test -> 662/662 pass (baseline 657 + 5 new). One failure en route was
+          my own test literal being wrong (correct footprint is 65_863_680 bytes; I
+          wrote 66_063_360) — code was right, literal fixed.
+Learned:  Metal inventory (subagent): all five DeltaNet projections reuse
+          DequantInt4GEMV AS-IS for any m with n%64==0 — no new GEMV kernel needed;
+          Model.resident(name:) is the generic accessor; GPU↔CPU handoff follows the
+          router-index pattern (shared buffer + contents() bind after
+          waitUntilCompleted); hidden buffers are fp16; bf16 scale/bias upcast inside
+          the kernel. No n=2048/4096 entries in DequantInt4GEMV's specialized-PSO list
+          yet — generic fallback is correct but slower; specialization is a later speed
+          item, not a Phase 3 blocker.
+Unproven: conv tap order / state ordering vs real mlx — source-verification agent still
+          running; P3-3's fixture comparison is the real proof either way.
+Next:     P3-2

@@ -301,8 +301,18 @@ Do: Same injection trick as P2-6, but on layer 0 (a DeltaNet layer).
 Verify: `swift test --filter Layer0`
 Done when: passes within tolerance.
 
-### P3-4 — Full forward, coherent text  ← the milestone
+### P3-3b — Qwen3.6 sequential prefill (decode loop over prompt)
 Needs: P3-3 · Runner: frontier
+Do: Route Qwen3.6 prompts token-by-token through the decode layer loop (which carries
+the pre-norm topology and DeltaNet), bypassing `executePrefillChunk` for this topology.
+Gemma keeps its chunked prefill untouched. Add a test asserting a Qwen36 generation
+never enters the chunked path.
+Verify: `swift build`; `swift test`
+Done when: no new failures, Gemma prefill unchanged, and a Qwen3.6 prompt runs through
+the decode loop end to end.
+
+### P3-4 — Full forward, coherent text  ← the milestone
+Needs: P3-3b · Runner: frontier
 Do: Run all 40 layers — Swift for the 30 linear layers, Metal for the rest. Slow is fine.
 Verify: the three greedy prompts in Success criterion C.
 Done when: all three answer correctly.
@@ -334,6 +344,9 @@ Do: Prefill by looping the decode recurrence over prompt tokens. Do **not** atte
 chunkwise parallel form yet — this sequential path becomes the oracle for it later.
 Verify: `swift test`
 Done when: no new failures.
+Note 2026-08-08: the mechanics were pulled forward into P3-3b (decode-loop prefill for
+Qwen3.6, decided pre-Phase-3). What remains here is re-validating the loop after the
+Phase 4 Metal port and its role as oracle for the future chunkwise form.
 
 ### P5-2 — Multi-token prompts
 Needs: P5-1 · Runner: mixed
