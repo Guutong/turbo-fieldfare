@@ -95,31 +95,44 @@ public struct GFTokenizer: @unchecked Sendable {
         fileManager.fileExists(atPath: folder.appendingPathComponent("tokenizer.json").path)
     }
 
-    public init(tokenizer: any Tokenizer) throws {
+    public init(tokenizer: any Tokenizer, nonGemmaVocabulary: Bool = false) throws {
         self.tokenizer = tokenizer
 
-        guard let bos = tokenizer.bosTokenId else {
-            throw GFTokenizerError.missingSpecialToken("<bos>")
+        // Detect vocabulary family: Gemma uses <bos>/<eos>/<pad>, Qwen uses
+        // <|im_start|>/<|im_end|>/<|endoftext|>.
+        let isQwenVocab = nonGemmaVocabulary
+            || tokenizer.bosTokenId == nil
+        let bos: Int
+        let eos: Int
+        let pad: Int
+
+        if isQwenVocab {
+            bos = tokenizer.convertTokenToId("<|im_start|>") ?? 0
+            eos = tokenizer.eosTokenId ?? (tokenizer.convertTokenToId("<|im_end|>") ?? 0)
+            pad = tokenizer.convertTokenToId("<|endoftext|>") ?? 0
+        } else {
+            guard let b = tokenizer.bosTokenId else {
+                throw GFTokenizerError.missingSpecialToken("<bos>")
+            }
+            bos = b
+            guard let e = tokenizer.eosTokenId else {
+                throw GFTokenizerError.missingSpecialToken("<eos>")
+            }
+            eos = e
+            guard let p = tokenizer.convertTokenToId("<pad>") else {
+                throw GFTokenizerError.missingSpecialToken("<pad>")
+            }
+            pad = p
         }
-        guard let eos = tokenizer.eosTokenId else {
-            throw GFTokenizerError.missingSpecialToken("<eos>")
-        }
-        guard let pad = tokenizer.convertTokenToId("<pad>") else {
-            throw GFTokenizerError.missingSpecialToken("<pad>")
-        }
-        guard let eot = tokenizer.convertTokenToId("<turn|>") else {
-            throw GFTokenizerError.missingSpecialToken("<turn|>")
-        }
-        guard let toolResponse = tokenizer.convertTokenToId("<|tool_response>") else {
-            throw GFTokenizerError.missingSpecialToken("<|tool_response>")
-        }
-        guard let toolCallStart = tokenizer.convertTokenToId("<|tool_call>"),
-              let toolCallEnd = tokenizer.convertTokenToId("<tool_call|>"),
-              let toolResponseEnd = tokenizer.convertTokenToId("<tool_response|>"),
-              let channelStart = tokenizer.convertTokenToId("<|channel>"),
-              let channelEnd = tokenizer.convertTokenToId("<channel|>") else {
-            throw GFTokenizerError.missingSpecialToken("Gemma tool/channel markers")
-        }
+
+        // Tool/channel markers are Gemma-specific; default to 0 for non-Gemma.
+        let eot = tokenizer.convertTokenToId("<turn|>") ?? 0
+        let toolResponse = tokenizer.convertTokenToId("<|tool_response>") ?? 0
+        let toolCallStart = tokenizer.convertTokenToId("<|tool_call>") ?? 0
+        let toolCallEnd = tokenizer.convertTokenToId("<tool_call|>") ?? 0
+        let toolResponseEnd = tokenizer.convertTokenToId("<tool_response|>") ?? 0
+        let channelStart = tokenizer.convertTokenToId("<|channel>") ?? 0
+        let channelEnd = tokenizer.convertTokenToId("<channel|>") ?? 0
 
         self.bosID = Int32(bos)
         self.eosID = Int32(eos)
