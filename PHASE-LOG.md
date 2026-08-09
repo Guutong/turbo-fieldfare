@@ -100,7 +100,7 @@ smaller tasks in `plan.md`, add them to the board with new IDs, and stop with
 | P4-1 | Port recurrence to Metal | DONE | ⚠️ frontier only · 9 kernels in `deltanet.metal`, conv+recurrent state in MTLBuffers; parity vs the Swift oracle relL2 ≤1.2e-06; 3/3 criterion-C prompts; 1→2.4 tok/s — see History |
 | P4-2 | Diff Metal vs Swift path | DONE | ⚠️ frontier only · all 30 DeltaNet layers agree, worst deltaOut relL2 1.29e-06 (layer 18), gate 1e-5; criterion C 2/2 checked prompts still correct — see History |
 | P5-1 | Sequential prefill | DONE | ⚠️ frontier only · re-validated after the Metal port: prefill-on and prefill-off produce byte-identical output; new parity test pins it; chunkwise form deliberately not attempted — see History |
-| P5-2 | Multi-token prompt coherence | TODO | |
+| P5-2 | Multi-token prompt coherence | DONE | ⚠️ frontier only · 136-token paragraph prompt answered correctly and coherently; 3/3 criterion-C still pass (incl. "4"); prefill on/off byte-identical at 136 tok; no code changes — see History |
 | P6-1 | Measure expert cache hit rate | TODO | |
 | P6-2 | Enforce context cap | TODO | |
 | P6-3 | ≤2GB resident, ≥4 tok/s | TODO | final |
@@ -1013,3 +1013,68 @@ Next:     P5-2 (multi-token prompt coherence). Still open and deliberately
           bug is unreachable from the Qwen3.6 path, which never enters the
           chunked machinery, but will matter if a chunkwise prefill form is
           built on it).
+
+### P5-2 — Multi-token prompts
+Did:      No code changed. This was a pure verification task and everything
+          was already coherent, so there was nothing to bisect and no
+          fixture to add. Confirmed the engine holds up on a
+          paragraph-length prompt (136 prompt tokens), which is ~17x the
+          longest prompt anything through P5-1 had ever exercised (5-8
+          tokens). The prompt was chosen so "coherent" is checkable rather
+          than a vibe: a factual passage followed by a question whose
+          answer is fully determined by the passage, so a correct answer
+          proves the model actually attended across all 136 tokens instead
+          of merely producing fluent text.
+Ran:      Release CLI, `--temperature 0` (greedy, for determinism — the
+          sampling path was already sanity-checked in P5-1 via
+          `--temperature 0.7 --seed 42`), `--prefill off`, `--max-new 8`:
+          criterion C is 3/3, no regression after the Metal port —
+          `"The capital of France is"` -> `" Paris, a city renowned for its
+          iconic"`; `"2 + 2 ="` -> `" 4.\n\nThe following is a"`;
+          `"The largest planet in our solar system is"` -> `" Jupiter,
+          which has a mass of "`. Note the knife-edge `2 + 2 =` case landed
+          on `" 4"` cleanly this run.
+          Then the new part, `--max-new 60`, prompt (136 tok):
+          "The Amazon rainforest covers roughly 5.5 million square
+          kilometres and spans nine countries in South America, with about
+          sixty percent of it lying within Brazil. It holds an estimated
+          ten percent of all known species on Earth, and its rivers carry
+          more fresh water than any other river system in the world.
+          Deforestation there has been driven largely by cattle ranching,
+          soy cultivation, and road building, and scientists warn that
+          continued clearing could push the forest past a tipping point
+          beyond which it would dry out and become savanna. Question:
+          according to the passage above, which single country contains
+          most of the Amazon rainforest, and what are the three main
+          drivers of deforestation? Answer:"
+          Generated verbatim:
+          "<think>\n\n</think>\n\nBased on the passage, **Brazil** contains
+          most of the Amazon rainforest (approximately sixty percent), and
+          the three main drivers of deforestation are **cattle ranching**,
+          **soy cultivation**, and **road building**.user\nA 4"
+          (`stop=maxTokens prefill=136tok new=60tok decode=23.70s
+          tok/s=2.532`). Re-ran the identical prompt with `--prefill on`:
+          byte-identical output (2.547 tok/s).
+Learned:  Coherent, and by the strong definition: grammatical, on-topic,
+          non-repetitive, and factually correct against the passage — it
+          picked out Brazil and all three drivers in the right order, which
+          requires real long-range attention, not just local fluency. No
+          repetition loop, no garbage tokens, no topic drift. So the
+          state-accumulation worry (DeltaNet conv/recurrent state and
+          full-attention KV growth over 136 prefill tokens rather than 5)
+          did not materialise, and P5-1's prefill on/off parity — which had
+          only ever been shown on a 5-token prompt — holds at 136 tokens
+          too. The one wart: the model emits a bare `user` role marker
+          right after finishing its answer and then drifts into `A 4`. That
+          is the model correctly ending its turn while `--max-new 60`
+          forces generation past the turn boundary, compounded by the
+          already-logged Qwen chat-template marker leakage; it is not
+          incoherence in the answer itself and it is out of scope here.
+          Also worth recording honestly: the regression filter was NOT run
+          this task, because no Swift source was touched — the CLI binary
+          used is the same one P5-1 tested.
+Next:     P6-1 (expert cache hit rate). Still open and untouched, unchanged
+          from P5-1: the Qwen chat template's Gemma marker leakage (now
+          with a concrete observation attached — the stray `user` marker
+          above) and the chunked-prefill path's hardcoded `isFull ? attnK`
+          v_proj bug (still unreachable from the Qwen3.6 path).
