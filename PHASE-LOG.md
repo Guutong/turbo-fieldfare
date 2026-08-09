@@ -97,7 +97,7 @@ smaller tasks in `plan.md`, add them to the board with new IDs, and stop with
 | P3-3 | Layer-0 isolation test | DONE | Real repack (LayerWriter fix) into scratch/qwen36.gturbo; gate passes relL2≤0.0075, maxAbs≤0.0039 — see History |
 | P3-3b | Qwen36 sequential prefill (decode loop) | DONE | routes via PrefillRoutePolicy; 694/694 pass; proves the route, not the math — see History |
 | P3-4 | Full 40-layer forward, coherent text | DONE | ⚠️ frontier only · milestone · engine verified correct (layer-by-layer MLX parity); bare "2+2=" is a base-model prompt-format quirk, not an engine bug — see History |
-| P4-1 | Port recurrence to Metal | TODO | ⚠️ frontier only |
+| P4-1 | Port recurrence to Metal | DONE | ⚠️ frontier only · 9 kernels in `deltanet.metal`, conv+recurrent state in MTLBuffers; parity vs the Swift oracle relL2 ≤1.2e-06; 3/3 criterion-C prompts; 1→2.4 tok/s — see History |
 | P4-2 | Diff Metal vs Swift path | TODO | ⚠️ frontier only |
 | P5-1 | Sequential prefill | TODO | |
 | P5-2 | Multi-token prompt coherence | TODO | |
@@ -824,3 +824,86 @@ Next:     Get full-model MLX ground truth for `"2 + 2 ="` on a machine with
           path at `RealForwardRunner.swift:802` still has the same hardcoded
           `isFull ? attnK` v_proj bug fixed in the decode path — harmless today
           only because Qwen3.6 routes to sequential prefill (P3-3b).
+
+### 2026-08-09 — P4-1 — TODO -> DONE
+Did:      Ported the DeltaNet decode step to Metal with the conv and
+          recurrent state resident in `MTLBuffer`s instead of `[Float]`
+          arrays. New shader module `Sources/TurboFieldfare/Metal/DeltaNet/
+          deltanet.metal` (registered in `MetalContext.shaderModules` /
+          `shaderSubdirectories`) with nine `dn_`-prefixed kernels: FP16
+          `hidden` load/store bridging, input RMSNorm, dense fp32 mat-vec
+          (the five projections), causal conv1d + silu with an in-place
+          state slide, QK-RMSNorm fused with the key->value head expansion,
+          the beta/g gates, the gated delta-rule recurrence, and the gated
+          RMSNorm/swiglu output gate. New `DeltaNetMetalBlock` owns the
+          pipelines, the ~220 KB per-token scratch, a lazily-populated fp32
+          weight-upload cache (reusing `DeltaNetCPUBlock.LayerWeights`'s
+          proven int4/bf16 dequant helpers), and `GPUStateStore` — the
+          buffer-backed replacement for `DeltaNetStateStore`, same
+          global-layer indexing, `nil` for full-attention layers, `reset()`
+          zeroing every buffer. `RealForwardRunner` now encodes the block
+          into the SAME command buffer as the layer's post-attention norm
+          and router, so the `hidden = hidden + deltaOut` write-back is
+          ordered without an extra sync point. `DeltaNetCPUBlock` was left
+          in place, unmodified, as the parity oracle.
+Ran:      `swift test --filter DeltaNet` -> 24 tests / 4 suites, ALL PASS
+          (the plan's stated verify command). `swift test --filter
+          "Layer0|Layer3|Qwen36|DeltaNet|Epilogue|QKV"` -> 55 tests / 12
+          suites, ALL PASS — P3-4's 53 plus the two new ones. The P3-3
+          numeric gate is unchanged and untouched: `layer0Forward
+          MatchesFixtureWithinTolerance` still reports relL2
+          0.005738/0.006700/0.006940/0.007089/0.007520 and maxAbs
+          <= 0.0039091706 across the 5 fixture tokens (ADR-0002 tolerance
+          NOT widened). New `DeltaNetMetalParityTests` steps the Metal and
+          Swift paths in LOCKSTEP over 6 tokens of layer 0 against the real
+          repacked weights, so state-plumbing bugs would compound; measured
+          deltaOut relL2 4.596e-07, 7.966e-07, 1.197e-06, 8.713e-07,
+          1.001e-06, 8.966e-07 with maxAbs <= 3.725e-07, final conv state
+          relL2 2.925e-07 and recurrent state relL2 4.716e-07 — flat, not
+          compounding. Gate set at 1e-5 (~10x headroom) before those
+          numbers were pasted into the test's doc comment. Release CLI
+          re-run of Success criterion C, verbatim: `"The capital of France
+          is"` -> `" Paris, a city renowned for its iconic"`; `"The largest
+          planet in our solar system is"` -> `" Jupiter, which has a mass
+          of "` — both byte-identical to P3-4. `"2 + 2 ="` -> `" 4.\n\nThe
+          following is a"`, i.e. 3/3 criterion-C prompts now answer
+          correctly. Decode throughput went from P3-4's ~1 tok/s to
+          2.42-2.64 tok/s on the same machine.
+Learned:  Keeping the reference's SEQUENTIAL reduction order in the kernels
+          — one thread per output row, recomputing a row's sum of squares
+          per thread rather than using SIMD/threadgroup reductions — is what
+          made this port land green on the first numeric run. At these
+          dimensions the redundant arithmetic is free, and it collapses the
+          divergence budget to FMA contraction plus transcendental ULPs
+          (~1e-06), so any real bug would have been unmissable instead of
+          hiding under a reassociation-sized tolerance. Two Metal-specific
+          traps: MSL has no `log1p`, so `dn_softplus` needs the standard
+          `log(u) * (y / (u - 1))` correction to match
+          `DeltaNetGate.softplus`; and symbol names are global because the
+          shader modules are concatenated into one runtime library, so
+          everything is `dn_`-prefixed to avoid colliding with `silu` in
+          `moe.metal`. The recurrence parallelizes cleanly with zero
+          barriers: one thread per (value head, value index) pair owns
+          exactly one `headKDim`-long row of the state, and the conv's
+          in-place window slide is likewise per-channel, so neither needs
+          an atomic or a barrier. The `pendingRoutedCommand` drain P3-4
+          found correct-as-written is still required — it now guards a
+          GPU-GPU rather than GPU-CPU hazard, since Metal orders work
+          within a command buffer but promises nothing across command
+          buffers on the same queue.
+Unproven: `"2 + 2 =" -> " 4."` now answering correctly is NOT claimed as a
+          fix. P3-4 diagnosed that prompt as a knife-edge prompt-format
+          quirk rather than an engine defect, and nothing here targeted it;
+          the most likely explanation is that ~1e-06 numeric differences
+          tipped a near-tie argmax. It should not be treated as evidence
+          either way about the underlying question, which P3-4's "Next"
+          still owns. Also unproven: only layer 0 was diffed against the
+          Swift oracle at the unit level — all-40-layer agreement is P4-2's
+          job, and the criterion-C runs are end-to-end evidence, not
+          per-layer evidence. Perf was observed, not profiled; no claim is
+          made about where the remaining time goes.
+Next:     P4-2 (diff the Metal path against the Phase 3 Swift path layer by
+          layer). Still open from P3-4 and deliberately untouched here: the
+          Qwen chat template rendering Gemma's `<|channel>` /
+          `<|end_of_turn|>` markers, and the chunked-prefill path's
+          hardcoded `isFull ? attnK` v_proj bug.
