@@ -86,6 +86,7 @@ public func runRawCompletion(producer: any LogitProducer,
                              scratch: RawCompletionScratch,
                              prefillConfig: PrefillRuntimeConfig = .defaultChunked,
                              start: RawCompletionStart = .reset,
+                             speculator: NGramSpeculator? = nil,
                              shouldStop: () -> Bool = { false },
                              onProgress: (RawDecodeProgress) -> Void) async throws -> RawDecodeResult {
     try config.validate()
@@ -198,6 +199,13 @@ public func runRawCompletion(producer: any LogitProducer,
                                      history: history, config: config, position: generated)
         }
         generated += 1
+        // P6b-4: n-gram speculation accounting. `history` here is exactly the
+        // tokens already fed to the producer, and `tokenID` is the real greedy
+        // token the forward pass just produced — so the drafter is verified
+        // against the serial path's own output and can never change it. See
+        // `NGramSpeculator` for why this makes speculation byte-identical to
+        // serial decode by construction.
+        speculator?.observe(realToken: tokenID, context: history)
         uncommittedBoundaryTokenIDs = [tokenID]
 
         if tokenizer.stopTokenIDs.contains(tokenID) || config.extraStopTokens.contains(tokenID) {

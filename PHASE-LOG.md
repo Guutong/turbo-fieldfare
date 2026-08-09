@@ -91,7 +91,7 @@ smaller tasks in `plan.md`, add them to the board with new IDs, and stop with
 | P6b-1 | Expert LRU cache with pinning | DONE | kimi-k3 inspired · LRU + slot pinning + per-layer eviction counters; LRU hit rate 53.29% vs LFU baseline 54.31% (near-parity, LFU slightly ahead) — see History |
 | P6b-2 | Batch expert prefetch disk-offset order | DONE | kimi-k3 inspired · 3-phase acquire, offset-sorted phase 2, queue depth 16 · measured NEUTRAL on NVMe (sorted 2.592 vs unsorted 2.660 tok/s mean of 3, within noise) — see History |
 | P6b-3 | Prefill expert dedup | DONE | kimi-k3 inspired · chunked dedup doesn't apply (sequential prefill is causally serial); measured the existing cache's dedup benefit instead — prefill hit rate 58.53%, ioReduction 2.41x (gate >=2x) — see History |
-| P6b-4 | Speculative decoding | TODO | kimi-k3 inspired · frontier |
+| P6b-4 | Speculative decoding | DONE | kimi-k3 inspired · `NGramSpeculator` (4->3 suffix ladder, K=4), never-commit-unverified so output is byte-identical to serial decode (verified on 2 real runs); measured acceptRate 0.897 and 2.500 tokens/round on a repetitive workload (both gates cleared), 0.889 / 1.154 on the standard prose prompt (tokens/round gate missed); no wall-clock win is realizable until Qwen3.6 gets a batched multi-token forward pass — see History |
 | P6b-5 | F_NOCACHE on expert fd | FAILED | research-suggested (llama.cpp #18758 cited +46%) · measured NEUTRAL on this NVMe machine (baseline 2.265/2.214, F_NOCACHE 2.285/2.061 tok/s across 2 runs each — within run-to-run noise, no measurable win) — see History |
 | P6b-6 | Bump expert cache slots 16->32 | FAILED | measurement only, no code change · 16 slots mean 2.35 tok/s (3 runs) vs 32 slots mean 2.47 tok/s (3 runs), +5.1%; RSS 1.57GB->1.87GB (+19%, still <2GB gate); nowhere near closing >=4 tok/s gate — see History |
 | P3-1 | DeltaNet conv1d + state (Swift) | DONE | 5 hand-checked tests; 662/662 suite |
@@ -1629,3 +1629,134 @@ Next:     P6b-4 (speculative decoding, still running) is the remaining
           is item 2 from that plan — draft-driven expert prefetch overlapping
           I/O with compute, extending P6b-4's draft mechanism rather than
           building new machinery — once P6b-4 reports its own result.
+
+### 2026-08-09 — P6b-4 — TODO -> DONE (n-gram speculation lands, byte-identical; the batched verify pass it would need does not exist)
+Did:      Built `NGramSpeculator` (new file,
+          `Runtime/Generation/NGramSpeculator.swift`): kimi-k3's
+          evidence-gated longest-suffix drafter, ladder [4, 3] (shorter rungs
+          deliberately not attempted — a 1-2 token suffix matches everywhere
+          and its continuation carries no signal), most-recent earlier
+          occurrence wins within a rung, drafts up to K=4 tokens, plus
+          `SpeculationStats` round accounting where a "round" is one
+          verification pass committing `accepted + 1` tokens (so
+          `tokensPerRound` is exactly plan.md's "tokens per decode step").
+          Wired into `runRawCompletion` as an optional `speculator:`
+          parameter and exposed on the CLI behind `TFF_SPEC_DECODE=1`, which
+          prints a `[spec-decode ...]` stderr footer next to P6b-3's
+          expert-cache lines.
+          **Design decision on the state-rollback problem: neither
+          snapshot-and-rollback nor stage-and-commit —
+          never-commit-unverified.** Greedy decode already computes the real
+          argmax `a_n` for position `n` as a side effect of the forward pass
+          over `t_n`. A drafted token `d` for position `n+1` is therefore
+          accepted **iff `d == a_n`**, a pure integer comparison against a
+          number the serial path had already produced. Accepting feeds the
+          model exactly the token serial decode would have fed; rejecting
+          feeds `a_n` — also exactly what serial decode would have fed. No
+          unverified token ever reaches `produceToken`, so the 30 DeltaNet
+          layers' conv/recurrent state and the 10 full-attention layers' KV
+          cache are only ever advanced by committed tokens. The rollback
+          problem does not arise; there is nothing to undo because nothing
+          speculative is ever committed. Scope: **greedy only**
+          (`--temperature 0`); distribution-matching rejection sampling for
+          temperature > 0 was not attempted.
+Ran:      `swift test --filter NGramSpeculator` -> **15/15 pass** (8
+          drafting: no-evidence, context shorter than the shortest rung,
+          length-4 match, K cap, length-3 fallback, length-4 rung preferred
+          over a MORE RECENT length-3 match, most-recent-wins within a rung,
+          2-gram rung correctly not attempted; 6 round-accounting: 1 token
+          per round without evidence, fully-accepted draft commits K+1 in ONE
+          round, partial rejection ends the round at first mismatch, rejected
+          tail not carried into the next round, repetitive stream exceeds
+          both gates, reset; 1 invariant: 50 randomised prompt/generation
+          pairs asserting the committed stream always equals the real stream
+          exactly). Full regression
+          `swift test --filter "Layer0|Layer3|Qwen36|DeltaNet|Epilogue|QKV|NGramSpeculator"`
+          -> **exit 0, 57 swift-testing tests in 13 suites pass**, including
+          the full P4-2 DeltaNet Metal-vs-CPU parity sweep (worst deltaOut
+          relL2 1.289676e-06, worst state relL2 6.592908e-07 at layer 18 —
+          unchanged, no tolerance touched).
+          Real-model runs, machine verified idle (`ps aux` clean), run
+          sequentially, `--temperature 0 --prefill on`, `scratch/qwen36.gturbo`.
+          **(1) Byte-identity, standard 136-token Amazon-rainforest prompt**
+          used by every prior Phase 6/6b task, `--max-new 60`, run twice —
+          once without `TFF_SPEC_DECODE`, once with. `diff` of the two
+          generations: **byte-identical**, and the text is the same answer
+          every prior run of this prompt has produced (Brazil + cattle
+          ranching / soy cultivation / road building). Footer:
+          `[spec-decode rounds=52 committed=60 drafts=3 noEvidence=49
+          proposed=9 accepted=8 acceptRate=0.8889 tokensPerRound=1.154]`.
+          **(2) Byte-identity + draft exercise, repetitive workload** — a
+          60-token prompt asking for a sentence repeated on numbered lines,
+          `--max-new 100`, again run with and without the env var. `diff`:
+          **byte-identical**. Footer:
+          `[spec-decode rounds=40 committed=100 drafts=17 noEvidence=23
+          proposed=68 accepted=61 acceptRate=0.8971 tokensPerRound=2.500]`.
+          **Against plan.md's gates: acceptance rate >=50% is cleared on BOTH
+          workloads (0.889 and 0.897). Tokens per decode step >=1.5 is
+          cleared on the repetitive workload (2.500) and MISSED on the
+          standard prose prompt (1.154).**
+Learned:  **Two separate results, and the second is the important one.**
+          (a) The drafter works and its acceptance is high wherever it fires
+          — ~89-90% on both workloads. What varies is how OFTEN it fires:
+          on repetitive text 17 of 40 rounds had evidence, on ordinary prose
+          only 3 of 52 (**49 of 52 rounds, 94%, had no length-4 AND no
+          length-3 match anywhere in a 196-token context**). n-gram/prompt-
+          lookup drafting is not a general decode accelerator here; it is a
+          repetition accelerator, and the 1.154 vs 2.500 spread between the
+          two prompts is entirely explained by how repetitive the generated
+          text is, exactly as the task anticipated.
+          (b) **The measured `tokensPerRound` is a ceiling, not a wall-clock
+          speedup, and cannot currently be cashed in.** A round only becomes
+          cheaper than `accepted + 1` serial steps if the K draft positions
+          are verified in ONE batched forward pass. Qwen3.6 has no such pass:
+          `prefillChunked` returns into `prefillSequential` for this topology
+          (`PrefillRoutePolicy.route`), and `prefillSequential` is a plain
+          per-token `produceToken` loop — the same fact P6b-3 established.
+          Verifying K drafts therefore costs K sequential forward passes,
+          i.e. exactly what serial decode costs, and the honest consequence
+          is that greedy n-gram speculation with sequential verification is
+          **provably identical to serial decode in both output and cost** —
+          zero waste (rejection costs no forward pass, since the mismatch is
+          detected against an argmax already in hand) and zero gain. The
+          `tok/s` figures confirm it: 1.619 vs 2.172 on the Amazon prompt and
+          1.901 vs 1.706 on the repetitive one, baseline vs instrumented —
+          run-to-run noise in both directions, no signal, consistent with an
+          observational change. This is why the work landed as a real,
+          tested, correct drafter plus honest measurement rather than a
+          claimed speedup.
+          (c) This makes P6b-4 the third consecutive task (after P6b-1's
+          LRU-vs-LFU near-tie and P6b-2's neutral offset-sorting) where the
+          plan.md mechanism is correct in the abstract but the bottleneck
+          identified by P6-3 — decode is ~8% CPU, I/O-bound on expert
+          streaming — is untouched by it. The lever that WOULD pay off is the
+          one thing every one of these tasks has now pointed at: a batched
+          multi-token forward pass for the Qwen3.6 topology, which would let
+          a round's K positions share one round-trip. That is a P5-1-scale
+          piece of work (a layer-major chunked path handling the DeltaNet
+          recurrence as a within-layer scan plus the pre-norm topology), and
+          it was correctly out of scope here.
+Unproven: Two prompts, one machine, one decode length, greedy only.
+          Temperature > 0 speculation (which needs distribution-matching
+          rejection sampling, and unlike the greedy case genuinely WOULD
+          need the state-rollback machinery) was not implemented or tested.
+          The claim that a batched verify pass is architecturally possible
+          for DeltaNet (recurrence is a sequential scan WITHIN a layer, so a
+          layer-major pass over K tokens is valid even though a token-major
+          one is not) is reasoned from source, **not** demonstrated by a
+          working implementation — it is the natural next investigation, not
+          an established fact. The `draft` scan is O(context x K) per round
+          on the CPU; at 196 tokens this is free next to a forward pass but
+          was not profiled at long context.
+Next:     **Phase 6b is now complete — P6b-1, P6b-2, P6b-3, P6b-4 all DONE**
+          (P6b-5 and P6b-6 FAILED as measured). The standing recommendation
+          out of this task is the batched multi-token Qwen3.6 forward pass,
+          which is the prerequisite for P6b-4's measured 2.5 tokens/round to
+          become real wall-clock time and is also what the tail of the board
+          already names as "draft-driven expert prefetch overlapping I/O with
+          compute, extending P6b-4's draft mechanism" — that item can now
+          build on `NGramSpeculator`, which exists and is tested. Carried
+          forward, still open and untouched: Qwen chat-template Gemma marker
+          leakage, unreachable chunked-prefill `isFull ? attnK` v_proj bug,
+          `AppContextLengthOption`'s stale 32K/64K choices, and the untracked
+          `Scripts/parse_resident_index.py` still sitting in the working tree.

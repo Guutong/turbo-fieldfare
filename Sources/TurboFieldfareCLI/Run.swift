@@ -92,6 +92,12 @@ public func run(args: Args,
             runtimeConfiguration: runtime)
         let scratch = try RawCompletionScratch(context: context,
                                                vocab: model.config.vocabSize)
+        // P6b-4: opt-in n-gram speculation accounting. Purely observational —
+        // it never feeds a token to the model, so enabling it cannot change
+        // the generated text.
+        let speculator = ProcessInfo.processInfo.environment["TFF_SPEC_DECODE"] == "1"
+            ? NGramSpeculator()
+            : nil
         let stats = try await runRawCompletion(
             producer: runner,
             tokenizer: tokenizer,
@@ -99,7 +105,8 @@ public func run(args: Args,
             config: config,
             context: context,
             scratch: scratch,
-            prefillConfig: runtime.prefillConfig) { progress in
+            prefillConfig: runtime.prefillConfig,
+            speculator: speculator) { progress in
                 switch progress {
                 case .prefill:
                     break
@@ -116,6 +123,11 @@ public func run(args: Args,
                 : 0
             let footer = "\n[stop=\(String(describing: stats.reason)) prefill=\(stats.prefillTokens)tok new=\(stats.newTokens)tok decode=\(String(format: "%.2f", stats.decodeSeconds))s tok/s=\(String(format: "%.3f", tokensPerSecond))]\n"
             stderr.write(Data(footer.utf8))
+        }
+        if let speculator {
+            let s = speculator.stats
+            let line = "[spec-decode rounds=\(s.rounds) committed=\(s.committedTokens) drafts=\(s.draftsProposed) noEvidence=\(s.roundsWithoutEvidence) proposed=\(s.draftTokensProposed) accepted=\(s.draftTokensAccepted) acceptRate=\(String(format: "%.4f", s.acceptanceRate)) tokensPerRound=\(String(format: "%.3f", s.tokensPerRound))]\n"
+            stderr.write(Data(line.utf8))
         }
         if ProcessInfo.processInfo.environment["TFF_EXPERT_CACHE_STATS"] == "1" {
             let cache = model.routedExpertCacheStats()
