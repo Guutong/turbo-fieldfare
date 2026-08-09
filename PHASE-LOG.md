@@ -99,7 +99,7 @@ smaller tasks in `plan.md`, add them to the board with new IDs, and stop with
 | P3-4 | Full 40-layer forward, coherent text | DONE | ⚠️ frontier only · milestone · engine verified correct (layer-by-layer MLX parity); bare "2+2=" is a base-model prompt-format quirk, not an engine bug — see History |
 | P4-1 | Port recurrence to Metal | DONE | ⚠️ frontier only · 9 kernels in `deltanet.metal`, conv+recurrent state in MTLBuffers; parity vs the Swift oracle relL2 ≤1.2e-06; 3/3 criterion-C prompts; 1→2.4 tok/s — see History |
 | P4-2 | Diff Metal vs Swift path | DONE | ⚠️ frontier only · all 30 DeltaNet layers agree, worst deltaOut relL2 1.29e-06 (layer 18), gate 1e-5; criterion C 2/2 checked prompts still correct — see History |
-| P5-1 | Sequential prefill | TODO | |
+| P5-1 | Sequential prefill | DONE | ⚠️ frontier only · re-validated after the Metal port: prefill-on and prefill-off produce byte-identical output; new parity test pins it; chunkwise form deliberately not attempted — see History |
 | P5-2 | Multi-token prompt coherence | TODO | |
 | P6-1 | Measure expert cache hit rate | TODO | |
 | P6-2 | Enforce context cap | TODO | |
@@ -955,3 +955,61 @@ Next:     P5-1 (sequential prefill — mechanics already pulled forward into
           leakage and the chunked-prefill path's hardcoded `isFull ? attnK`
           v_proj bug (both noted since P3-4/P4-1, still unfixed, still out
           of scope).
+
+### 2026-08-09 — P5-1 — TODO -> DONE (sequential prefill re-validated on the Metal DeltaNet path)
+Did:      No production code changed — the mechanics landed in P3-3b and are
+          still correct. Confirmed by reading the wiring that prefill and
+          decode share one recurrence: `prefillChunked` dispatches on
+          `PrefillRoutePolicy.route(for: cfg.topology)`, `.qwen36` ->
+          `prefillSequential`, which calls the same `produceToken` per
+          prompt token that `produce` calls, and `RealForwardRunner` has
+          exactly one DeltaNet dispatch site (line ~1749) and it is
+          `DeltaNetMetalBlock`. So the Metal port reached prefill for free;
+          there was no stale `DeltaNetCPUBlock` call left on the prefill
+          path. Added `Qwen36SequentialPrefillParityTests` (commit
+          dce86a8) to pin that rather than leave it as a reading: it
+          replays the criterion-C prompt through `prefillChunked` and
+          through a decode-only per-token `produce` replay, greedy-decodes
+          4 more tokens on each, and requires the two token sequences to be
+          identical. Did NOT attempt the chunkwise parallel form (plan.md
+          says not to); the test's doc comment records that this sequential
+          loop is its intended oracle.
+Ran:      Release CLI (not rebuilt — no Swift source changed), same prompt
+          both ways, byte-identical: `--prefill on` -> `" Paris, a city
+          renowned for its iconic landmarks such as the"` (3.009 tok/s);
+          `--prefill off` -> the same string (3.147 tok/s), both
+          `prefill=5tok new=12tok`. These are genuinely different code
+          paths, not a vacuous comparison: `--prefill on` goes through
+          `prefillChunked`/`prefillSequential` (lm_head on the last prompt
+          token only, fused greedy seed) while `--prefill off` goes through
+          RawCompletion's scalar replay loop (lm_head every token).
+          `swift test --filter Qwen36SequentialPrefillParityTests` -> 1/1
+          PASS, 248.2s. Regression filter run in four foreground chunks to
+          stay under the per-call timeout, all PASS, exit 0:
+          `Epilogue|QKV` 8 tests / 5 suites / 1.5s; `Layer0|Layer3` 21
+          tests / 3 suites / 54.5s; `DeltaNet` 25 tests / 4 suites /
+          799.0s; `Qwen36` 28 tests / 8 suites / 362.0s (includes both the
+          P3-3b routing suite and the new parity suite). ADR-0002
+          tolerances untouched.
+Learned:  A parity test between two paths is worthless without a
+          ground-truth anchor. The first version of this test passed while
+          being completely vacuous — path B used `produce`, which hardcodes
+          `.greedyIfAvailable`, so it never wrote the logits buffer and the
+          comparison was reading path A's own stale bytes back. Adding an
+          assertion that the continuation actually begins with "Paris"
+          turned the green run red immediately and exposed it. The
+          follow-on red herring: `RawCompletionScratch.logits` is Float16,
+          and reading it as Float32 yields a plausible-looking but wrong
+          argmax (token 5875 " Over", repeating) — that was a bug in the
+          test, not in the engine, confirmed by the CLI producing " Paris"
+          in both the fused-greedy path (temperature 0) and the non-fused
+          logits path (`--temperature 0.7 --seed 42` -> `" Paris. Paris is
+          a European capital city of France."`). Final test asserts on the
+          greedy token sequence, the same observable the CLI emits.
+Next:     P5-2 (multi-token prompt coherence). Still open and deliberately
+          untouched: the Qwen chat template's Gemma marker leakage and the
+          chunked-prefill path's hardcoded `isFull ? attnK` v_proj bug
+          (both noted since P3-4/P4-1, still out of scope; note the v_proj
+          bug is unreachable from the Qwen3.6 path, which never enters the
+          chunked machinery, but will matter if a chunkwise prefill form is
+          built on it).
