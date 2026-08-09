@@ -63,6 +63,13 @@ public struct ExpertCacheStats: Sendable, Equatable {
     /// P6b-1: number of times pinning had to be overridden because there were
     /// not enough unpinned slots to place the plan's misses. Should stay 0.
     public var pinOverrides: Int
+    /// P6b-2: cumulative wall-clock nanoseconds spent inside phase 2 of the
+    /// batched acquire (the parallel, offset-sorted preads). This is the
+    /// directly measurable "I/O wall time" the batching is meant to reduce.
+    public var readNanos: UInt64
+    /// P6b-2: largest number of preads observed in flight simultaneously.
+    /// Must never exceed `PreadExpertStreamer.prefetchQueueDepth`.
+    public var peakInFlightReads: Int
 
     public init(lookups: Int = 0,
                 hits: Int = 0,
@@ -70,7 +77,9 @@ public struct ExpertCacheStats: Sendable, Equatable {
                 plans: Int = 0,
                 evictions: Int = 0,
                 pinnedProtections: Int = 0,
-                pinOverrides: Int = 0) {
+                pinOverrides: Int = 0,
+                readNanos: UInt64 = 0,
+                peakInFlightReads: Int = 0) {
         self.lookups = lookups
         self.hits = hits
         self.misses = misses
@@ -78,6 +87,8 @@ public struct ExpertCacheStats: Sendable, Equatable {
         self.evictions = evictions
         self.pinnedProtections = pinnedProtections
         self.pinOverrides = pinOverrides
+        self.readNanos = readNanos
+        self.peakInFlightReads = peakInFlightReads
     }
 
     public var hitRate: Double {
@@ -91,7 +102,9 @@ public struct ExpertCacheStats: Sendable, Equatable {
                          plans: lhs.plans + rhs.plans,
                          evictions: lhs.evictions + rhs.evictions,
                          pinnedProtections: lhs.pinnedProtections + rhs.pinnedProtections,
-                         pinOverrides: lhs.pinOverrides + rhs.pinOverrides)
+                         pinOverrides: lhs.pinOverrides + rhs.pinOverrides,
+                         readNanos: lhs.readNanos &+ rhs.readNanos,
+                         peakInFlightReads: max(lhs.peakInFlightReads, rhs.peakInFlightReads))
     }
 }
 
@@ -104,6 +117,15 @@ public enum ExpertCachePolicy: String, Sendable {
 public final class PreadExpertStreamer: @unchecked Sendable {
     public static let scratchAlignment = 2 * 1024 * 1024
     public static var cachePolicyDefault: ExpertCachePolicy { .lfu }
+    /// P6b-2: maximum preads in flight at once during phase 2 of a batched
+    /// acquire (plan.md's "queue depth 16"). With Qwen3.6's top-K of 8 a single
+    /// layer's plan never reaches this cap; it bounds larger batches (prefill
+    /// dedup, wider top-K) from swamping the I/O subsystem.
+    public static let prefetchQueueDepth = 16
+    /// A/B escape hatch for the offset sort so the same binary can measure
+    /// sorted vs router-order issue. Default on.
+    static let prefetchSortEnabled =
+        ProcessInfo.processInfo.environment["TFF_EXPERT_PREFETCH_SORT"] != "0"
 
     public let layout: StreamLayout
     public let slotCount: Int
@@ -391,30 +413,78 @@ public final class PreadExpertStreamer: @unchecked Sendable {
         precondition(plan.assignedSlots.count == plan.experts.count,
                      "expert cache plan slot count mismatch")
 
+        // P6b-2 — 3-phase batched acquire (kimi-k3 `getmany`).
+        //
+        // Phase 1 (serial, under `cacheLock`) already happened in
+        // `makeExpertCachePlan`: each miss has a slot reserved, and that slot's
+        // `slotExpert` was set to -1, which *is* the in-flight marker — no other
+        // lookup can claim it as a hit, and P6b-1's pinning keeps a concurrent
+        // encode's slots out of the victim set. Nothing is published yet.
+        //
+        // Phase 2 (parallel, sorted by ascending disk offset, bounded queue
+        // depth) is below. Phase 3 (serial publish) follows it.
+        let order = Self.offsetSortedMissOrder(plan: plan, layout: layout)
         let errorLock = NSLock()
         nonisolated(unsafe) var firstError: Error?
-        DispatchQueue.concurrentPerform(iterations: plan.misses.count) { missOffset in
-            let index = plan.misses[missOffset]
-            do {
-                _ = try self.loadExpert(
-                    layer: 0,
-                    expert: plan.experts[index],
-                    slot: plan.assignedSlots[index])
-            } catch {
+        nonisolated(unsafe) var inFlight = 0
+        nonisolated(unsafe) var peakInFlight = 0
+        let start = DispatchTime.now().uptimeNanoseconds
+
+        for wave in stride(from: 0, to: order.count, by: Self.prefetchQueueDepth) {
+            let waveCount = min(Self.prefetchQueueDepth, order.count - wave)
+            DispatchQueue.concurrentPerform(iterations: waveCount) { waveOffset in
+                let index = order[wave + waveOffset]
                 errorLock.lock()
-                if firstError == nil { firstError = error }
+                inFlight += 1
+                peakInFlight = max(peakInFlight, inFlight)
+                errorLock.unlock()
+                do {
+                    _ = try self.loadExpert(
+                        layer: 0,
+                        expert: plan.experts[index],
+                        slot: plan.assignedSlots[index])
+                } catch {
+                    errorLock.lock()
+                    if firstError == nil { firstError = error }
+                    errorLock.unlock()
+                }
+                errorLock.lock()
+                inFlight -= 1
                 errorLock.unlock()
             }
         }
+        let elapsed = DispatchTime.now().uptimeNanoseconds &- start
+
+        // Phase 3 (serial, under `cacheLock`): publish. A slot only becomes
+        // visible as a hit after its read has completed; on any read failure
+        // nothing is published, so a half-read slot can never be mistaken for
+        // resident weights.
         if let firstError { throw firstError }
 
         cacheLock.lock()
         for index in plan.misses {
             slotExpert[plan.assignedSlots[index]] = plan.experts[index]
         }
+        stats.readNanos &+= elapsed
+        stats.peakInFlightReads = max(stats.peakInFlightReads, peakInFlight)
         cacheLock.unlock()
 
         return expertCachePlanBuffers(plan)
+    }
+
+    /// P6b-2: the order phase 2 issues a plan's misses in — ascending absolute
+    /// file offset, so the read stream walks the layer file forward instead of
+    /// jumping around in router top-K order. Ties (impossible for distinct
+    /// experts, possible for a degenerate layout) break on plan index so the
+    /// order is deterministic. Returns indices into `plan.experts`.
+    static func offsetSortedMissOrder(plan: ExpertCachePlan, layout: StreamLayout) -> [Int] {
+        guard Self.prefetchSortEnabled else { return plan.misses }
+        return plan.misses.sorted { lhs, rhs in
+            let lhsOffset = layout.expertOffset(layer: 0, expert: plan.experts[lhs])
+            let rhsOffset = layout.expertOffset(layer: 0, expert: plan.experts[rhs])
+            if lhsOffset != rhsOffset { return lhsOffset < rhsOffset }
+            return lhs < rhs
+        }
     }
 
     public func expertCachePlanBuffers(_ plan: ExpertCachePlan)

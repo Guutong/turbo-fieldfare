@@ -120,7 +120,7 @@ public func run(args: Args,
         if ProcessInfo.processInfo.environment["TFF_EXPERT_CACHE_STATS"] == "1" {
             let cache = model.routedExpertCacheStats()
             let rate = String(format: "%.4f", cache.hitRate)
-            let line = "[expert-cache slots=\(runtime.expertCacheSlots) policy=\(runtime.modelExpertCachePolicy.rawValue) lookups=\(cache.lookups) hits=\(cache.hits) misses=\(cache.misses) plans=\(cache.plans) hitRate=\(rate) evictions=\(cache.evictions) pinProtect=\(cache.pinnedProtections) pinOverride=\(cache.pinOverrides)]\n"
+            let line = "[expert-cache slots=\(runtime.expertCacheSlots) policy=\(runtime.modelExpertCachePolicy.rawValue) lookups=\(cache.lookups) hits=\(cache.hits) misses=\(cache.misses) plans=\(cache.plans) hitRate=\(rate) evictions=\(cache.evictions) pinProtect=\(cache.pinnedProtections) pinOverride=\(cache.pinOverrides) ioSec=\(String(format: "%.2f", Double(cache.readNanos) / 1e9)) qdPeak=\(cache.peakInFlightReads)]\n"
             stderr.write(Data(line.utf8))
             let perLayer = model.routedExpertCacheStatsByLayer().enumerated().compactMap {
                 index, entry -> String? in
