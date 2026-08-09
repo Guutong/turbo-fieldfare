@@ -5,8 +5,7 @@ struct ModelActionBanner: View {
     @Bindable var model: AppModel
 
     var body: some View {
-        if model.hasOutputTranscript,
-           let action = model.presentation.conversationAction {
+        if let action = model.presentation.conversationAction {
             HStack(spacing: 10) {
                 Image(systemName: iconName(for: action))
                     .foregroundStyle(iconColor(for: action))
