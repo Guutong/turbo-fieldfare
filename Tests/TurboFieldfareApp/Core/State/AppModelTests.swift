@@ -103,9 +103,9 @@ import Testing
         let model = AppModel()
         model.modelPathText = FileManager.default.temporaryDirectory.path
         model.promptText = "go"
-        model.maxContextTokens = AppContextLengthOption.sixtyFourK.tokens
+        model.maxContextTokens = AppContextLengthOption.sixteenK.tokens
 
-        #expect(try model.makeRequest().maxNewTokens == AppContextLengthOption.sixtyFourK.tokens)
+        #expect(try model.makeRequest().maxNewTokens == AppContextLengthOption.sixteenK.tokens)
     }
 
     @MainActor

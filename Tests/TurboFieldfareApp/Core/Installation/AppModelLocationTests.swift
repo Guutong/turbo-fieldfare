@@ -44,4 +44,25 @@ import Testing
             fileExists: { _ in false })
         #expect(result.path == "/support/TurboFieldfare/gemma4.gturbo")
     }
+
+    @Test func differentCatalogIDsResolveToDistinctDirectories() {
+        let files: Set<String> = ["/repo/Package.swift", "/repo/Sources/TurboFieldfareApp/Mac"]
+        let gemma = AppModelLocation.resolve(
+            explicitURL: nil,
+            executableURL: nil,
+            currentDirectoryURL: URL(fileURLWithPath: "/repo"),
+            applicationSupportURL: URL(fileURLWithPath: "/support"),
+            fileExists: files.contains,
+            catalogID: "gemma4")
+        let other = AppModelLocation.resolve(
+            explicitURL: nil,
+            executableURL: nil,
+            currentDirectoryURL: URL(fileURLWithPath: "/repo"),
+            applicationSupportURL: URL(fileURLWithPath: "/support"),
+            fileExists: files.contains,
+            catalogID: "qwen36")
+        #expect(gemma.path == "/repo/scratch/gemma4.gturbo")
+        #expect(other.path == "/repo/scratch/qwen36.gturbo")
+        #expect(gemma != other)
+    }
 }

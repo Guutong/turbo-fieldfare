@@ -4,6 +4,7 @@ import SwiftUI
 
 struct InspectorView: View {
     @Bindable var model: AppModel
+    @State private var showingModelPicker = false
 
     var body: some View {
         Form {
@@ -16,6 +17,9 @@ struct InspectorView: View {
         .formStyle(.grouped)
         .scrollContentBackground(.hidden)
         .background(Color(nsColor: .windowBackgroundColor))
+        .sheet(isPresented: $showingModelPicker) {
+            ModelPickerView(model: model)
+        }
     }
 
     private var modelSection: some View {
@@ -38,6 +42,10 @@ struct InspectorView: View {
                     .buttonStyle(.borderless)
                     .help("Copy model path")
                 }
+            }
+            if AppModelCatalog.entries.count > 1 {
+                Button("Switch Model…") { showingModelPicker = true }
+                    .disabled(model.isRunning)
             }
             if model.canUnloadModel {
                 Button("Unload Model", action: model.unloadModel)
@@ -92,7 +100,17 @@ struct InspectorView: View {
                 .labelsHidden()
                 .fixedSize()
             }
-            Text("More slots can improve decode speed by keeping more experts in memory, but they also use more RAM. Changes are compared with 4K context and 16 slots and apply after reloading the model.")
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Cache policy")
+                Picker("Cache policy", selection: $model.runtimeOptions.expertCachePolicy) {
+                    ForEach(AppExpertCachePolicy.allCases) { policy in
+                        Text(policy.label).tag(policy)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+            }
+            Text("More slots can improve decode speed by keeping more experts in memory, but they also use more RAM. LFU is the recommended default (measured slightly higher hit rate than LRU on this model). Changes are compared with 4K context and 16 slots and apply after reloading the model.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -142,6 +160,18 @@ struct InspectorView: View {
     private var runtimeSection: some View {
         Section("Runtime") {
             Toggle("Prefill", isOn: $model.runtimeOptions.prefillEnabled)
+            if model.runtimeOptions.prefillEnabled {
+                LabeledContent("Chunk size") {
+                    Picker("Chunk size", selection: $model.runtimeOptions.prefillChunkTokens) {
+                        ForEach(AppRuntimeOptions.allowedPrefillChunkTokens, id: \.self) { tokens in
+                            Text("\(tokens)").tag(tokens)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .labelsHidden()
+                    .fixedSize()
+                }
+            }
             VStack(alignment: .leading, spacing: 8) {
                 Text("RDADVISE")
                 Picker("RDADVISE", selection: $model.runtimeOptions.rdadvisePolicy) {
@@ -153,6 +183,19 @@ struct InspectorView: View {
                 .labelsHidden()
             }
             Text("RDADVISE is experimental. It may speed up short decodes but slow down long decodes.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Model verification")
+                Picker("Model verification", selection: $model.runtimeOptions.modelVerification) {
+                    ForEach(AppModelVerification.allCases) { verification in
+                        Text(verification.label).tag(verification)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+            }
+            Text("Full SHA-256 re-verifies every file on load. Trusted install skips re-hashing files that already passed verification during install.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             if model.hasStaleLoadedRuntime {
