@@ -194,9 +194,28 @@ actor RealInferenceSession {
                 context = try MetalContext()
                 ctx = context
             }
+            // Auto-detect arch from the manifest instead of defaulting to
+            // Model.load's Gemma 4 default — otherwise any non-Gemma-4
+            // model (e.g. a locally-repacked one opened via "Open Local
+            // Model…") fails to load with a hiddenSize mismatch, matching
+            // AppModelInstallationProbe's and the CLI's own detection.
+            let expectedArch: ArchConfig
+            let manifestData = try Data(contentsOf: manifest)
+            if let root = try? JSONSerialization.jsonObject(with: manifestData) as? [String: Any],
+               let arch = root["arch"] as? [String: Any] {
+                expectedArch = ArchConfig.detect(
+                    hiddenSize: arch["hiddenSize"] as? Int ?? 0,
+                    numLayers: arch["numLayers"] as? Int ?? 0,
+                    numExperts: arch["numExperts"] as? Int ?? 0,
+                    numKVHeads: arch["numKVHeads"] as? Int ?? 0,
+                    numFullKVHeads: arch["numFullKVHeads"] as? Int ?? 0)
+            } else {
+                expectedArch = .gemma4_26B_A4B
+            }
             let loadedModel = try Model.load(
                 directoryURL: key.directory,
                 device: context.device,
+                expecting: expectedArch,
                 streamingMode: .pread(slotCount: runtimeConfiguration.expertCacheSlots),
                 expertCachePolicy: runtimeConfiguration.modelExpertCachePolicy,
                 integrityPolicy: key.options.modelVerification.runtimeValue)
