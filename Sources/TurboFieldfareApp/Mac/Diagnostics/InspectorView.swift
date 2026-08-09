@@ -22,6 +22,17 @@ struct InspectorView: View {
         }
     }
 
+    private func openLocalModel() {
+        let panel = NSOpenPanel()
+        panel.title = "Open Local Model"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Open"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        model.setModelURL(url)
+    }
+
     private var modelSection: some View {
         Section("Model") {
             LabeledContent("Path") {
@@ -47,6 +58,10 @@ struct InspectorView: View {
                 Button("Switch Model…") { showingModelPicker = true }
                     .disabled(model.isRunning)
             }
+            Button("Open Local Model…", action: openLocalModel)
+                .disabled(model.isRunning)
+                .help("Point the app at any .gturbo model directory on disk, "
+                    + "e.g. one produced outside the built-in catalog's download flow.")
             if model.canUnloadModel {
                 Button("Unload Model", action: model.unloadModel)
             }
