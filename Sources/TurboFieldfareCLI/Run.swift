@@ -114,6 +114,18 @@ public func run(args: Args,
             let footer = "\n[stop=\(String(describing: stats.reason)) prefill=\(stats.prefillTokens)tok new=\(stats.newTokens)tok decode=\(String(format: "%.2f", stats.decodeSeconds))s tok/s=\(String(format: "%.3f", tokensPerSecond))]\n"
             stderr.write(Data(footer.utf8))
         }
+        if ProcessInfo.processInfo.environment["TFF_EXPERT_CACHE_STATS"] == "1" {
+            let cache = model.routedExpertCacheStats()
+            let rate = String(format: "%.4f", cache.hitRate)
+            let line = "[expert-cache slots=\(runtime.expertCacheSlots) policy=\(runtime.modelExpertCachePolicy.rawValue) lookups=\(cache.lookups) hits=\(cache.hits) misses=\(cache.misses) plans=\(cache.plans) hitRate=\(rate)]\n"
+            stderr.write(Data(line.utf8))
+            let perLayer = model.routedExpertCacheStatsByLayer().enumerated().compactMap {
+                index, entry -> String? in
+                guard let entry, entry.lookups > 0 else { return nil }
+                return "L\(index):\(entry.hits)/\(entry.lookups)"
+            }
+            stderr.write(Data("[expert-cache per-layer \(perLayer.joined(separator: " "))]\n".utf8))
+        }
         return RunResult(exitCode: 0)
     } catch is CancellationError {
         stdout.write(Data("\n".utf8))

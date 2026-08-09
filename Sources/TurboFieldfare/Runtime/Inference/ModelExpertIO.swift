@@ -85,6 +85,19 @@ extension Model {
         return RoutedExpertFetchPlan(layer: layer, cachePlan: cachePlan)
     }
 
+    /// P6-1: cumulative routed-expert cache hit/miss counts across all opened layers.
+    public func routedExpertCacheStats() -> ExpertCacheStats {
+        streamersQueue.sync {
+            streamersBox.streamers.compactMap { $0 }
+                .reduce(ExpertCacheStats()) { $0 + $1.cacheStats }
+        }
+    }
+
+    /// P6-1: per-layer cumulative routed-expert cache stats (nil for unopened layers).
+    public func routedExpertCacheStatsByLayer() -> [ExpertCacheStats?] {
+        streamersQueue.sync { streamersBox.streamers.map { $0?.cacheStats } }
+    }
+
     public func routedExpertCacheSlotCount(layer _: Int) -> Int? {
         guard case .pread(let slotCount) = streamingMode else { return nil }
         return slotCount

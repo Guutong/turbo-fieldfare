@@ -48,6 +48,32 @@ public struct ExpertCachePlan: Sendable, Equatable {
     }
 }
 
+/// Cumulative routed-expert cache lookup counters (P6-1 instrumentation).
+public struct ExpertCacheStats: Sendable, Equatable {
+    public var lookups: Int
+    public var hits: Int
+    public var misses: Int
+    public var plans: Int
+
+    public init(lookups: Int = 0, hits: Int = 0, misses: Int = 0, plans: Int = 0) {
+        self.lookups = lookups
+        self.hits = hits
+        self.misses = misses
+        self.plans = plans
+    }
+
+    public var hitRate: Double {
+        lookups > 0 ? Double(hits) / Double(lookups) : 0
+    }
+
+    public static func + (lhs: ExpertCacheStats, rhs: ExpertCacheStats) -> ExpertCacheStats {
+        ExpertCacheStats(lookups: lhs.lookups + rhs.lookups,
+                         hits: lhs.hits + rhs.hits,
+                         misses: lhs.misses + rhs.misses,
+                         plans: lhs.plans + rhs.plans)
+    }
+}
+
 public enum ExpertCachePolicy: String, Sendable {
     case lru
     case lfu
@@ -74,6 +100,17 @@ public final class PreadExpertStreamer: @unchecked Sendable {
     private var expertUseCount: [Int]
     private var useClock = 0
     private let cacheLock = NSLock()
+
+    /// P6-1 instrumentation: cumulative hit/miss counts over accepted cache plans.
+    /// Mutated only under `cacheLock`, on the same critical section the planner
+    /// already takes, so it adds no extra synchronization to the hot path.
+    private var stats = ExpertCacheStats()
+
+    public var cacheStats: ExpertCacheStats {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        return stats
+    }
 
     public convenience init(layout: StreamLayout,
                             device: MTLDevice,
@@ -246,6 +283,10 @@ public final class PreadExpertStreamer: @unchecked Sendable {
         guard misses.count <= evictable.count else { return nil }
 
         useClock = clock
+        stats.lookups &+= experts.count
+        stats.hits &+= experts.count - misses.count
+        stats.misses &+= misses.count
+        stats.plans &+= 1
         for expert in experts where expert >= 0 && expert < expertUseCount.count {
             expertUseCount[expert] &+= 1
         }

@@ -101,7 +101,7 @@ smaller tasks in `plan.md`, add them to the board with new IDs, and stop with
 | P4-2 | Diff Metal vs Swift path | DONE | ⚠️ frontier only · all 30 DeltaNet layers agree, worst deltaOut relL2 1.29e-06 (layer 18), gate 1e-5; criterion C 2/2 checked prompts still correct — see History |
 | P5-1 | Sequential prefill | DONE | ⚠️ frontier only · re-validated after the Metal port: prefill-on and prefill-off produce byte-identical output; new parity test pins it; chunkwise form deliberately not attempted — see History |
 | P5-2 | Multi-token prompt coherence | DONE | ⚠️ frontier only · 136-token paragraph prompt answered correctly and coherently; 3/3 criterion-C still pass (incl. "4"); prefill on/off byte-identical at 136 tok; no code changes — see History |
-| P6-1 | Measure expert cache hit rate | TODO | |
+| P6-1 | Measure expert cache hit rate | DONE | ⚠️ frontier only · baseline 54.31% at the default 16 slots (33891 hits / 62400 lookups) on the P5-2 136-tok prompt + 60 new tokens; slot sweep 8/16/24/32 → 41.54/54.31/60.72/65.90%; measurement only, nothing tuned — see History |
 | P6-2 | Enforce context cap | TODO | |
 | P6-3 | ≤2GB resident, ≥4 tok/s | TODO | final |
 
@@ -1078,3 +1078,65 @@ Next:     P6-1 (expert cache hit rate). Still open and untouched, unchanged
           with a concrete observation attached — the stray `user` marker
           above) and the chunked-prefill path's hardcoded `isFull ? attnK`
           v_proj bug (still unreachable from the Qwen3.6 path).
+
+### P6-1 — Expert cache hit rate
+Did:      Added the missing cumulative hit/miss instrumentation and measured.
+          `PreadExpertStreamer` already computed per-plan `hits`/`misses`
+          (`ExpertCachePlan`) but threw the numbers away, so there was no
+          way to read a rate. Added an `ExpertCacheStats` counter struct
+          (lookups/hits/misses/plans) incremented inside
+          `makeExpertCachePlan`'s existing `cacheLock` critical section —
+          four integer adds on a lock the planner already holds, so no new
+          synchronization and no measurable hot-path cost — plus
+          `Model.routedExpertCacheStats()` / `...ByLayer()` aggregation and
+          an env-gated CLI footer (`TFF_EXPERT_CACHE_STATS=1`). Deliberately
+          changed nothing about the cache itself: no policy change, no slot
+          default change, no prefetch. Per plan.md, report the number first.
+Ran:      Release CLI on `/tmp/qwen36.gturbo`, the P5-2 136-token Amazon
+          paragraph prompt, `--temperature 0 --prefill off --max-new 60`,
+          `TFF_EXPERT_CACHE_STATS=1`, LFU policy, one run per slot count.
+          Output was the same correct P5-2 answer each time (Brazil + the
+          three drivers), so the instrumented binary is not perturbing
+          decode. Measured:
+
+          | slots | lookups | hits  | misses | hit rate | tok/s |
+          |-------|---------|-------|--------|----------|-------|
+          |     8 |   62400 | 25920 |  36480 |  41.54%  | 2.525 |
+          |    16 |   62400 | 33891 |  28509 |  54.31%  | 2.686 |
+          |    24 |   62400 | 37887 |  24513 |  60.72%  | 2.585 |
+          |    32 |   62400 | 41119 |  21281 |  65.90%  | 2.623 |
+
+          Headline number, at the shipping default of 16 slots + LFU:
+          **54.31% (33891 hits / 62400 lookups, 28509 misses, 7800 plans)**.
+          The lookup count is exactly reproducible arithmetic: 40 layers ×
+          8 routed experts/token × 195 forward passes (136 prefill + 60
+          decode, minus the final token that needs no forward) = 62400,
+          and plans = 40 × 195 = 7800.
+Learned:  plan.md's prediction is confirmed but the number is less dire
+          than "fine-grained experts barely reuse" suggests: a bit over
+          half of routed-expert fetches are already served from cache at
+          the default. Hit rate scales cleanly and monotonically with slot
+          count with no knee in 8..32 — doubling 16→32 buys +11.6 points,
+          so there is real headroom for P6-2/P6-3 to trade RAM for I/O if
+          the resident-bytes budget allows. The floor is structural: 8
+          slots with 8 experts per token means every token can evict the
+          whole cache, and 41.54% is what pure per-token luck gives.
+          Per-layer detail is the more actionable finding — the early
+          layers route much more diffusely than the rest. At 16 slots L0
+          hits 239/1560 (15.3%) and L1 373/1560 (23.9%), climbing to a
+          ~60-65% plateau from L8 onward (peak L8 1084/1560 = 69.5%),
+          then sagging again at the tail (L39 618/1560 = 39.6%). So a
+          uniform slot budget across all 40 layers is leaving hits on the
+          table; a non-uniform allocation is the obvious future lever, but
+          that is explicitly out of scope here.
+          Honest caveats: this is one prompt and one decode length, and it
+          pools prefill and decode into a single rate — the counters have
+          no phase split, so a decode-only figure was NOT measured. Both
+          are cheap follow-ups if the number needs to be sharper.
+Next:     P6-2 (enforce context cap). Carried forward untouched from P5-2:
+          the Qwen chat template's Gemma marker leakage and the
+          chunked-prefill path's hardcoded `isFull ? attnK` v_proj bug
+          (still unreachable from the Qwen3.6 path). New from this task:
+          the counters have no prefill/decode phase split, and the
+          per-layer skew above suggests a non-uniform slot budget is worth
+          evaluating before any policy work.
