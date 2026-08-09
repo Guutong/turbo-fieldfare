@@ -102,7 +102,7 @@ smaller tasks in `plan.md`, add them to the board with new IDs, and stop with
 | P5-1 | Sequential prefill | DONE | ⚠️ frontier only · re-validated after the Metal port: prefill-on and prefill-off produce byte-identical output; new parity test pins it; chunkwise form deliberately not attempted — see History |
 | P5-2 | Multi-token prompt coherence | DONE | ⚠️ frontier only · 136-token paragraph prompt answered correctly and coherently; 3/3 criterion-C still pass (incl. "4"); prefill on/off byte-identical at 136 tok; no code changes — see History |
 | P6-1 | Measure expert cache hit rate | DONE | ⚠️ frontier only · baseline 54.31% at the default 16 slots (33891 hits / 62400 lookups) on the P5-2 136-tok prompt + 60 new tokens; slot sweep 8/16/24/32 → 41.54/54.31/60.72/65.90%; measurement only, nothing tuned — see History |
-| P6-2 | Enforce context cap | TODO | |
+| P6-2 | Enforce context cap | DONE | ⚠️ frontier only · shared ContextCap authority, max 16384, CLI/server unified, validated before tokenizer/weight load — see History |
 | P6-3 | ≤2GB resident, ≥4 tok/s | TODO | final |
 
 ---
@@ -1140,3 +1140,65 @@ Next:     P6-2 (enforce context cap). Carried forward untouched from P5-2:
           the counters have no prefill/decode phase split, and the
           per-layer skew above suggests a non-uniform slot budget is worth
           evaluating before any policy work.
+
+### P6-2 — Context cap
+Did:      The gap was not where it was expected. Both entry points already
+          guarded the *prompt* against `maxContext` (`Run.swift` and the two
+          `ServerInference` guards). The hole was one level up: the CLI's
+          `--max-context` accepted any positive Int, so a typo like
+          `--max-context 10000000` passed arg parsing and went straight into
+          KV-cache/RoPE sizing, failing as an allocation error rather than a
+          diagnosable one; and the two paths diverged, with the server
+          allowing 32768/65536 — both above plan.md's 8-16K target. Added
+          `ContextCap` (Sources/TurboFieldfare/Runtime/Configuration/) as the
+          single authority: `maximum = 16_384`, `allowedServerValues =
+          [4096, 8192, 16384]`, and two message builders. Wired it into the
+          CLI arg parser (new `ArgsError.contextCapExceeded`), into `run()`
+          as the *first* statement so it fires before tokenizer or weight
+          load, and into `ServerArguments` (32768/65536 dropped) and both
+          `ServerInference` prompt guards, which now report actual counts.
+          Chose 16384 — the top of the 8-16K range, anchored on the server's
+          existing default. `KVCacheManager` sizes buffers from `maxContext`
+          with no fixed hard ceiling of its own, so there was no lower
+          physical limit forcing a smaller value. Defaults deliberately
+          unchanged (CLI 4096, server 16384): raising the CLI default would
+          4x KV allocation on this 16GB machine for no requested benefit.
+Ran:      `swift test --filter "ContextCap|CLIArguments"` ->
+          `Test run with 21 tests in 3 suites passed after 0.002 seconds.`
+          New suites `CLIContextCapTests` and `ServerContextCapTests`,
+          including `runRejectsOversizedContextBeforeTouchingTheModel()`
+          which drives the real `run()` with a nonexistent model path and
+          asserts exit 2 plus the context message — proving the guard beats
+          every expensive step.
+          Regression `swift test --filter
+          "Layer0|Layer3|Qwen36|DeltaNet|Epilogue|QKV"` ->
+          `Test run with 57 tests in 13 suites passed after 900.394 seconds.`
+          Release binaries, real end-to-end:
+            `TurboFieldfareCLI ... --max-context 65536` -> exit 2,
+            `error: context exceeds the maximum supported context of 16384 tokens (got 65536)`
+            `TurboFieldfareServer ... --max-context 32768` -> exit 2,
+            `error: --max-context must be one of 4096, 8192, 16384 (maximum supported context is 16384 tokens); got 32768`
+          Normal path unbroken, release CLI on `/tmp/qwen36.gturbo`,
+          `--prompt "The capital of France is" --temperature 0 --prefill off
+          --max-new 12 --max-context 4096`:
+            ` Paris, a city renowned for its iconic landmarks such as the`
+            `[stop=maxTokens prefill=5tok new=12tok decode=4.81s tok/s=2.495]`
+Learned:  "Does a cap exist?" and "is the cap itself bounded?" are different
+          questions, and only the second was actually unanswered here. A
+          guard that validates the prompt against a user-supplied limit is
+          worthless if the limit is unvalidated — the failure just moves
+          from the check to the allocator. Placing the validation as the
+          first statement of `run()` is what makes it testable without a
+          model: the oversized-context test needs no weights, no Metal
+          device, and no tokenizer, so it runs in ~1ms instead of minutes.
+          That is also why no 16K-token real generation was needed to prove
+          the guard.
+Next:     P6-3. Newly found here and deliberately NOT fixed: the mac app's
+          `AppContextLengthOption` still offers 32K and 64K cases that now
+          exceed the shared cap — trimming them touches settings
+          persistence and UI, out of scope for this task. Carried forward
+          untouched: the Qwen chat template's Gemma marker leakage, the
+          chunked-prefill hardcoded `isFull ? attnK` v_proj bug (still
+          unreachable from the Qwen3.6 path), and from P6-1 the lack of a
+          prefill/decode phase split in the expert-cache counters plus the
+          per-layer skew suggesting a non-uniform slot budget.
