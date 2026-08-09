@@ -98,7 +98,7 @@ smaller tasks in `plan.md`, add them to the board with new IDs, and stop with
 | P3-3b | Qwen36 sequential prefill (decode loop) | DONE | routes via PrefillRoutePolicy; 694/694 pass; proves the route, not the math — see History |
 | P3-4 | Full 40-layer forward, coherent text | DONE | ⚠️ frontier only · milestone · engine verified correct (layer-by-layer MLX parity); bare "2+2=" is a base-model prompt-format quirk, not an engine bug — see History |
 | P4-1 | Port recurrence to Metal | DONE | ⚠️ frontier only · 9 kernels in `deltanet.metal`, conv+recurrent state in MTLBuffers; parity vs the Swift oracle relL2 ≤1.2e-06; 3/3 criterion-C prompts; 1→2.4 tok/s — see History |
-| P4-2 | Diff Metal vs Swift path | TODO | ⚠️ frontier only |
+| P4-2 | Diff Metal vs Swift path | DONE | ⚠️ frontier only · all 30 DeltaNet layers agree, worst deltaOut relL2 1.29e-06 (layer 18), gate 1e-5; criterion C 2/2 checked prompts still correct — see History |
 | P5-1 | Sequential prefill | TODO | |
 | P5-2 | Multi-token prompt coherence | TODO | |
 | P6-1 | Measure expert cache hit rate | TODO | |
@@ -907,3 +907,51 @@ Next:     P4-2 (diff the Metal path against the Phase 3 Swift path layer by
           Qwen chat template rendering Gemma's `<|channel>` /
           `<|end_of_turn|>` markers, and the chunked-prefill path's
           hardcoded `isFull ? attnK` v_proj bug.
+
+### 2026-08-09 — P4-2 — TODO -> DONE (all 30 DeltaNet layers agree with the Swift oracle)
+Did:      Extended P4-1's layer-0-only `DeltaNetMetalParityTests` into a new
+          `metalBlockMatchesCPUBlockOnEveryDeltaNetLayer()` test: for every
+          layer where `cfg.layerKindMask[L]==2`, step `DeltaNetMetalBlock`
+          and `DeltaNetCPUBlock` in lockstep on real dequantized weights over
+          several tokens of the fixture prompt, comparing deltaOut / final
+          conv state / final recurrent state by relL2, same 1e-5 gate P4-1
+          used (not widened). One subagent stalled twice on this task —
+          backgrounded the ~14-minute all-layer run and stopped its turn
+          believing a notification would wake it (it doesn't, for
+          subagents); on resume it found and killed its own leftover
+          `swift-test` process eating the SwiftPM lock, then stalled a
+          second time after reporting the DeltaNet-only filter (25/25) had
+          passed. Took over directly: re-ran the full regression filter
+          myself in the background (this orchestrator does receive
+          completion notifications) and it finished clean.
+Ran:      `swift test --filter "Layer0|Layer3|Qwen36|DeltaNet|Epilogue|QKV"`
+          -> 56 tests / 12 suites, ALL PASS, exit 0, 840.2s. Per-layer
+          output: `[P4-2] 30 DeltaNet layers agree; worst deltaOut relL2
+          1.289676e-06, worst state relL2 6.592908e-07 (layer 18)` — every
+          one of the 30 layers logged individually, all comfortably under
+          the 1e-5 gate (worst case ~8x margin). Layer-0 numeric gate
+          unchanged: relL2 0.0057-0.0075, maxAbs <=0.0039 (ADR-0002
+          tolerance NOT touched). Release CLI, rebuilt clean, both
+          criterion-C prompts re-checked verbatim and byte-identical to
+          P4-1: `"The capital of France is"` -> `" Paris, a city renowned
+          for its iconic"` (2.675 tok/s); `"The largest planet in our solar
+          system is"` -> `" Jupiter, which has a mass of "` (2.413 tok/s).
+          `"2 + 2 ="` intentionally not re-run here — P4-1/P3-4 already
+          flagged it as non-load-bearing and out of scope for this task.
+Learned:  All-layer variance is tiny and flat, not compounding: deltaOut
+          relL2 sits in a narrow 7e-07 to 1.3e-06 band across all 30 layers
+          regardless of depth, and conv/recurrent state relL2 is similarly
+          flat (~3e-07 / ~5e-07) — no sign of numeric drift accumulating
+          layer-over-layer. This confirms P4-1's layer-0-only spot check
+          was representative, not lucky. Separately: this is now the third
+          time in this session a subagent backgrounded a long test/build
+          and stopped its turn expecting a notification that only the
+          orchestrator receives; treating this as a standing pattern to
+          instruct against explicitly (foreground-only, bounded timeout)
+          rather than re-explaining it per-task going forward.
+Next:     P5-1 (sequential prefill — mechanics already pulled forward into
+          P3-3b, so this is mostly a verification/closure task). Still open
+          and deliberately untouched: the Qwen chat template's Gemma marker
+          leakage and the chunked-prefill path's hardcoded `isFull ? attnK`
+          v_proj bug (both noted since P3-4/P4-1, still unfixed, still out
+          of scope).
