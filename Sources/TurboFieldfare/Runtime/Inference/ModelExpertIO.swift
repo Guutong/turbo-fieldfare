@@ -104,6 +104,22 @@ extension Model {
         }
     }
 
+    /// P6b-3: declare which generation phase routed-expert cache lookups should
+    /// be attributed to. Applies to every already-open layer and is remembered
+    /// for layers that open later.
+    public func setExpertCachePhase(_ phase: ExpertCachePhase) {
+        streamersQueue.sync {
+            streamersBox.cachePhase = phase
+            for streamer in streamersBox.streamers {
+                streamer?.setCachePhase(phase)
+            }
+        }
+    }
+
+    public func expertCachePhase() -> ExpertCachePhase {
+        streamersQueue.sync { streamersBox.cachePhase }
+    }
+
     /// P6-1: cumulative routed-expert cache hit/miss counts across all opened layers.
     public func routedExpertCacheStats() -> ExpertCacheStats {
         streamersQueue.sync {

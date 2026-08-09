@@ -70,6 +70,19 @@ public struct ExpertCacheStats: Sendable, Equatable {
     /// P6b-2: largest number of preads observed in flight simultaneously.
     /// Must never exceed `PreadExpertStreamer.prefetchQueueDepth`.
     public var peakInFlightReads: Int
+    /// P6b-3: the subset of `lookups` that occurred while the streamer was in
+    /// `.prefill` phase. Qwen3.6 prefill is a per-token replay of the decode
+    /// loop (P3-3b), so prefill and decode share every counter above; this
+    /// split is what makes a prefill-only reuse (dedup) rate measurable.
+    public var prefillLookups: Int
+    /// P6b-3: the subset of `hits` that occurred during prefill. Each prefill
+    /// hit is one expert blob NOT re-read from disk — the dedup saving.
+    public var prefillHits: Int
+    /// P6b-3: the subset of `misses` that occurred during prefill, i.e. the
+    /// expert blobs prefill actually read from disk.
+    public var prefillMisses: Int
+    /// P6b-3: the subset of `plans` made during prefill.
+    public var prefillPlans: Int
 
     public init(lookups: Int = 0,
                 hits: Int = 0,
@@ -79,7 +92,15 @@ public struct ExpertCacheStats: Sendable, Equatable {
                 pinnedProtections: Int = 0,
                 pinOverrides: Int = 0,
                 readNanos: UInt64 = 0,
-                peakInFlightReads: Int = 0) {
+                peakInFlightReads: Int = 0,
+                prefillLookups: Int = 0,
+                prefillHits: Int = 0,
+                prefillMisses: Int = 0,
+                prefillPlans: Int = 0) {
+        self.prefillLookups = prefillLookups
+        self.prefillHits = prefillHits
+        self.prefillMisses = prefillMisses
+        self.prefillPlans = prefillPlans
         self.lookups = lookups
         self.hits = hits
         self.misses = misses
@@ -95,6 +116,25 @@ public struct ExpertCacheStats: Sendable, Equatable {
         lookups > 0 ? Double(hits) / Double(lookups) : 0
     }
 
+    /// P6b-3: prefill-only hit rate. This IS the prefill expert dedup rate —
+    /// the fraction of prefill expert requests served from an already-resident
+    /// blob instead of a fresh pread.
+    public var prefillHitRate: Double {
+        prefillLookups > 0 ? Double(prefillHits) / Double(prefillLookups) : 0
+    }
+
+    /// P6b-3: prefill I/O reduction factor versus a hypothetical no-reuse
+    /// engine that pread every routed expert of every prefill token. Equal to
+    /// `prefillLookups / prefillMisses`; 1.0 means no reuse at all.
+    public var prefillIOReductionFactor: Double {
+        prefillMisses > 0 ? Double(prefillLookups) / Double(prefillMisses)
+                          : (prefillLookups > 0 ? Double.infinity : 0)
+    }
+
+    public var decodeLookups: Int { lookups - prefillLookups }
+    public var decodeHits: Int { hits - prefillHits }
+    public var decodeMisses: Int { misses - prefillMisses }
+
     public static func + (lhs: ExpertCacheStats, rhs: ExpertCacheStats) -> ExpertCacheStats {
         ExpertCacheStats(lookups: lhs.lookups + rhs.lookups,
                          hits: lhs.hits + rhs.hits,
@@ -104,8 +144,21 @@ public struct ExpertCacheStats: Sendable, Equatable {
                          pinnedProtections: lhs.pinnedProtections + rhs.pinnedProtections,
                          pinOverrides: lhs.pinOverrides + rhs.pinOverrides,
                          readNanos: lhs.readNanos &+ rhs.readNanos,
-                         peakInFlightReads: max(lhs.peakInFlightReads, rhs.peakInFlightReads))
+                         peakInFlightReads: max(lhs.peakInFlightReads, rhs.peakInFlightReads),
+                         prefillLookups: lhs.prefillLookups + rhs.prefillLookups,
+                         prefillHits: lhs.prefillHits + rhs.prefillHits,
+                         prefillMisses: lhs.prefillMisses + rhs.prefillMisses,
+                         prefillPlans: lhs.prefillPlans + rhs.prefillPlans)
     }
+}
+
+/// P6b-3: which generation phase the engine is currently in, so routed-expert
+/// cache counters can be attributed to prompt prefill versus decode. Qwen3.6's
+/// prefill runs through the same per-token decode loop (P3-3b), so nothing in
+/// the streamer can infer the phase on its own — the runner must declare it.
+public enum ExpertCachePhase: String, Sendable {
+    case prefill
+    case decode
 }
 
 public enum ExpertCachePolicy: String, Sendable {
@@ -154,10 +207,27 @@ public final class PreadExpertStreamer: @unchecked Sendable {
     /// already takes, so it adds no extra synchronization to the hot path.
     private var stats = ExpertCacheStats()
 
+    /// P6b-3: current generation phase. Read and written under `cacheLock`,
+    /// the same lock the planner already holds, so attributing a plan to a
+    /// phase costs no extra synchronization.
+    private var phase: ExpertCachePhase = .decode
+
     public var cacheStats: ExpertCacheStats {
         cacheLock.lock()
         defer { cacheLock.unlock() }
         return stats
+    }
+
+    public var cachePhase: ExpertCachePhase {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        return phase
+    }
+
+    public func setCachePhase(_ newPhase: ExpertCachePhase) {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        phase = newPhase
     }
 
     public convenience init(layout: StreamLayout,
@@ -384,6 +454,13 @@ public final class PreadExpertStreamer: @unchecked Sendable {
         stats.hits &+= experts.count - misses.count
         stats.misses &+= misses.count
         stats.plans &+= 1
+        if phase == .prefill {
+            // P6b-3: same four adds, attributed to the prompt-prefill phase.
+            stats.prefillLookups &+= experts.count
+            stats.prefillHits &+= experts.count - misses.count
+            stats.prefillMisses &+= misses.count
+            stats.prefillPlans &+= 1
+        }
         for expert in experts where expert >= 0 && expert < expertUseCount.count {
             expertUseCount[expert] &+= 1
         }

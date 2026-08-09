@@ -665,6 +665,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             break
         }
 
+        // P6b-3: same phase attribution for the Gemma-shaped chunked path.
+        model.setExpertCachePhase(.prefill)
+        defer { model.setExpertCachePhase(.decode) }
         let scratch = try ensurePrefillScratch(config: config)
         let spans = PrefillChunkPlanner.spans(tokenCount: tokens.count,
                                               startPosition: startPosition,
@@ -709,6 +712,11 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                    onProgress: (Int) -> Void) async throws -> PrefillResult {
         var position = startPosition
         let lastOffset = tokens.count - 1
+        // P6b-3: attribute every routed-expert cache lookup made below to the
+        // prefill phase. Prefill here is literally the decode loop replayed per
+        // prompt token, so the streamer cannot tell the phases apart on its own.
+        model.setExpertCachePhase(.prefill)
+        defer { model.setExpertCachePhase(.decode) }
         for (offset, token) in tokens.enumerated() {
             try Task.checkCancellation()
             try await produceToken(token: token,

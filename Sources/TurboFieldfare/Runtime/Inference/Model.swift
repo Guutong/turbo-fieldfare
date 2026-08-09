@@ -51,6 +51,11 @@ public struct Model {
     final class StreamersBox: @unchecked Sendable {
         var streamers: [PreadExpertStreamer?]
         var layerVerified: [Bool]
+        /// P6b-3: phase every streamer starts in. Layers open lazily (a layer's
+        /// first expert fetch), so a phase set before a layer exists must still
+        /// apply to it when it is created — otherwise the early prefill tokens
+        /// of a not-yet-opened layer would be miscounted as decode.
+        var cachePhase: ExpertCachePhase = .decode
         init(numLayers: Int) {
             self.streamers = Array(repeating: nil, count: numLayers)
             self.layerVerified = Array(repeating: false, count: numLayers)
@@ -377,12 +382,14 @@ public struct Model {
         case .pread(let configuredSlotCount):
             slotCount = configuredSlotCount
         }
-        streamersBox.streamers[L] = try PreadExpertStreamer(
+        let streamer = try PreadExpertStreamer(
             layout: layout,
             device: device,
             slotCount: slotCount,
             cachePolicy: expertCachePolicy,
             fileDescriptor: layerFD)
+        streamer.setCachePhase(streamersBox.cachePhase)
+        streamersBox.streamers[L] = streamer
         streamersBox.layerVerified[L] = true
     }
 

@@ -122,6 +122,13 @@ public func run(args: Args,
             let rate = String(format: "%.4f", cache.hitRate)
             let line = "[expert-cache slots=\(runtime.expertCacheSlots) policy=\(runtime.modelExpertCachePolicy.rawValue) lookups=\(cache.lookups) hits=\(cache.hits) misses=\(cache.misses) plans=\(cache.plans) hitRate=\(rate) evictions=\(cache.evictions) pinProtect=\(cache.pinnedProtections) pinOverride=\(cache.pinOverrides) ioSec=\(String(format: "%.2f", Double(cache.readNanos) / 1e9)) qdPeak=\(cache.peakInFlightReads)]\n"
             stderr.write(Data(line.utf8))
+            // P6b-3: prefill/decode split. `prefillHitRate` is the prefill
+            // expert dedup rate, and `ioFactor` is prefill I/O reduction vs a
+            // no-reuse engine that pread every routed expert of every token.
+            let prefillRate = String(format: "%.4f", cache.prefillHitRate)
+            let ioFactor = String(format: "%.2f", cache.prefillIOReductionFactor)
+            let split = "[expert-cache prefill lookups=\(cache.prefillLookups) hits=\(cache.prefillHits) misses=\(cache.prefillMisses) plans=\(cache.prefillPlans) hitRate=\(prefillRate) ioReduction=\(ioFactor)x | decode lookups=\(cache.decodeLookups) hits=\(cache.decodeHits) misses=\(cache.decodeMisses)]\n"
+            stderr.write(Data(split.utf8))
             let perLayer = model.routedExpertCacheStatsByLayer().enumerated().compactMap {
                 index, entry -> String? in
                 guard let entry, entry.lookups > 0 else { return nil }
