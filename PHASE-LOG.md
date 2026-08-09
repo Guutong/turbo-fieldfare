@@ -1141,6 +1141,78 @@ Next:     P6-2 (enforce context cap). Carried forward untouched from P5-2:
           per-layer skew above suggests a non-uniform slot budget is worth
           evaluating before any policy work.
 
+### 2026-08-09 — P6-2 — TODO -> DONE (context cap unified across CLI and server)
+Did:      Investigated whether the CLI (`TurboFieldfareCLI`, the tool used
+          throughout every Phase 3/4/5 verification) had an equivalent
+          guard to the server's `maxContext`. It did — `Run.swift` already
+          had `guard promptIds.count < args.maxContext` — so the real gap
+          was one level up: `--max-context` accepted ANY positive Int with
+          no ceiling, so `--max-context 10000000` sailed through arg
+          parsing straight into KV-cache/RoPE buffer allocation and died
+          as an unstructured OOM/allocation failure rather than a
+          diagnosable error. Separately, the CLI and server's allowed
+          value sets had diverged: server allowed 4096/8192/16384/32768/
+          65536, two of which sit above plan.md's stated 8-16K target.
+          Added `Sources/TurboFieldfare/Runtime/Configuration/
+          ContextCap.swift` as the single shared authority (`maximum =
+          16_384`, `allowedServerValues = [4096, 8192, 16384]`, plus
+          message builders for both the arg-validation and prompt-overflow
+          cases). Wired into `TurboFieldfareCLI/Args.swift` (new
+          `ArgsError.contextCapExceeded`, usage text updated to
+          `1...16384`) and `Run.swift` (cap checked FIRST, before
+          tokenizer or weight load, so it fails fast; prompt-overflow
+          message now reports actual counts). Server's `ServerArguments.
+          swift`/`ServerInference.swift` trimmed to the same allowed set
+          and same message format. Cap value: 16_384, anchored on the
+          server's pre-existing default rather than lowered — found no
+          evidence of a hard structural ceiling below that in
+          `KVCacheManager` (it sizes buffers from `maxContext` with no
+          fixed limit). Left both CLI (4096) and server (16384) *defaults*
+          alone — raising the CLI default would 4x KV allocation on this
+          16GB machine for no asked-for benefit.
+Ran:      A first subagent pass built this correctly but stalled (again)
+          reporting "waiting on the regression suite" / "waiting on the
+          release build" without ever finishing — the same
+          background-and-stop mistake logged repeatedly earlier this
+          session. Orchestrator took over directly: re-ran the regression
+          in the background itself (only the orchestrator receives
+          completion notifications) —
+          `swift test --filter "Layer0|Layer3|Qwen36|DeltaNet|Epilogue|
+          QKV|ContextCap|CLIArguments"` -> **78 tests / 16 suites, ALL
+          PASS, exit 0, 937.6s** (includes the DeltaNet all-30-layer parity
+          test from P4-2, unchanged, worst deltaOut relL2 1.29e-06).
+          Rebuilt release, re-ran a known-good prompt under the cap:
+          `"The capital of France is"` -> `" Paris, a city renowned for its
+          iconic"` — correct, matching every prior run byte-for-byte
+          (decode was unusually slow, 0.2 tok/s, almost certainly transient
+          contention with the stalled subagent's own lingering build
+          process rather than a real regression — no stale swift process
+          remained afterward). New `CLIContextCapTests`/
+          `ServerContextCapTests` cover: arg-parse rejects an out-of-range
+          `--max-context` with the shared message; `run()` rejects an
+          oversized prompt BEFORE touching the model (driven with a
+          nonexistent model path, confirms exit code 2 with the context
+          message rather than a file-not-found error, proving the guard is
+          genuinely first); server's allowed-value set matches the shared
+          list.
+Learned:  The task's own framing ("enforce a context cap... with a clear
+          error") pointed at prompt-length guards, but the actual gap was
+          the *cap value's own input validation* — an unbounded numeric
+          flag is just as dangerous as no cap at all, since it lets a
+          caller configure their way past the limit that was supposed to
+          protect them. Worth remembering as a general pattern: any user-
+          settable ceiling needs its own ceiling.
+Unproven: `AppContextLengthOption` (the mac-app-facing option set) still
+          offers 32K/64K choices that now exceed the shared 16384 cap —
+          deliberately not touched, out of scope for this CLI/server task,
+          flagged here for whoever owns that surface.
+Next:     P6-3 (final numbers — resident memory and decode speed). Carried
+          forward, still open: Qwen chat-template Gemma marker leakage,
+          the unreachable chunked-prefill `isFull ? attnK` v_proj bug, the
+          P6-1 expert-cache counters' missing prefill/decode phase split,
+          the per-layer cache-slot skew, and now `AppContextLengthOption`'s
+          stale 32K/64K choices.
+
 ### P6-2 — Context cap
 Did:      The gap was not where it was expected. Both entry points already
           guarded the *prompt* against `maxContext` (`Run.swift` and the two
