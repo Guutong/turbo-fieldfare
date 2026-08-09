@@ -420,3 +420,103 @@ evidence-gated longest-suffix matching (length ≥4→3), verified greedily in o
 Output is byte-identical to serial decode by construction. Measured: +22% cost per
 extra verified token. Target: ≥1.5 tokens per decode step.
 Verify: output matches serial decode exactly; measured acceptance rate ≥50%.
+
+---
+
+# Phase 7 — Batched multi-token forward pass
+
+Phase 6b closed with P6-3's mission gate (≤2GB resident, ≥4 tok/s decode) still FAILED
+at 2.298 tok/s. P6b-1 through P6b-3 each measured real but small or neutral wins
+(LRU-vs-LFU near-parity, offset-sorted prefetch neutral on this NVMe machine, prefill
+dedup real at 2.41x I/O reduction but only during prefill). P6b-4 built a correct,
+tested n-gram speculative drafter — byte-identical to serial decode by construction,
+~89-90% acceptance wherever it fires — but proved its own `tokensPerRound` ceiling
+(up to 2.5 on repetitive text) is **not currently cashable into wall-clock speedup**,
+because `produceToken` processes one token through all 40 layers with its own
+command-buffer + expert-fetch round-trip per layer, so verifying K drafted tokens
+costs exactly K sequential passes — the same as not drafting at all. Two follow-up
+tasks (P6b-5 F_NOCACHE, P6b-6 32 cache slots) also measured real but small effects
+(neutral, and +5.1% at +19% RSS respectively) — neither touches the actual bottleneck.
+
+The bottleneck every Phase 6b task has now independently pointed at: decode runs at
+~8% CPU, I/O-bound on expert streaming, because the loop is token-major (all 40
+layers for token N, then all 40 layers for token N+1) instead of layer-major (all K
+tokens for layer L, then all K tokens for layer L+1). P6b-4's own reasoning (logged
+in PHASE-LOG.md's 2026-08-09 P6b-4 entry) is that DeltaNet's recurrence is a
+sequential scan **within** a layer, so a layer-major pass over K tokens is
+mathematically valid even though P3-3b/P5-1's token-major sequential prefill was the
+only route ever built. This phase turns that reasoning into a working, re-verified
+implementation. This is real engineering risk, not a measurement task — ADR-0002's
+numeric tolerances apply throughout and are never widened to force a pass.
+
+### P7-1 — Batched routed-expert cache plan across K tokens
+Needs: P6b-3 · Runner: mixed
+Do: Extend `PreadExpertStreamer`'s existing plan/execute split (`makeExpertCachePlan`
+/ `executeExpertCachePlan`) so one planning call accepts K tokens' router selections
+for a single layer, dedups experts across all K the way P6b-3 already proved dedup
+works during prefill, and returns one fetch plan consumed by P6b-2's offset-sorted
+batched fetch. No forward-pass change yet — this task only proves the batched
+plan/execute path produces the same resident buffers as K sequential per-token plans,
+just fetched once instead of K times.
+Why: this is the reusable primitive every later task in this phase depends on; P6b-3
+already measured the dedup win (2.41x I/O reduction) for the prefill case, this
+generalizes it into something P7-3's batched kernel path can call.
+Verify: `swift test --filter PreadExpertStreamer`; new test asserting a K-token
+batched plan's resident set equals the union of K independent per-token plans, and
+that repeated experts across tokens are fetched exactly once.
+
+### P7-2 — Batched full-attention KV-cache writes for K positions
+Needs: P7-1 · Runner: mixed
+Do: Extend the KV-cache write path already used by Gemma's `executePrefillChunk` so
+Qwen3.6's 10 full-attention layers can append K positions in one call, independent of
+what the 30 DeltaNet layers are doing in the same round.
+Why: batched KV writes already exist and are proven in this engine for Gemma;
+Qwen3.6 has never used that path (`PrefillRoutePolicy` always routes it to
+`prefillSequential`) purely because of DeltaNet's per-token state dependency, not
+because full-attention batching is itself unavailable. Splitting this out first keeps
+P7-3's DeltaNet work from also having to solve KV batching from scratch.
+Verify: new test comparing K batched full-attention layer outputs against K
+sequential `produceToken` calls for the same prompt, tolerance-identical per
+ADR-0002 (never widened).
+
+### P7-3 — Layer-major DeltaNet kernel: K tokens, one layer, one round-trip
+Needs: P7-1, P7-2 · Runner: frontier
+Do: Add a Metal kernel path that, for one DeltaNet layer, accepts a batched
+`[K, hidden]` input and internally scans the K positions sequentially for the
+conv/recurrent state update (cheap, in-SRAM, not the bottleneck) while batching
+everything expensive — the routed-expert GEMM using P7-1's batched plan — into one
+command buffer and one I/O round-trip per layer instead of K.
+Why: this is the actual bottleneck fix. It collapses the round-trip count from
+K-tokens-times-40-layers to 1-times-40, which is what would turn P6b-4's measured
+`tokensPerRound` ceiling (up to 2.5x) into real wall-clock speedup instead of a
+provably-uncashable one.
+Verify: `swift test --filter DeltaNetMetalParity` extended to K>1 batches; relL2
+tolerance unchanged (≤1e-5, same gate P4-2 established) against the Swift CPU oracle
+run K times sequentially. This is the highest-risk task in the phase — do not widen
+the tolerance to force a pass; a failure here is a finding, not a blocker to route
+around.
+
+### P7-4 — Wire the batched forward pass into the decode loop
+Needs: P7-3 · Runner: frontier
+Do: When `NGramSpeculator` (P6b-4) proposes K draft tokens, run ONE batched forward
+pass over those K positions (P7-3) instead of K sequential `produceToken` calls, and
+accept the longest correct prefix using P6b-4's existing never-commit-unverified
+design (accept iff the drafted token equals the already-computed argmax — no
+rollback machinery needed, same as P6b-4).
+Why: this is where P7-1 through P7-3 actually pay off — the speculative drafter that
+P6b-4 built and honestly reported as "correct but not currently cashable" becomes a
+real speedup instead of a measured ceiling.
+Verify: byte-identical output vs serial decode on the same two real-model prompts
+P6b-4 used (same discipline: `diff` of generations with and without batching, run
+twice each); real tok/s measurement against the P6-3 baseline (2.298 tok/s).
+
+### P7-5 — Re-measure the P6-3 mission gate
+Needs: P7-4 · Runner: mixed
+Do: Re-run P6-3's exact measurement protocol (`/usr/bin/time -l`, same prompt, same
+`--max-new 48`) now that a batched round exists end-to-end.
+Why: P6-3 is the actual mission-complete gate (≤2GB resident, ≥4 tok/s) that every
+task since P6b-1 has been an attempt to close. This closes the loop honestly, whether
+it passes or not.
+Verify: measured tok/s and peak RSS reported as-is, gate outcome stated plainly
+(PASS/FAIL), same standard as every prior measurement task in this log — no
+tolerance or gate redefinition to force a pass.

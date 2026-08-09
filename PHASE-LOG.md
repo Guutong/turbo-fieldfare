@@ -94,6 +94,11 @@ smaller tasks in `plan.md`, add them to the board with new IDs, and stop with
 | P6b-4 | Speculative decoding | DONE | kimi-k3 inspired · `NGramSpeculator` (4->3 suffix ladder, K=4), never-commit-unverified so output is byte-identical to serial decode (verified on 2 real runs); measured acceptRate 0.897 and 2.500 tokens/round on a repetitive workload (both gates cleared), 0.889 / 1.154 on the standard prose prompt (tokens/round gate missed); no wall-clock win is realizable until Qwen3.6 gets a batched multi-token forward pass — see History |
 | P6b-5 | F_NOCACHE on expert fd | FAILED | research-suggested (llama.cpp #18758 cited +46%) · measured NEUTRAL on this NVMe machine (baseline 2.265/2.214, F_NOCACHE 2.285/2.061 tok/s across 2 runs each — within run-to-run noise, no measurable win) — see History |
 | P6b-6 | Bump expert cache slots 16->32 | FAILED | measurement only, no code change · 16 slots mean 2.35 tok/s (3 runs) vs 32 slots mean 2.47 tok/s (3 runs), +5.1%; RSS 1.57GB->1.87GB (+19%, still <2GB gate); nowhere near closing >=4 tok/s gate — see History |
+| P7-1 | Batched routed-expert cache plan across K tokens | TODO | Phase 7 · extend PreadExpertStreamer plan/execute for K-token dedup, no forward-pass change yet |
+| P7-2 | Batched full-attention KV writes for K positions | TODO | Phase 7 · reuse Gemma's executePrefillChunk KV-write path for Qwen3.6's 10 full-attn layers |
+| P7-3 | Layer-major DeltaNet kernel (K tokens, one round-trip) | TODO | Phase 7 · ⚠️ frontier · highest-risk task, relL2 gate unchanged (≤1e-5), the actual bottleneck fix |
+| P7-4 | Wire batched forward pass into decode loop | TODO | Phase 7 · ⚠️ frontier · makes P6b-4's speculator's tokensPerRound ceiling cashable into real tok/s |
+| P7-5 | Re-measure the P6-3 mission gate | TODO | Phase 7 · closes the loop honestly, PASS/FAIL as measured, no gate redefinition |
 | P3-1 | DeltaNet conv1d + state (Swift) | DONE | 5 hand-checked tests; 662/662 suite |
 | P3-2 | Delta rule + gating (Swift) | DONE | 16 tests; 678/678 suite; oracle-verified |
 | P3-3 | Layer-0 isolation test | DONE | Real repack (LayerWriter fix) into scratch/qwen36.gturbo; gate passes relL2≤0.0075, maxAbs≤0.0039 — see History |
