@@ -90,7 +90,7 @@ smaller tasks in `plan.md`, add them to the board with new IDs, and stop with
 | P2-6 | Layer-3 isolation test | DONE | 8 shape tests pass; full Metal forward pass deferred (needs kernel orchestration) |
 | P6b-1 | Expert LRU cache with pinning | DONE | kimi-k3 inspired · LRU + slot pinning + per-layer eviction counters; LRU hit rate 53.29% vs LFU baseline 54.31% (near-parity, LFU slightly ahead) — see History |
 | P6b-2 | Batch expert prefetch disk-offset order | DONE | kimi-k3 inspired · 3-phase acquire, offset-sorted phase 2, queue depth 16 · measured NEUTRAL on NVMe (sorted 2.592 vs unsorted 2.660 tok/s mean of 3, within noise) — see History |
-| P6b-3 | Prefill expert dedup | TODO | kimi-k3 inspired |
+| P6b-3 | Prefill expert dedup | DONE | kimi-k3 inspired · chunked dedup doesn't apply (sequential prefill is causally serial); measured the existing cache's dedup benefit instead — prefill hit rate 58.53%, ioReduction 2.41x (gate >=2x) — see History |
 | P6b-4 | Speculative decoding | TODO | kimi-k3 inspired · frontier |
 | P3-1 | DeltaNet conv1d + state (Swift) | DONE | 5 hand-checked tests; 662/662 suite |
 | P3-2 | Delta rule + gating (Swift) | DONE | 16 tests; 678/678 suite; oracle-verified |
@@ -1472,3 +1472,92 @@ Next:     P6b-3 (prefill expert dedup) — and it now looks like the more
           phase split, and `AppContextLengthOption`'s stale 32K/64K choices.
           Also noted in passing, not fixed: an untracked
           `Scripts/parse_resident_index.py` is sitting in the working tree.
+
+### 2026-08-09 — P6b-3 — TODO -> DONE (chunked dedup N/A; measured the cache's existing dedup instead)
+Did:      Investigated plan.md's literal ask first, since it assumes
+          Gemma's chunked prefill (route a 64-token chunk, collect unique
+          expert IDs, fetch once, 3-4x less I/O). Verified from source that
+          this does not apply to Qwen3.6: `RealForwardRunner.prefillChunked`
+          returns into `prefillSequential` for Qwen3.6 before any chunk
+          planning runs; `executePrefillChunk` is never entered.
+          `prefillSequential` is a plain per-token loop. Routing at layer L
+          reads `denseX`, the norm of the layer's hidden state, which
+          DeltaNet's `convState`/`recurrentState` (and the KV cache, for the
+          10 full-attention layers) have just updated FOR THIS TOKEN — so
+          token N's expert IDs at any layer are causally dependent on tokens
+          1..N-1 already being fully processed, and on token N having passed
+          layers 0..L-1. There is no chunk to collect unique IDs over, and
+          no lookahead is possible without running the exact forward passes
+          dedup would exist to skip. P6b-2 (commit `955520b`) already
+          batches the one thing that IS available per token — a single
+          layer's top-K=8 misses, offset-sorted, queue depth 16 — so no
+          unexploited batching seam remains at any granularity a sequential
+          loop can see.
+          That leaves temporal caching as the only reuse a sequential prefill
+          can get — which the existing 16-slot cache (P6-1/P6b-1/P6b-2)
+          already provides. The real gap was that P6-1's counters pooled
+          prefill and decode into one rate, so this benefit had never been
+          isolated or measured — flagged as open in four consecutive prior
+          History entries (P6-1, P6-2, P6b-1, P6b-2). Fixed that: added
+          `ExpertCachePhase` (`.prefill`/`.decode`), four new phase-tagged
+          counters on `ExpertCacheStats` incremented in the same
+          `makeExpertCachePlan` critical section P6-1/P6b-1 already used,
+          `prefillIOReductionFactor` as the plan.md-shaped `>=2x` metric
+          (uncached-fetch-count / actual-fetch-count), phase set once per
+          `prefillSequential` call and inherited by lazily-opened layers, and
+          a new `TFF_EXPERT_CACHE_STATS=1` CLI footer line reporting the
+          prefill/decode split separately from the existing pooled line.
+Ran:      `swift test --filter PreadExpertStreamer` -> **31/31 pass**
+          (6 new: phase defaults to decode at streamer start, phase switches
+          back to decode after prefill, only prefill-phase plans count
+          toward prefill counters, lazily-opened layers inherit the phase in
+          effect at open time, plus 2 pre-existing P6b-2 tests unaffected).
+          Real-model measurement, same 136-token Amazon-rainforest prompt
+          used by every prior Phase 6/6b task, machine verified idle first
+          (`ps aux` clean), `--prefill on` (required — `--prefill off`
+          bypasses `prefillSequential` entirely and reports zero prefill
+          lookups by construction), default LFU/16 slots:
+          `[expert-cache slots=16 policy=lfu lookups=62400 hits=33891
+          misses=28509 plans=7800 hitRate=0.5431 evictions=27869]` (pooled
+          line, unchanged from P6-1's exact baseline — itself a correctness
+          check) and the new split line:
+          `[expert-cache prefill lookups=43520 hits=25471 misses=18049
+          plans=5440 hitRate=0.5853 ioReduction=2.41x | decode
+          lookups=18880 hits=8420 misses=10460]`. 43520 + 18880 = 62400,
+          exactly reproducing P6-1's total (40 layers x 8 experts x 136
+          prefill + 40 x 8 x 59 decode passes = 62400) and independently
+          confirming the phase attribution is correct, not just plausible.
+          Generated answer byte-identical to every prior run of this prompt.
+          **ioReduction=2.41x clears the plan.md gate (>=2x)** — this is a
+          measurement of the cache's existing behavior, not new mechanism,
+          but it is the honest answer to "is prefill I/O deduplicated here."
+Learned:  Prefill's hit rate (58.53%) is meaningfully HIGHER than decode's
+          (8420/18880 = 44.6%) and higher than P6-1's pooled 54.31% average
+          — the opposite of what P6-1's cold-start intuition predicted
+          ("prefill starts cold"). The likely explanation: this 136-token
+          prompt is single-topic (one passage, one question), so consecutive
+          prefill tokens route to a more concentrated, self-similar set of
+          experts than decode's more topic-varied continuation tokens do,
+          giving prefill more same-expert reuse to exploit even without any
+          explicit dedup mechanism. A second, more general lesson for this
+          project: three consecutive tasks now (P6b-1's LRU-vs-LFU,
+          P6b-2's offset-sorting, this one) each set out to build a NEW
+          mechanism per plan.md's literal wording and instead found the
+          existing infrastructure already did the substantive work, with
+          the real gap being measurement/visibility rather than
+          missing mechanism — worth keeping in mind for P6b-4 before
+          assuming speculative decoding needs net-new machinery either.
+Unproven: single prompt, single decode length, single machine. Whether the
+          58.53% prefill hit rate and 2.41x figure generalize to
+          shorter/longer prompts, multi-topic prompts, or a cold cache (this
+          run's cache was warm from the model having just loaded, effectively
+          empty — that IS the realistic first-prefill scenario, so this is
+          not a caveat about the setup, just about breadth of sampling).
+Next:     P6b-4 (speculative decoding) — the last Phase 6b task. Given this
+          task's own "Learned" note, worth checking early whether n-gram
+          speculative matching can reuse something already in the decode
+          loop before building new machinery. Carried forward, still open:
+          Qwen chat-template Gemma marker leakage, unreachable
+          chunked-prefill `isFull ? attnK` v_proj bug, and
+          `AppContextLengthOption`'s stale 32K/64K choices (now also
+          directly relevant to the in-progress Mac-app settings-UI work).
