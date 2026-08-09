@@ -85,6 +85,25 @@ extension Model {
         return RoutedExpertFetchPlan(layer: layer, cachePlan: cachePlan)
     }
 
+    /// P6b-1: pin the slots a committed encode is reading so a later plan for
+    /// the same layer cannot select them as eviction victims. No-op for layers
+    /// with no open streamer (mmap/full-resident modes).
+    public func pinRoutedExpertSlots(layer: Int, slots: [Int]) {
+        guard !slots.isEmpty else { return }
+        streamersQueue.sync {
+            guard streamersBox.streamers.indices.contains(layer) else { return }
+            streamersBox.streamers[layer]?.pinSlots(slots)
+        }
+    }
+
+    public func unpinRoutedExpertSlots(layer: Int, slots: [Int]) {
+        guard !slots.isEmpty else { return }
+        streamersQueue.sync {
+            guard streamersBox.streamers.indices.contains(layer) else { return }
+            streamersBox.streamers[layer]?.unpinSlots(slots)
+        }
+    }
+
     /// P6-1: cumulative routed-expert cache hit/miss counts across all opened layers.
     public func routedExpertCacheStats() -> ExpertCacheStats {
         streamersQueue.sync {

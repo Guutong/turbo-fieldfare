@@ -1468,6 +1468,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             let sharedCB: MTLCommandBuffer?
             let phase1HitCB: MTLCommandBuffer?
             let encodeAndCommitNanos: UInt64
+            // P6b-1: expert-cache slots this command buffer is still reading.
+            let pinnedLayer: Int
+            let pinnedSlots: [Int]
         }
         var pendingRoutedCommand: PendingRoutedCommand?
 
@@ -1489,6 +1492,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 try checkCommandBufferError(phase1HitCB.error)
             }
             try checkCommandBufferError(pending.cb.error)
+            // P6b-1: the encode is done reading these slots; release the pins.
+            model.unpinRoutedExpertSlots(layer: pending.pinnedLayer,
+                                         slots: pending.pinnedSlots)
             totalCb2Nanos &+= pending.encodeAndCommitNanos
         }
 
@@ -1824,6 +1830,14 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             var phase1HitSlots: [UInt32] = []
             var phase1MissSlots: [UInt32] = []
 
+            // P6b-1: pin every slot this layer's plan resolved to, for as long
+            // as the phase-1/phase-2 encodes reading them stay in flight. The
+            // pins are released in finishPendingRoutedCommand.
+            var pinnedSlots: [Int] = []
+            if let plan = plannedFetch {
+                pinnedSlots = plan.cachePlan.assignedSlots.filter { $0 >= 0 }
+                model.pinRoutedExpertSlots(layer: L, slots: pinnedSlots)
+            }
             if let plan = plannedFetch {
                 let missSet = Set(plan.misses)
                 phase1HitSlots = (0..<cfg.topKExperts)
@@ -2044,7 +2058,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 cb: routedCB,
                 sharedCB: sharedCB,
                 phase1HitCB: phase1HitCB,
-                encodeAndCommitNanos: clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tCb2Start)
+                encodeAndCommitNanos: clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tCb2Start,
+                pinnedLayer: L,
+                pinnedSlots: pinnedSlots)
             continue
         }
         if let pending = pendingRoutedCommand {

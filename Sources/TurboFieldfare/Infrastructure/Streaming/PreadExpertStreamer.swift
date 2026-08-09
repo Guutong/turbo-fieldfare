@@ -54,12 +54,30 @@ public struct ExpertCacheStats: Sendable, Equatable {
     public var hits: Int
     public var misses: Int
     public var plans: Int
+    /// P6b-1: number of resident experts displaced from a slot by a miss.
+    /// A miss that lands on a never-used (empty) slot is not an eviction.
+    public var evictions: Int
+    /// P6b-1: number of times a pinned slot was excluded from the eviction
+    /// candidate set while planning a miss.
+    public var pinnedProtections: Int
+    /// P6b-1: number of times pinning had to be overridden because there were
+    /// not enough unpinned slots to place the plan's misses. Should stay 0.
+    public var pinOverrides: Int
 
-    public init(lookups: Int = 0, hits: Int = 0, misses: Int = 0, plans: Int = 0) {
+    public init(lookups: Int = 0,
+                hits: Int = 0,
+                misses: Int = 0,
+                plans: Int = 0,
+                evictions: Int = 0,
+                pinnedProtections: Int = 0,
+                pinOverrides: Int = 0) {
         self.lookups = lookups
         self.hits = hits
         self.misses = misses
         self.plans = plans
+        self.evictions = evictions
+        self.pinnedProtections = pinnedProtections
+        self.pinOverrides = pinOverrides
     }
 
     public var hitRate: Double {
@@ -70,7 +88,10 @@ public struct ExpertCacheStats: Sendable, Equatable {
         ExpertCacheStats(lookups: lhs.lookups + rhs.lookups,
                          hits: lhs.hits + rhs.hits,
                          misses: lhs.misses + rhs.misses,
-                         plans: lhs.plans + rhs.plans)
+                         plans: lhs.plans + rhs.plans,
+                         evictions: lhs.evictions + rhs.evictions,
+                         pinnedProtections: lhs.pinnedProtections + rhs.pinnedProtections,
+                         pinOverrides: lhs.pinOverrides + rhs.pinOverrides)
     }
 }
 
@@ -98,6 +119,11 @@ public final class PreadExpertStreamer: @unchecked Sendable {
     private var slotExpert: [Int]
     private var slotLastUse: [Int]
     private var expertUseCount: [Int]
+    /// P6b-1: per-slot pin depth. A slot with a non-zero pin count is holding
+    /// weights an in-flight encode is still reading, so it must not be chosen
+    /// as an eviction victim. Nested pins are counted, not booleaned, so
+    /// overlapping pin/unpin pairs cannot unpin each other's slot early.
+    private var slotPinCount: [Int]
     private var useClock = 0
     private let cacheLock = NSLock()
 
@@ -200,6 +226,7 @@ public final class PreadExpertStreamer: @unchecked Sendable {
         self.slotBuffers = buffers
         self.slotExpert = [Int](repeating: -1, count: slotCount)
         self.slotLastUse = [Int](repeating: 0, count: slotCount)
+        self.slotPinCount = [Int](repeating: 0, count: slotCount)
         self.expertUseCount = [Int](repeating: 0, count: max(1, layout.expertsPerLayer))
         closeFDOnFailure = false
     }
@@ -231,6 +258,33 @@ public final class PreadExpertStreamer: @unchecked Sendable {
             fileOffset: layout.streamOffset + regionOffset,
             count: Int(layout.expertStride))
         return (slotBuffers[slot], 0, layout.expertStride)
+    }
+
+    /// P6b-1: mark slots as ineligible for eviction until the matching
+    /// `unpinSlots` call. Callers pin the slots a committed GPU encode is
+    /// reading, so a concurrently planned fetch cannot pread over them.
+    public func pinSlots(_ slots: [Int]) {
+        guard !slots.isEmpty else { return }
+        cacheLock.lock()
+        for slot in slots where slot >= 0 && slot < slotCount {
+            slotPinCount[slot] &+= 1
+        }
+        cacheLock.unlock()
+    }
+
+    public func unpinSlots(_ slots: [Int]) {
+        guard !slots.isEmpty else { return }
+        cacheLock.lock()
+        for slot in slots where slot >= 0 && slot < slotCount {
+            slotPinCount[slot] = max(0, slotPinCount[slot] - 1)
+        }
+        cacheLock.unlock()
+    }
+
+    public var pinnedSlotCount: Int {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        return slotPinCount.reduce(0) { $0 + ($1 > 0 ? 1 : 0) }
     }
 
     public func loadExpertsCached(experts: [Int]) throws
@@ -277,13 +331,34 @@ public final class PreadExpertStreamer: @unchecked Sendable {
         }
 
         let misses = experts.indices.filter { assignedSlots[$0] == -1 }
-        let evictable = (0..<slotCount)
-            .filter { !reserved[$0] }
-            .sorted { shouldEvictSlot($0, before: $1) }
+        let unreserved = (0..<slotCount).filter { !reserved[$0] }
+        // P6b-1: pinned slots are held by an in-flight encode and are excluded
+        // from the victim set. If (and only if) the plan cannot otherwise be
+        // placed, pinning is overridden rather than failing the fetch; that is
+        // counted so it shows up in the stats instead of silently corrupting a
+        // read. With top-K << slotCount it should never happen.
+        let unpinned = unreserved.filter { slotPinCount[$0] == 0 }
+        let protectedCount = unreserved.count - unpinned.count
+        var evictable = unpinned.sorted { shouldEvictSlot($0, before: $1) }
+        var pinOverrides = 0
+        var pinnedProtections = 0
+        if !misses.isEmpty {
+            pinnedProtections = protectedCount
+        }
+        if misses.count > evictable.count {
+            let pinned = unreserved
+                .filter { slotPinCount[$0] > 0 }
+                .sorted { shouldEvictSlot($0, before: $1) }
+            pinOverrides = min(misses.count - evictable.count, pinned.count)
+            pinnedProtections = max(0, protectedCount - pinOverrides)
+            evictable.append(contentsOf: pinned)
+        }
         guard misses.count <= evictable.count else { return nil }
 
         useClock = clock
         stats.lookups &+= experts.count
+        stats.pinnedProtections &+= pinnedProtections
+        stats.pinOverrides &+= pinOverrides
         stats.hits &+= experts.count - misses.count
         stats.misses &+= misses.count
         stats.plans &+= 1
@@ -297,6 +372,7 @@ public final class PreadExpertStreamer: @unchecked Sendable {
             let slot = evictable[offset]
             assignedSlots[index] = slot
             reserved[slot] = true
+            if slotExpert[slot] >= 0 { stats.evictions &+= 1 }
             slotExpert[slot] = -1
             slotLastUse[slot] = clock
         }
