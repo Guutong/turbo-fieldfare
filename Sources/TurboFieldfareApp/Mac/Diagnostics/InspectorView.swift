@@ -5,6 +5,7 @@ import SwiftUI
 struct InspectorView: View {
     @Bindable var model: AppModel
     @State private var showingModelPicker = false
+    @State private var showingHuggingFaceSearch = false
 
     var body: some View {
         Form {
@@ -19,6 +20,9 @@ struct InspectorView: View {
         .background(Color(nsColor: .windowBackgroundColor))
         .sheet(isPresented: $showingModelPicker) {
             ModelPickerView(model: model)
+        }
+        .sheet(isPresented: $showingHuggingFaceSearch) {
+            HuggingFaceSearchView(model: model)
         }
     }
 
@@ -62,6 +66,10 @@ struct InspectorView: View {
                 .disabled(model.isRunning)
                 .help("Point the app at any .gturbo model directory on disk, "
                     + "e.g. one produced outside the built-in catalog's download flow.")
+            Button("Search HuggingFace…") { showingHuggingFaceSearch = true }
+                .disabled(model.isRunning)
+                .help("Browse HuggingFace Hub. Installing still requires the model "
+                    + "to already be in this app's built-in catalog.")
             if model.canUnloadModel {
                 Button("Unload Model", action: model.unloadModel)
             }

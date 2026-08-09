@@ -53,4 +53,18 @@ enum MetricFormat {
         storageFormatter.string(fromByteCount: Int64(clamping: bytes))
     }
 
+    /// Compact "12.3K"-style count, used for HF search result download/like counts.
+    static func count(_ value: Int) -> String {
+        let magnitude = Double(abs(value))
+        let sign = value < 0 ? "-" : ""
+        switch magnitude {
+        case 1_000_000...:
+            return "\(sign)\((magnitude / 1_000_000).formatted(.number.precision(.fractionLength(1))))M"
+        case 1_000...:
+            return "\(sign)\((magnitude / 1_000).formatted(.number.precision(.fractionLength(1))))K"
+        default:
+            return "\(value)"
+        }
+    }
+
 }
