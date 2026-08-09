@@ -24,7 +24,7 @@ import Testing
 /// state 4.7e-07 — i.e. ~10x headroom under the gate, and flat rather than
 /// compounding across tokens, which is what confirms the GPU-resident state
 /// is not drifting away from the reference.
-@Suite struct DeltaNetMetalParityTests {
+@Suite struct DeltaNetParityTests {
     private static let modelDir = "scratch/qwen36.gturbo"
 
     private static var isModelAvailable: Bool {
@@ -149,6 +149,110 @@ import Testing
         let recurrentRelL2 = Self.relativeL2(gpuRecurrent, cpuRecurrentState)
         #expect(convRelL2 <= 1e-5, "conv state relL2 \(convRelL2)")
         #expect(recurrentRelL2 <= 1e-5, "recurrent state relL2 \(recurrentRelL2)")
+    }
+
+    /// P4-2: the same lockstep diff, but for EVERY DeltaNet layer in the model
+    /// rather than just layer 0, with one full-size `GPUStateStore` covering
+    /// all `numLayers` slots so the per-layer state buffers are indexed exactly
+    /// as `RealForwardRunner` indexes them (global layer index, `nil` for the
+    /// full-attention layers). Layer 0 was the only layer P4-1 proved; this is
+    /// what rules out layer-index-dependent weight-shape or state-keying bugs.
+    ///
+    /// Full-attention layers are not part of this recurrence and are skipped.
+    /// Same 1e-5 gate as above — per ADR-0002 it is not to be widened.
+    @Test(.enabled(if: isModelAvailable))
+    func metalBlockMatchesCPUBlockOnEveryDeltaNetLayer() throws {
+        let device = MTLCreateSystemDefaultDevice()!
+        let context = try MetalContext()
+        let model = try Model.load(directoryURL: URL(fileURLWithPath: Self.modelDir),
+                                   device: device, expecting: .qwen36_35B_A3B)
+        let dims = DeltaNetDimensions.qwen36_35B_A3B
+        let D = model.config.hiddenSize
+        let numLayers = model.config.numLayers
+        let isLinearLayer = (0..<numLayers).map { model.config.layerKindMask[$0] == 2 }
+        let linearLayers = (0..<numLayers).filter { isLinearLayer[$0] }
+        #expect(linearLayers.count == 30,
+                "Qwen3.6-35B-A3B has 30 DeltaNet layers, found \(linearLayers.count)")
+
+        let block = try DeltaNetMetalBlock(context: context, hiddenSize: D, dims: dims)
+        // One store sized for the whole model, so layer L uses slot L.
+        let state = try DeltaNetMetalBlock.GPUStateStore(
+            device: device, numLayers: numLayers, dims: dims,
+            isLinearLayer: isLinearLayer)
+
+        let hidden = device.makeBuffer(length: D * MemoryLayout<Float16>.size,
+                                       options: .storageModeShared)!
+        let hiddenPtr = hidden.contents().assumingMemoryBound(to: Float16.self)
+
+        let tokenCount = 4
+        var worstDelta: Float = 0
+        var worstState: Float = 0
+        var worstLayer = -1
+
+        for layer in linearLayers {
+            let cpuWeights = try DeltaNetCPUBlock.LayerWeights(
+                model: model, layer: layer, D: D, dims: dims)
+            let gpuWeights = try DeltaNetMetalBlock.LayerWeights(
+                device: device, model: model, layer: layer, D: D, dims: dims)
+            var cpuConvState = [Float](repeating: 0, count: dims.convStateCount)
+            var cpuRecurrentState = [Float](repeating: 0, count: dims.recurrentStateCount)
+            let convState = try #require(state.convState[layer],
+                                         "layer \(layer) must own a conv state slot")
+            let recurrentState = try #require(state.recurrentState[layer])
+
+            // Layer-dependent seed so no two layers see the same activations.
+            var rng = LCG(state: 0x5DEECE66D &+ UInt64(layer) &* 0x9E3779B97F4A7C15)
+            var layerWorstDelta: Float = 0
+            for token in 0..<tokenCount {
+                var x = [Float](repeating: 0, count: D)
+                for i in 0..<D {
+                    let half = Float16(rng.next() * 0.5)
+                    hiddenPtr[i] = half
+                    x[i] = Float(half)
+                }
+                let reference = DeltaNetCPUBlock.forward(
+                    x: x, weights: cpuWeights, dims: dims,
+                    convState: &cpuConvState, recurrentState: &cpuRecurrentState)
+
+                let cb = context.queue.makeCommandBuffer()!
+                block.encode(commandBuffer: cb, hidden: hidden, weights: gpuWeights,
+                             convState: convState, recurrentState: recurrentState)
+                cb.commit()
+                cb.waitUntilCompleted()
+                try checkCommandBufferError(cb.error)
+
+                let ours = block.lastDeltaOut
+                let relL2 = Self.relativeL2(ours, reference)
+                let maxAbs = Self.maxAbsolute(ours, reference)
+                layerWorstDelta = max(layerWorstDelta, relL2)
+                #expect(ours.allSatisfy { $0.isFinite },
+                        "layer \(layer) token \(token) produced non-finite output")
+                #expect(relL2 <= 1e-5,
+                        "layer \(layer) token \(token) deltaOut relL2 \(relL2) (maxAbs \(maxAbs))")
+            }
+
+            let gpuConv = (0..<dims.convStateCount).map {
+                convState.contents().assumingMemoryBound(to: Float.self)[$0]
+            }
+            let gpuRecurrent = (0..<dims.recurrentStateCount).map {
+                recurrentState.contents().assumingMemoryBound(to: Float.self)[$0]
+            }
+            let convRelL2 = Self.relativeL2(gpuConv, cpuConvState)
+            let recurrentRelL2 = Self.relativeL2(gpuRecurrent, cpuRecurrentState)
+            #expect(convRelL2 <= 1e-5, "layer \(layer) conv state relL2 \(convRelL2)")
+            #expect(recurrentRelL2 <= 1e-5,
+                    "layer \(layer) recurrent state relL2 \(recurrentRelL2)")
+
+            let layerWorst = max(layerWorstDelta, max(convRelL2, recurrentRelL2))
+            if layerWorst > max(worstDelta, worstState) { worstLayer = layer }
+            worstDelta = max(worstDelta, layerWorstDelta)
+            worstState = max(worstState, max(convRelL2, recurrentRelL2))
+            print("[P4-2] layer \(layer): deltaOut relL2 <= \(layerWorstDelta), " +
+                  "conv \(convRelL2), recurrent \(recurrentRelL2)")
+        }
+
+        print("[P4-2] \(linearLayers.count) DeltaNet layers agree; worst deltaOut relL2 " +
+              "\(worstDelta), worst state relL2 \(worstState) (layer \(worstLayer))")
     }
 
     @Test(.enabled(if: isModelAvailable))
