@@ -16,6 +16,11 @@ public func run(args: Args,
                 stdout: FileHandle = .standardOutput,
                 stderr: FileHandle = .standardError) async -> RunResult {
     do {
+        // Validated before tokenizer/weight load so an oversized context fails
+        // fast with a message instead of an allocation failure.
+        if let reason = ContextCap.rejectionReason(for: args.maxContext) {
+            return errored(stderr, reason, 2)
+        }
         let modelURL = URL(fileURLWithPath: args.model)
         let tokenizer = try await GFTokenizer.load(forModelDirectory: modelURL)
         let promptIds: [Int32]
@@ -37,11 +42,9 @@ public func run(args: Args,
             return errored(stderr, "one of --prompt or --messages-file is required", 2)
         }
         guard !promptIds.isEmpty else { return errored(stderr, "empty prompt", 2) }
-        guard promptIds.count < args.maxContext else {
-            return errored(
-                stderr,
-                "context overflow: prompt \(promptIds.count) reaches maxContext \(args.maxContext)",
-                2)
+        if let reason = ContextCap.promptRejectionReason(promptTokens: promptIds.count,
+                                                         maxContext: args.maxContext) {
+            return errored(stderr, reason, 2)
         }
         let effectiveMaxNew = min(args.maxNew, args.maxContext - promptIds.count)
         let config = GenerationConfig(

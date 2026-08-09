@@ -514,7 +514,7 @@ public actor ServerModelSession: ServerInferenceBackend {
         }
         guard effectivePromptIDs.count < maxContext else {
             throw ServerRequestError.invalid(
-                message: "effective prompt exceeds the configured context",
+                message: "effective prompt exceeds maximum context of \(maxContext) tokens (got \(effectivePromptIDs.count))",
                 param: "messages",
                 code: "context_length_exceeded")
         }
@@ -663,7 +663,7 @@ public actor ServerModelSession: ServerInferenceBackend {
         }
         guard promptIDs.count < maxContext else {
             throw ServerRequestError.invalid(
-                message: "prompt exceeds the configured context",
+                message: "prompt exceeds maximum context of \(maxContext) tokens (got \(promptIDs.count))",
                 param: "messages",
                 code: "context_length_exceeded")
         }

@@ -64,6 +64,7 @@ public enum ArgsError: Error, Equatable, CustomStringConvertible {
     case requiredMissing(String)
     case mutuallyExclusive(String, String)
     case modeMissing
+    case contextCapExceeded(String)
 
     public var description: String {
         switch self {
@@ -74,6 +75,7 @@ public enum ArgsError: Error, Equatable, CustomStringConvertible {
         case .requiredMissing(let flag): return "required flag missing: \(flag)"
         case .mutuallyExclusive(let a, let b): return "\(a) and \(b) are mutually exclusive"
         case .modeMissing: return "one of --prompt or --messages-file is required"
+        case .contextCapExceeded(let reason): return reason
         }
     }
 }
@@ -91,7 +93,7 @@ extension Args {
 
     options:
       --max-new <int>            Generated-token limit (default 1024).
-      --max-context <int>        Context limit in tokens (default 4096).
+      --max-context <int>        Context limit in tokens, 1...16384 (default 4096).
       --temperature <float>      Sampling temperature (default 0.2; 0 = greedy).
       --top-k <int>              Top-k truncation, 1...256 (default 64; 0 = off).
       --top-p <float>            Nucleus truncation (default 0.95).
@@ -177,8 +179,11 @@ extension Args {
                 maxNew = parsed
             case "--max-context":
                 let value = try takeValue(argv, &index, flag: flag)
-                guard let parsed = Int(value), parsed > 0 else {
+                guard let parsed = Int(value) else {
                     throw ArgsError.invalidValue(flag: flag, value: value)
+                }
+                if let reason = ContextCap.rejectionReason(for: parsed) {
+                    throw ArgsError.contextCapExceeded(reason)
                 }
                 maxContext = parsed
             case "--temperature":
