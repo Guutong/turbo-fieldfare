@@ -21,6 +21,12 @@ enum GTurboJSON {
         var router: Int
         var sharedExpert: Int
         var routedExpert: Int
+        /// Per-slot group size when it differs from plan.baseGroupSize
+        /// (Laguna: attention/embedding/router are g64 while base is 128).
+        var slotGroupSizes: [String: Int] = [:]
+        /// Per-layer overrides for slots that vary by layer (Laguna attention).
+        /// Keyed by slot name: "attention", "sharedExpert", etc.
+        var perLayer: [String: [(layer: Int, weightBits: Int, groupSize: Int)]]?
     }
 
     static func encodeManifest(plan: RepackPlan,
@@ -32,6 +38,13 @@ enum GTurboJSON {
                                       expertStride: UInt64,
                                       bitWidths: QuantBitWidths) throws -> Data {
         let arch = plan.arch
+        // NOTE: `GTurboManifestArchV1` (TurboFieldfareFormat) does not yet carry
+        // Laguna's generalized fields (headsPerLayer, denseMLPLayerMask,
+        // fullRopeScaling, attentionGating, routedScalingFactor, normTopology,
+        // routerScoring) — Laguna is "not yet loadable" per `ArchConfig.lagunaS2_1`'s
+        // own doc comment, so this repacker intentionally does not attempt to
+        // thread them through the wire codec yet. Extending the wire format is
+        // a follow-up once Laguna repacking is wired up end-to-end.
         let bitWidthsByQuantSlot = [
             "embedding": bitWidths.embedding,
             "attention": bitWidths.attention,
@@ -61,18 +74,33 @@ enum GTurboJSON {
             attentionKEqV: arch.attentionKEqV,
             hiddenActivation: arch.hiddenActivation,
             fullAttentionLayerMask: arch.fullAttentionLayerMask.map(Int.init),
-            layerKindMask: arch.layerKindMask.map(Int.init))
+            layerKindMask: arch.layerKindMask.map(Int.init),
+            normTopology: arch.normTopology,
+            routerScoring: arch.routerScoring)
+        // NOTE: `GTurboManifestQuantSlotV1` does not yet carry a sparse
+        // per-layer override table (Laguna needs one — see `ManifestQuantLayerOverride`
+        // on the reader side, which already decodes it optionally). Until the
+        // wire codec grows that field, a slot's per-layer quant overrides
+        // (`bitWidths.perLayer`) cannot be emitted here; the scalar `groupSize`
+        // below still honors a per-slot override (Laguna: attention/embedding/
+        // router at g64 while base is g128).
         func slot(_ name: String) throws -> GTurboManifestQuantSlotV1 {
             guard let weightBits = bitWidthsByQuantSlot[name] else {
                 throw RepackError.configurationInvalid(
                     detail: "missing manifest quant slot bit width for \(name)")
+            }
+            let groupSize = bitWidths.slotGroupSizes[name] ?? plan.baseGroupSize
+            let wirePerLayer = bitWidths.perLayer?[name]?.map {
+                GTurboManifestQuantLayerOverrideV1(
+                    layer: $0.layer, weightBits: $0.weightBits, groupSize: $0.groupSize)
             }
             return GTurboManifestQuantSlotV1(
                 weightBits: weightBits,
                 scheme: plan.baseMode,
                 scaleType: "BF16",
                 biasType: "BF16",
-                groupSize: plan.baseGroupSize)
+                groupSize: groupSize,
+                perLayer: wirePerLayer)
         }
         let quant = GTurboManifestQuantV1(
             embedding: try slot("embedding"),
@@ -162,11 +190,14 @@ enum GTurboJSON {
                                         file: layerFile,
                                         experts: experts))
         }
+        // Dense-MLP layers hold zero experts, so the sparse-layer count has
+        // to come from the first layer that actually has any.
+        let expertsPerLayer = plan.layers.first(where: { $0.expertsPerLayer > 0 })?.expertsPerLayer ?? 0
         return try GTurboPackedExpertsLayoutCodec.encode(
             GTurboPackedExpertsLayoutV1(
                 expertStride: expertStride,
                 numLayers: arch.numLayers,
-                expertsPerLayer: plan.layers.first?.expertsPerLayer ?? 0,
+                expertsPerLayer: expertsPerLayer,
                 layers: layers))
     }
 }

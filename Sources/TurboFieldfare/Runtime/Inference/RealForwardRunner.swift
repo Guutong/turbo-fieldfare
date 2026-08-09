@@ -135,7 +135,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         let gate: SharedExpertInt8Proj
         let up: SharedExpertInt8Proj
         let down: SharedExpertInt8Proj
-        let postF1: TensorView
+        /// nil under `.preNorm`, which does not norm the shared/dense branch
+        /// output on its way to the residual.
+        let postF1: TensorView?
     }
 
     private let model: Model
@@ -152,6 +154,15 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     private let moe: MoE
     private let fusionHead: LMHeadChainInt4
     private let fusedQKVGEMV: FusedQKVGEMV
+    /// Wider-than-4-bit QKV projections, keyed by width. Empty for every
+    /// checkpoint whose attention is uniformly 4-bit — which is every
+    /// checkpoint that runs today — so this costs nothing to carry and the
+    /// 4-bit dispatch below is reached by exactly the same path it always was.
+    private let fusedQKVGEMVWide: [Int: FusedQKVGEMVGeneric]
+    /// Attention `(weightBits, groupSize)` per layer, resolved once at init.
+    /// Looking it up per token would re-walk the manifest's override table
+    /// inside the decode loop for no benefit.
+    private let attentionQuantByLayer: [(weightBits: Int, groupSize: Int)]
     private let fusedQKVEpilogue: FusedQKVEpilogue
     private let fusedPostAttentionSetup: FusedPostAttentionSetup
     private let fusedTail: FusedLayerTail
@@ -162,6 +173,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     private let prefillEmbed: PrefillEmbedLookupInt4
     private let prefillRMS: PrefillRMSNorm
     private let prefillQMM: PrefillInt4QMM
+    private let dequantInt5: DequantInt5GEMV
+    private let dequantInt8: DequantInt8GEMV
     private let prefillMPPAffineInt4: MPPPrefillInt4QMM?
     private let prefillQKVEpilogue: PrefillQKVEpilogue
     private let prefillAttention: PrefillAttention
@@ -220,6 +233,13 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     private let effectiveScaleBuffers: [MTLBuffer]
     /// Dummy all-ones per_expert_scale for Qwen3.6 (Gemma uses real tensor).
     private let dummyPerExpertScale: MTLBuffer?
+    /// BF16 all-ones `[numExperts]` buffer. `.sigmoidTopK` models have no
+    /// `per_expert_scale` (`Model.routerPerExpertScale` returns nil), but the
+    /// sigmoid kernels read that buffer slot, so it gets ones — multiplying a
+    /// weight by 1.0 is exact, so this is a no-op numerically. Used by the
+    /// generalized (prefill) sigmoid-router path; `dummyPerExpertScale` above
+    /// remains the decode-loop's Qwen3.6-specific counterpart.
+    private let routerOnesPerExpert: MTLBuffer
     private let sharedExpertProjections: [LayerSharedExpertProjections]
 
     // P4-1: DeltaNet on Metal with GPU-resident conv/recurrent state, for
@@ -254,6 +274,15 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         self.ctx = context
         self.cfg = model.config
         self.maxContext = maxContext
+
+        // Refuse architectures the kernels cannot execute, rather than running
+        // the nearest available kernel and returning numbers that look fine.
+        // Sigmoid routing is now implemented end to end (router_topk_sigmoid /
+        // prefill_router_sigmoid_block, wired in the decode and prefill loops
+        // below), so the remaining refusal is the activation. Router logit
+        // softcapping (tanh(x/c)*c) is not implemented; Laguna does not set it
+        // (config.json: moe_router_logit_softcapping = 0.0) and no config
+        // field carries it, so a nonzero value cannot arrive silently.
         self.useFusedGreedyHead = runtimeConfiguration.headPath == .fusedRows
         self.prefillAttentionPath = runtimeConfiguration.prefillAttentionPath
         let useFP16Ring = runtimeConfiguration.fp16RingEnabled
@@ -274,7 +303,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         self.embedInt4 = try EmbedLookupInt4(context: context)
         self.rms       = try RMSNorm(context: context)
         self.int4      = try DequantInt4GEMV(context: context)
-        self.attention = try Attention(context: context)
+        self.attention = try Attention(context: context, config: cfg)
         self.shared    = try SharedExpertRuntime(context: context,
                                                   weightBits: model.sharedExpertWeightBits,
                                                   activation: cfg.activation)
@@ -283,6 +312,22 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                               maxD: cfg.hiddenSize,
                                               maxVocab: cfg.vocabSize)
         self.fusedQKVGEMV = try FusedQKVGEMV(context: context)
+        self.attentionQuantByLayer = (0..<cfg.numLayers).map(model.attentionQuant(atLayer:))
+        // Build one pipeline per width the model actually uses. A uniformly
+        // 4-bit checkpoint builds none of these, so it pays nothing for the
+        // capability; a mixed one gets its PSOs up front rather than stalling
+        // mid-decode to compile one.
+        var wide: [Int: FusedQKVGEMVGeneric] = [:]
+        for quant in model.distinctAttentionQuants where quant.weightBits != 4 {
+            guard let bits = FusedQKVGEMVGeneric.Bits(rawValue: quant.weightBits) else {
+                throw ModelError.indexCorrupt(
+                    detail: "no attention kernel for \(quant.weightBits)-bit weights")
+            }
+            if wide[quant.weightBits] == nil {
+                wide[quant.weightBits] = try FusedQKVGEMVGeneric(context: context, bits: bits)
+            }
+        }
+        self.fusedQKVGEMVWide = wide
         self.fusedQKVEpilogue = try FusedQKVEpilogue(context: context)
         self.fusedPostAttentionSetup = try FusedPostAttentionSetup(context: context)
         self.fusedTail = try FusedLayerTail(context: context)
@@ -290,6 +335,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         self.prefillEmbed = try PrefillEmbedLookupInt4(context: context)
         self.prefillRMS = try PrefillRMSNorm(context: context)
         self.prefillQMM = try PrefillInt4QMM(context: context)
+        self.dequantInt5 = try DequantInt5GEMV(context: context)
+        self.dequantInt8 = try DequantInt8GEMV(context: context)
         self.prefillMPPAffineInt4 = MPPPrefillInt4QMM(context: context)
         self.prefillQKVEpilogue = try PrefillQKVEpilogue(context: context)
         self.prefillAttention = try PrefillAttention(context: context)
@@ -308,7 +355,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
 
         let device = context.device
         let D = cfg.hiddenSize
-        let F = cfg.intermediateSize
+        let F = max(cfg.intermediateSize, cfg.denseMLPIntermediateSize)
         let maxQ = cfg.numHeads * max(cfg.headDim, cfg.fullHeadDim)
 
         func buf(_ count: Int, _ stride: Int = MemoryLayout<Float16>.size) throws -> MTLBuffer {
@@ -361,7 +408,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                  scalesOffset: Int(view.scaleOffset),
                                  biasesOffset: Int(view.biasOffset),
                                  rows: rows,
-                                 cols: cols)
+                                 cols: cols,
+                                 groupSize: model.sharedExpertGroupSize)
         }
         // Dummy per_expert_scale for Qwen3.6 (all-ones; Gemma uses real tensor).
         if cfg.topology == .qwen36 {
@@ -379,46 +427,25 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             self.dummyPerExpertScale = nil
         }
 
-        // Dummy postF1 TensorView for Qwen3.6 (unused — pre-norm skips post_ffn_1).
-        let dummyPostF1: TensorView
-        if cfg.topology == .qwen36 {
-            guard let buf = device.makeBuffer(
-                length: MemoryLayout<UInt16>.size,
-                options: .storageModeShared) else {
-                throw ModelError.residentBufferWrapFailed
-            }
-            buf.contents().assumingMemoryBound(to: UInt16.self)[0] = Quantization.bf16Bits(1.0)
-            buf.label = "dummy.postF1"
-            dummyPostF1 = TensorView(buffer: buf, offset: 0, length: UInt64(MemoryLayout<UInt16>.size),
-                                     scaleOffset: 0, scaleLength: 0,
-                                     biasOffset: 0, biasLength: 0,
-                                     shape: (1, 1, 1, 1), dtype: 2)
-        } else {
-            // Will be overwritten per layer — placeholder.
-            dummyPostF1 = TensorView(buffer: device.makeBuffer(length: 1)!,
-                                     offset: 0, length: 1,
-                                     scaleOffset: 0, scaleLength: 0,
-                                     biasOffset: 0, biasLength: 0,
-                                     shape: (0,0,0,0), dtype: 2)
-        }
-
         var sharedViews: [LayerSharedExpertProjections] = []
         sharedViews.reserveCapacity(cfg.numLayers)
         for L in 0..<cfg.numLayers {
             let gate = try model.sharedExpertGate(layer: L)
             let up = try model.sharedExpertUp(layer: L)
             let down = try model.sharedExpertDown(layer: L)
-            let postF1View: TensorView
-            if cfg.topology == .qwen36 {
-                postF1View = dummyPostF1  // unused in pre-norm path
-            } else {
-                postF1View = try model.postFFN1(layer: L)
-            }
+            // Dense-MLP layers (Laguna) may use a distinct intermediate size;
+            // Qwen3.6 has no dense-MLP layers so `isDenseMLP` is always false
+            // and this collapses to the uniform `cfg.intermediateSize` it
+            // always used. `postFFN1` is nil under `.preNorm` (Qwen3.6),
+            // which does not norm the shared/dense branch output.
+            let layerF = cfg.isDenseMLP(atLayer: L)
+                ? (cfg.denseMLPIntermediateSize > 0 ? cfg.denseMLPIntermediateSize : cfg.intermediateSize)
+                : cfg.intermediateSize
             sharedViews.append(LayerSharedExpertProjections(
-                gate: sharedProj(gate, rows: UInt32(F), cols: UInt32(D)),
-                up: sharedProj(up, rows: UInt32(F), cols: UInt32(D)),
-                down: sharedProj(down, rows: UInt32(D), cols: UInt32(F)),
-                postF1: postF1View))
+                gate: sharedProj(gate, rows: UInt32(layerF), cols: UInt32(D)),
+                up: sharedProj(up, rows: UInt32(layerF), cols: UInt32(D)),
+                down: sharedProj(down, rows: UInt32(D), cols: UInt32(layerF)),
+                postF1: try model.postFFN1(layer: L)))
         }
         self.sharedExpertProjections = sharedViews
 
@@ -432,33 +459,28 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         let dInts = D
         let bf16One = Quantization.bf16Bits(1.0)
         for L in 0..<cfg.numLayers {
-            let buf: MTLBuffer
-            if cfg.topology == .qwen36 {
-                guard let b = device.makeBuffer(length: dInts * MemoryLayout<UInt16>.size,
-                                                options: .storageModeShared) else {
-                    throw ModelError.residentBufferWrapFailed
-                }
-                let dst = b.contents().assumingMemoryBound(to: UInt16.self)
-                for i in 0..<dInts { dst[i] = bf16One }
-                b.label = "effective_scale_dummy.L\(L)"
-                buf = b
-            } else {
-                let scaleView = try model.routerScale(layer: L)
-                guard let b = device.makeBuffer(length: dInts * MemoryLayout<UInt16>.size,
-                                                options: .storageModeShared) else {
-                    throw ModelError.residentBufferWrapFailed
-                }
-                let src = scaleView.buffer.contents()
-                    .advanced(by: Int(scaleView.offset))
-                    .assumingMemoryBound(to: UInt16.self)
-                let dst = b.contents().assumingMemoryBound(to: UInt16.self)
-                for i in 0..<dInts {
-                    let v = Quantization.bf16ToFloat(src[i]) * invSqrtD
-                    dst[i] = Quantization.bf16Bits(v)
-                }
-                b.label = "effective_scale.L\(L)"
-                buf = b
+            guard let buf = device.makeBuffer(length: dInts * MemoryLayout<UInt16>.size,
+                                              options: .storageModeShared) else {
+                throw ModelError.residentBufferWrapFailed
             }
+            // A `.sigmoidTopK` router (Qwen3.6, or any dense-MLP layer) has no
+            // input scale and no 1/sqrt(D) factor — `F.linear(u, W)` on the
+            // already-normed MLP input — so its effective scale is all ones.
+            if !cfg.isDenseMLP(atLayer: L) {
+                let dst = buf.contents().assumingMemoryBound(to: UInt16.self)
+                if let scaleView = try model.routerScale(layer: L) {
+                    let src = scaleView.buffer.contents()
+                        .advanced(by: Int(scaleView.offset))
+                        .assumingMemoryBound(to: UInt16.self)
+                    for i in 0..<dInts {
+                        let v = Quantization.bf16ToFloat(src[i]) * invSqrtD
+                        dst[i] = Quantization.bf16Bits(v)
+                    }
+                } else {
+                    for i in 0..<dInts { dst[i] = bf16One }
+                }
+            }
+            buf.label = "effective_scale.L\(L)"
             perLayer.append(buf)
         }
         self.effectiveScaleBuffers = perLayer
@@ -480,6 +502,23 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             self.deltaNetState = nil
             self.sharedExpertGate = nil
         }
+
+        // All-ones per-expert scale for `.sigmoidTopK` routing, which has no
+        // `router.per_expert_scale` tensor. The sigmoid kernels multiply the
+        // gathered (already renormalized) weights by this buffer, so ones keep
+        // the reference semantics exactly. Used by the generalized prefill
+        // router path; the decode loop's Qwen3.6 path uses
+        // `dummyPerExpertScale` above instead.
+        guard let ones = device.makeBuffer(
+            length: max(cfg.numExperts, 1) * MemoryLayout<UInt16>.size,
+            options: .storageModeShared) else {
+            throw ModelError.residentBufferWrapFailed
+        }
+        let oneBits = Quantization.bf16Bits(1.0)
+        let oneDst = ones.contents().assumingMemoryBound(to: UInt16.self)
+        for i in 0..<cfg.numExperts { oneDst[i] = oneBits }
+        ones.label = "router.per_expert_scale.ones"
+        self.routerOnesPerExpert = ones
     }
 
     /// Splits `qRawScratch`'s `[numHeads, 2 * headDim]` gated q_proj output into
@@ -531,6 +570,44 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 "continuation expected KV position \(expectedPosition), current \(kv.position)")
         }
         resetTransientState()
+    }
+
+    /// Decode-path layer tail. The two block topologies differ in everything
+    /// between the FFN branches and the residual, so both decode call sites
+    /// (dense and routed) go through here rather than branching twice.
+    ///
+    /// `postF2`/`postF` are nil and `layerScalar` is 1.0 under `.preNorm`; the
+    /// pre-norm kernel takes neither.
+    private func encodeDecodeLayerTail(_ cb: MTLCommandBuffer,
+                                       postF2: TensorView?,
+                                       postF: TensorView?,
+                                       layerScalar: Float) {
+        let D = UInt32(model.config.hiddenSize)
+        switch model.config.normTopology {
+        case .preNorm:
+            fusedTail.encodePreNorm(commandBuffer: cb,
+                                    h2: h2Buf,
+                                    h1: h1Buf,
+                                    hidden: hidden,
+                                    d: D,
+                                    routedScale: Float(model.config.routedScalingFactor))
+        case .sandwich:
+            guard let postF2, let postF else {
+                preconditionFailure(
+                    "sandwich topology requires post_feedforward_layernorm{,_2}")
+            }
+            fusedTail.encode(commandBuffer: cb,
+                             h2: h2Buf,
+                             h1: h1Buf,
+                             hidden: hidden,
+                             postFFN2Weight: postF2.buffer,
+                             postFFN2WeightOffset: Int(postF2.offset),
+                             postFFNWeight: postF.buffer,
+                             postFFNWeightOffset: Int(postF.offset),
+                             d: D,
+                             eps: 1e-6,
+                             layerScalar: layerScalar)
+        }
     }
 
     private func resetTransientState() {
@@ -791,19 +868,25 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             let postAttention: TensorView
             let preFFN: TensorView
             let preFFN2: TensorView
-            let postFFN2: TensorView
-            let postFFN: TensorView
-            let layerScalar: TensorView
+            /// nil under `.preNorm`, which norms nothing on the way out of the
+            /// FFN and has no per-layer residual gain.
+            let postFFN2: TensorView?
+            let postFFN: TensorView?
+            let layerScalar: TensorView?
             let qNorm: TensorView
             let kNorm: TensorView
-            let router: TensorView
-            let routerPerExpertScale: TensorView
+            let router: TensorView?
+            /// nil under `.sigmoidTopK`, which has no output scale.
+            let routerPerExpertScale: TensorView?
+            /// nil under `.softmaxTopK`, which has no selection bias.
+            let routerSelectionBias: TensorView?
         }
 
         let isQwen36Prefill = cfg.topology == .qwen36
         let layerViews = try (0..<cfg.numLayers).map { L in
             let isFull = cfg.layerKindMask[L] == 1
             let isLinear = cfg.layerKindMask[L] == 2
+            let isDense = cfg.isDenseMLP(atLayer: L)
             // Qwen36 has only input_layernorm + post_attention_layernorm;
             // alias the missing norms to postAttention so the prefill loop
             // doesn't crash — they're unused in the Qwen36 topology branch.
@@ -827,8 +910,12 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 layerScalar: isQwen36Prefill ? postAttnV : (try model.layerScalar(layer: L)),
                 qNorm: isLinear ? postAttnV : (try model.qNorm(layer: L)),
                 kNorm: isLinear ? postAttnV : (try model.kNorm(layer: L)),
-                router: try model.router(layer: L),
-                routerPerExpertScale: isQwen36Prefill ? postAttnV : (try model.routerPerExpertScale(layer: L)))
+                router: isDense ? nil : (try model.router(layer: L)),
+                // Unused when `.sigmoidTopK` (Qwen3.6 routes through
+                // `encodeSigmoidBlock`, which reads `routerOnesPerExpert`
+                // instead), so no Qwen3.6-specific alias is needed here.
+                routerPerExpertScale: isDense ? nil : (try model.routerPerExpertScale(layer: L)),
+                routerSelectionBias: isDense ? nil : (try model.routerSelectionBias(layer: L)))
         }
 
         let tokenIDs = tokens.map { UInt32(bitPattern: $0) }
@@ -844,66 +931,167 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         let t = tokens.count
         let emb = model.embedding
 
-        func encodeInt4Projection(commandBuffer: MTLCommandBuffer,
-                                  family: PrefillProjectionFamily,
-                                  weights: TensorView,
-                                  x: MTLBuffer,
-                                  y: MTLBuffer,
-                                  rows: Int,
-                                  columns: Int,
-                                  tokenCount: Int,
-                                  xStrideElements: Int,
-                                  yStrideElements: Int) {
-            if tokenCount >= 32,
-               family == .q || family == .kv || family == .o,
-               let candidate = prefillMPPAffineInt4 {
-                let path = candidate.encode(
-                    commandBuffer: commandBuffer,
-                    weights: weights.buffer,
-                    weightsOffset: Int(weights.offset),
-                    scales: weights.buffer,
-                    scalesOffset: Int(weights.scaleOffset),
-                    biases: weights.buffer,
-                    biasesOffset: Int(weights.biasOffset),
-                    x: x,
-                    y: y,
-                    m: tokenCount,
-                    n: rows,
-                    k: columns)
-                if path == .affineThreadgroupF16 {
+        /// The two block topologies differ in what happens between the FFN
+        /// branches and the residual, so the tail is dispatched here rather
+        /// than duplicated at the dense and MoE call sites.
+        func encodePrefillLayerTail(commandBuffer: MTLCommandBuffer,
+                                    views: LayerPrefillQKVViews) throws {
+            switch cfg.normTopology {
+            case .preNorm:
+                prefillLayerTail.encodePreNorm(commandBuffer: commandBuffer,
+                                               h2: scratch.h2,
+                                               h1: scratch.h1,
+                                               hidden: scratch.hidden,
+                                               queryCount: UInt32(t),
+                                               d: UInt32(D),
+                                               h2StrideElements: UInt32(D),
+                                               h1StrideElements: UInt32(D),
+                                               hiddenStrideElements: UInt32(D),
+                                               routedScale: Float(cfg.routedScalingFactor))
+            case .sandwich:
+                guard let postFFN2 = views.postFFN2,
+                      let postFFN = views.postFFN,
+                      let layerScalar = views.layerScalar else {
+                    throw ModelError.tensorNotFound(
+                        name: "post_feedforward_layernorm / layer_scalar")
+                }
+                let scalarBits = layerScalar.buffer.contents()
+                    .advanced(by: Int(layerScalar.offset))
+                    .assumingMemoryBound(to: UInt16.self)[0]
+                prefillLayerTail.encode(commandBuffer: commandBuffer,
+                                        h2: scratch.h2,
+                                        h1: scratch.h1,
+                                        hidden: scratch.hidden,
+                                        postFFN2Weight: postFFN2.buffer,
+                                        postFFN2WeightOffset: Int(postFFN2.offset),
+                                        postFFNWeight: postFFN.buffer,
+                                        postFFNWeightOffset: Int(postFFN.offset),
+                                        queryCount: UInt32(t),
+                                        d: UInt32(D),
+                                        h2StrideElements: UInt32(D),
+                                        h1StrideElements: UInt32(D),
+                                        hiddenStrideElements: UInt32(D),
+                                        eps: eps,
+                                        layerScalar: Quantization.bf16ToFloat(scalarBits))
+            }
+        }
+
+        func encodeAttentionProjection(commandBuffer: MTLCommandBuffer,
+                                       family: PrefillProjectionFamily,
+                                       layer: Int,
+                                       weights: TensorView,
+                                       x: MTLBuffer,
+                                       y: MTLBuffer,
+                                       rows: Int,
+                                       columns: Int,
+                                       tokenCount: Int,
+                                       xStrideElements: Int,
+                                       yStrideElements: Int) {
+            let (weightBits, groupSize) = attentionQuantByLayer[layer]
+            if weightBits == 4 && groupSize == 64 {
+                if tokenCount >= 32,
+                   family == .q || family == .kv || family == .o,
+                   let candidate = prefillMPPAffineInt4 {
+                    let path = candidate.encode(
+                        commandBuffer: commandBuffer,
+                        weights: weights.buffer,
+                        weightsOffset: Int(weights.offset),
+                        scales: weights.buffer,
+                        scalesOffset: Int(weights.scaleOffset),
+                        biases: weights.buffer,
+                        biasesOffset: Int(weights.biasOffset),
+                        x: x,
+                        y: y,
+                        m: tokenCount,
+                        n: rows,
+                        k: columns)
+                    if path == .affineThreadgroupF16 {
+                        return
+                    }
+                }
+                if PrefillProjectionDispatchPolicy.selectedDispatch(for: family,
+                                                                    chunkTokens: tokenCount) == .qmm {
+                    prefillQMM.encode(commandBuffer: commandBuffer,
+                                      weights: weights.buffer,
+                                      weightsOffset: Int(weights.offset),
+                                      scales: weights.buffer,
+                                      scalesOffset: Int(weights.scaleOffset),
+                                      biases: weights.buffer,
+                                      biasesOffset: Int(weights.biasOffset),
+                                      x: x,
+                                      y: y,
+                                      t: tokenCount,
+                                      n: rows,
+                                      k: columns)
                     return
                 }
-            }
-            if PrefillProjectionDispatchPolicy.selectedDispatch(for: family,
-                                                                chunkTokens: tokenCount) == .qmm {
-                prefillQMM.encode(commandBuffer: commandBuffer,
-                                  weights: weights.buffer,
-                                  weightsOffset: Int(weights.offset),
-                                  scales: weights.buffer,
-                                  scalesOffset: Int(weights.scaleOffset),
-                                  biases: weights.buffer,
-                                  biasesOffset: Int(weights.biasOffset),
-                                  x: x,
-                                  y: y,
-                                  t: tokenCount,
-                                  n: rows,
-                                  k: columns)
-                return
-            }
-            for row in 0..<tokenCount {
-                int4.encode(commandBuffer: commandBuffer,
-                            weights: weights.buffer,
-                            weightsOffset: Int(weights.offset),
-                            scales: weights.buffer,
-                            scalesOffset: Int(weights.scaleOffset),
-                            biases: weights.buffer,
-                            biasesOffset: Int(weights.biasOffset),
-                            x: x,
-                            xOffset: row * xStrideElements * MemoryLayout<Float16>.stride,
-                            y: y,
-                            yOffset: row * yStrideElements * MemoryLayout<Float16>.stride,
-                            m: UInt32(rows),
-                            n: UInt32(columns))
+                for row in 0..<tokenCount {
+                    int4.encode(commandBuffer: commandBuffer,
+                                weights: weights.buffer,
+                                weightsOffset: Int(weights.offset),
+                                scales: weights.buffer,
+                                scalesOffset: Int(weights.scaleOffset),
+                                biases: weights.buffer,
+                                biasesOffset: Int(weights.biasOffset),
+                                x: x,
+                                xOffset: row * xStrideElements * MemoryLayout<Float16>.stride,
+                                y: y,
+                                yOffset: row * yStrideElements * MemoryLayout<Float16>.stride,
+                                m: UInt32(rows),
+                                n: UInt32(columns))
+                }
+            } else if weightBits == 4 {
+                for row in 0..<tokenCount {
+                    int4.encode(commandBuffer: commandBuffer,
+                                weights: weights.buffer,
+                                weightsOffset: Int(weights.offset),
+                                scales: weights.buffer,
+                                scalesOffset: Int(weights.scaleOffset),
+                                biases: weights.buffer,
+                                biasesOffset: Int(weights.biasOffset),
+                                x: x,
+                                xOffset: row * xStrideElements * MemoryLayout<Float16>.stride,
+                                y: y,
+                                yOffset: row * yStrideElements * MemoryLayout<Float16>.stride,
+                                m: UInt32(rows),
+                                n: UInt32(columns),
+                                groupSize: groupSize)
+                }
+            } else if weightBits == 5 {
+                for row in 0..<tokenCount {
+                    dequantInt5.encode(commandBuffer: commandBuffer,
+                                       weights: weights.buffer,
+                                       weightsOffset: Int(weights.offset),
+                                       scales: weights.buffer,
+                                       scalesOffset: Int(weights.scaleOffset),
+                                       biases: weights.buffer,
+                                       biasesOffset: Int(weights.biasOffset),
+                                       x: x,
+                                       xOffset: row * xStrideElements * MemoryLayout<Float16>.stride,
+                                       y: y,
+                                       yOffset: row * yStrideElements * MemoryLayout<Float16>.stride,
+                                       m: UInt32(rows),
+                                       n: UInt32(columns),
+                                       groupSize: UInt32(groupSize))
+                }
+            } else if weightBits == 8 {
+                for row in 0..<tokenCount {
+                    dequantInt8.encode(commandBuffer: commandBuffer,
+                                       weights: weights.buffer,
+                                       weightsOffset: Int(weights.offset),
+                                       scales: weights.buffer,
+                                       scalesOffset: Int(weights.scaleOffset),
+                                       biases: weights.buffer,
+                                       biasesOffset: Int(weights.biasOffset),
+                                       x: x,
+                                       xOffset: row * xStrideElements * MemoryLayout<Float16>.stride,
+                                       y: y,
+                                       yOffset: row * yStrideElements * MemoryLayout<Float16>.stride,
+                                       m: UInt32(rows),
+                                       n: UInt32(columns))
+                }
+            } else {
+                preconditionFailure("unsupported prefill attention weightBits \(weightBits) for layer \(layer)")
             }
         }
 
@@ -989,7 +1177,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                             outScale: sqrtHidden)
 
         for L in 0..<cfg.numLayers {
-            model.beginOpeningRoutedExpertStreamer(layer: L)
+            if !cfg.isDenseMLP(atLayer: L) {
+                model.beginOpeningRoutedExpertStreamer(layer: L)
+            }
             let views = layerViews[L]
             let isFull = cfg.layerKindMask[L] == 1
             let headDim = isFull ? cfg.fullHeadDim : cfg.headDim
@@ -1008,37 +1198,41 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                    t: UInt32(t),
                                    d: UInt32(D),
                                    eps: eps)
-            encodeInt4Projection(commandBuffer: cb,
-                                 family: .q,
-                                 weights: views.q,
-                                 x: scratch.normed,
-                                 y: scratch.q,
-                                 rows: qDim,
-                                 columns: D,
-                                 tokenCount: t,
-                                 xStrideElements: D,
-                                 yStrideElements: qDim)
-            encodeInt4Projection(commandBuffer: cb,
-                                 family: .kv,
-                                 weights: views.k,
-                                 x: scratch.normed,
-                                 y: scratch.kStage,
-                                 rows: kvDim,
-                                 columns: D,
-                                 tokenCount: t,
-                                 xStrideElements: D,
-                                 yStrideElements: kvDim)
-            encodeInt4Projection(commandBuffer: cb,
-                                 family: .kv,
-                                 weights: views.v,
-                                 x: scratch.normed,
-                                 y: scratch.vStage,
-                                 rows: kvDim,
-                                 columns: D,
-                                 tokenCount: t,
-                                 xStrideElements: D,
-                                 yStrideElements: kvDim)
+            encodeAttentionProjection(commandBuffer: cb,
+                                       family: .q,
+                                       layer: L,
+                                       weights: views.q,
+                                       x: scratch.normed,
+                                       y: scratch.q,
+                                       rows: qDim,
+                                       columns: D,
+                                       tokenCount: t,
+                                       xStrideElements: D,
+                                       yStrideElements: qDim)
+            encodeAttentionProjection(commandBuffer: cb,
+                                       family: .kv,
+                                       layer: L,
+                                       weights: views.k,
+                                       x: scratch.normed,
+                                       y: scratch.kStage,
+                                       rows: kvDim,
+                                       columns: D,
+                                       tokenCount: t,
+                                       xStrideElements: D,
+                                       yStrideElements: kvDim)
+            encodeAttentionProjection(commandBuffer: cb,
+                                       family: .kv,
+                                       layer: L,
+                                       weights: views.v,
+                                       x: scratch.normed,
+                                       y: scratch.vStage,
+                                       rows: kvDim,
+                                       columns: D,
+                                       tokenCount: t,
+                                       xStrideElements: D,
+                                       yStrideElements: kvDim)
 
+            let scaling = cfg.ropeScaling(atLayer: L)
             let rotatedPairs = isFull
                 ? UInt32(Double(cfg.fullHeadDim) * cfg.partialRotaryFactor / 2.0)
                 : UInt32(headDim / 2)
@@ -1059,7 +1253,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                        kvTokenStrideElements: UInt32(kvDim),
                                        theta: isFull ? Float(cfg.fullRopeTheta) : Float(cfg.ropeTheta),
                                        rotatedPairs: rotatedPairs,
-                                       eps: eps)
+                                       eps: eps,
+                                       scaling: scaling)
 
             if let kv {
                 let bytes = t * kvDim * MemoryLayout<Float16>.stride
@@ -1072,6 +1267,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                          valueSource: scratch.vStage,
                                          bytesPerToken: bytes / t)
             }
+            let attnScale = isFull ? Float(scaling?.attentionFactor ?? 1.0) : 1.0
             let params = PrefillAttentionParams(
                     startPosition: UInt32(startPosition),
                     queryCount: UInt32(t),
@@ -1083,7 +1279,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     kvTokenStrideElements: UInt32(kvDim),
                     qTokenStrideElements: UInt32(qDim),
                     oTokenStrideElements: UInt32(qDim),
-                    scale: 1.0)
+                    scale: attnScale)
             if let kv {
                     let keyBuffer = kv.keyBuffer(layer: L, validTokenCount: startPosition + t)
                     let valueBuffer = kv.valueBuffer(layer: L, validTokenCount: startPosition + t)
@@ -1103,17 +1299,37 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 throw PrefillError.chunkedUnsupported(
                     "chunked prefill attention requires FP16 KV")
             }
-            encodeInt4Projection(commandBuffer: cb,
-                                     family: .o,
-                                     weights: views.o,
-                                     x: scratch.attentionOutput,
-                                     y: scratch.h1,
-                                     rows: D,
-                                     columns: qDim,
-                                     tokenCount: t,
-                                     xStrideElements: qDim,
-                                     yStrideElements: D)
-            prefillPostAttention.encode(commandBuffer: cb,
+            encodeAttentionProjection(commandBuffer: cb,
+                                       family: .o,
+                                       layer: L,
+                                       weights: views.o,
+                                       x: scratch.attentionOutput,
+                                       y: scratch.h1,
+                                       rows: D,
+                                       columns: qDim,
+                                       tokenCount: t,
+                                       xStrideElements: qDim,
+                                       yStrideElements: D)
+            switch cfg.normTopology {
+            case .preNorm:
+                prefillPostAttention.encodePreNorm(commandBuffer: cb,
+                                                    hidden: scratch.hidden,
+                                                    attn: scratch.h1,
+                                                    denseX: scratch.denseX,
+                                                    routedX: scratch.routedX,
+                                                    routerX: scratch.routerX,
+                                                    preFFNWeight: views.preFFN.buffer,
+                                                    preFFNWeightOffset: Int(views.preFFN.offset),
+                                                    queryCount: UInt32(t),
+                                                    d: UInt32(D),
+                                                    hiddenStrideElements: UInt32(D),
+                                                    attnStrideElements: UInt32(D),
+                                                    denseStrideElements: UInt32(D),
+                                                    routedStrideElements: UInt32(D),
+                                                    routerStrideElements: UInt32(D),
+                                                    eps: eps)
+            case .sandwich:
+                prefillPostAttention.encode(commandBuffer: cb,
                                             hidden: scratch.hidden,
                                             attn: scratch.h1,
                                             denseX: scratch.denseX,
@@ -1133,25 +1349,130 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                             routedStrideElements: UInt32(D),
                                             routerStrideElements: UInt32(D),
                                             eps: eps)
-            prefillRouter.encodeGemma4Block(
-                        commandBuffer: cb,
-                        weights: views.router.buffer,
-                        weightsOffset: Int(views.router.offset),
-                        scales: views.router.buffer,
-                        scalesOffset: Int(views.router.scaleOffset),
-                        biases: views.router.buffer,
-                        biasesOffset: Int(views.router.biasOffset),
-                        hidden: scratch.routerX,
-                        effectiveScale: effectiveScaleBuffers[L],
-                        perExpertScale: views.routerPerExpertScale.buffer,
-                        perExpertScaleOffset: Int(views.routerPerExpertScale.offset),
-                        outIndices: scratch.routeIDs,
-                        outWeights: scratch.routeWeights,
-                        queryCount: UInt32(t),
-                        numExperts: UInt32(cfg.numExperts),
-                        d: UInt32(D),
-                        topK: UInt32(cfg.topKExperts),
-                        hiddenStrideElements: UInt32(D))
+            }
+
+            if cfg.isDenseMLP(atLayer: L) {
+                cb.commit()
+                try waitForCompletion(cb)
+                if let error = cb.error {
+                    throw error
+                }
+
+                guard let sharedCB = ctx.queue.makeCommandBuffer() else {
+                    throw ModelError.residentBufferWrapFailed
+                }
+                let sharedProj = sharedExpertProjections[L]
+                let layerF = cfg.isDenseMLP(atLayer: L)
+                    ? (cfg.denseMLPIntermediateSize > 0 ? cfg.denseMLPIntermediateSize : cfg.intermediateSize)
+                    : cfg.intermediateSize
+                try prefillSharedExpert.encodeBlock(commandBuffer: sharedCB,
+                                                    x: scratch.denseX,
+                                                    y: scratch.h1,
+                                                    gate: sharedProj.gate,
+                                                    up: sharedProj.up,
+                                                    down: sharedProj.down,
+                                                    scratchGate: scratch.sharedGateScratch,
+                                                    scratchUp: scratch.sharedUpScratch,
+                                                    scratchAct: scratch.sharedActScratch,
+                                                    queryCount: t,
+                                                    d: D,
+                                                    intermediate: layerF,
+                                                    xStrideElements: D,
+                                                    yStrideElements: D)
+                if let postF1 = sharedProj.postF1 {
+                    prefillRMS.encodeBF16W(commandBuffer: sharedCB,
+                                           x: scratch.h1,
+                                           weight: postF1.buffer,
+                                           weightOffset: Int(postF1.offset),
+                                           out: scratch.h1,
+                                           t: UInt32(t),
+                                           d: UInt32(D),
+                                           eps: eps)
+                }
+                sharedCB.commit()
+                try waitForCompletion(sharedCB)
+                if let error = sharedCB.error {
+                    throw error
+                }
+
+                guard let tailCB = ctx.queue.makeCommandBuffer() else {
+                    throw ModelError.residentBufferWrapFailed
+                }
+                if let blit = tailCB.makeBlitCommandEncoder() {
+                    blit.fill(buffer: scratch.h2, range: 0..<(t * D * MemoryLayout<Float16>.stride), value: 0)
+                    blit.endEncoding()
+                }
+                try encodePrefillLayerTail(commandBuffer: tailCB, views: views)
+                tailCB.commit()
+                try waitForCompletion(tailCB)
+                if let error = tailCB.error {
+                    throw error
+                }
+                if L + 1 < cfg.numLayers {
+                    guard let nextCB = ctx.queue.makeCommandBuffer() else {
+                        throw ModelError.residentBufferWrapFailed
+                    }
+                    cb = nextCB
+                }
+                continue
+            }
+
+            guard let router = views.router else {
+                throw ModelError.tensorNotFound(name: "language_model.model.layers.\(L).router.proj.weight")
+            }
+            if cfg.routerScoring == .sigmoidTopK {
+                guard let selectionBias = views.routerSelectionBias else {
+                    throw ModelError.tensorNotFound(
+                        name: "language_model.model.layers.\(L).mlp.gate.e_score_correction_bias")
+                }
+                prefillRouter.encodeSigmoidBlock(
+                            commandBuffer: cb,
+                            weights: router.buffer,
+                            weightsOffset: Int(router.offset),
+                            scales: router.buffer,
+                            scalesOffset: Int(router.scaleOffset),
+                            biases: router.buffer,
+                            biasesOffset: Int(router.biasOffset),
+                            hidden: scratch.routerX,
+                            effectiveScale: effectiveScaleBuffers[L],
+                            perExpertScale: routerOnesPerExpert,
+                            selectionBias: selectionBias.buffer,
+                            selectionBiasOffset: Int(selectionBias.offset),
+                            outIndices: scratch.routeIDs,
+                            outWeights: scratch.routeWeights,
+                            queryCount: UInt32(t),
+                            numExperts: UInt32(cfg.numExperts),
+                            d: UInt32(D),
+                            topK: UInt32(cfg.topKExperts),
+                            hiddenStrideElements: UInt32(D),
+                            groupSize: UInt32(model.routerGroupSize),
+                            useBF16: router.scaleLength == 0)
+            } else {
+                guard let routerPerExpertScale = views.routerPerExpertScale else {
+                    throw ModelError.tensorNotFound(
+                        name: "language_model.model.layers.\(L).router.per_expert_scale")
+                }
+                prefillRouter.encodeGemma4Block(
+                            commandBuffer: cb,
+                            weights: router.buffer,
+                            weightsOffset: Int(router.offset),
+                            scales: router.buffer,
+                            scalesOffset: Int(router.scaleOffset),
+                            biases: router.buffer,
+                            biasesOffset: Int(router.biasOffset),
+                            hidden: scratch.routerX,
+                            effectiveScale: effectiveScaleBuffers[L],
+                            perExpertScale: routerPerExpertScale.buffer,
+                            perExpertScaleOffset: Int(routerPerExpertScale.offset),
+                            outIndices: scratch.routeIDs,
+                            outWeights: scratch.routeWeights,
+                            queryCount: UInt32(t),
+                            numExperts: UInt32(cfg.numExperts),
+                            d: UInt32(D),
+                            topK: UInt32(cfg.topKExperts),
+                            hiddenStrideElements: UInt32(D),
+                            groupSize: UInt32(model.routerGroupSize))
+            }
 
                     cb.commit()
                     try waitForCompletion(cb)
@@ -1210,14 +1531,16 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                                         intermediate: cfg.intermediateSize,
                                                         xStrideElements: D,
                                                         yStrideElements: D)
-                    prefillRMS.encodeBF16W(commandBuffer: sharedCB,
-                                           x: scratch.h1,
-                                           weight: sharedProj.postF1.buffer,
-                                           weightOffset: Int(sharedProj.postF1.offset),
-                                           out: scratch.h1,
-                                           t: UInt32(t),
-                                           d: UInt32(D),
-                                           eps: eps)
+                    if let postF1 = sharedProj.postF1 {
+                        prefillRMS.encodeBF16W(commandBuffer: sharedCB,
+                                               x: scratch.h1,
+                                               weight: postF1.buffer,
+                                               weightOffset: Int(postF1.offset),
+                                               out: scratch.h1,
+                                               t: UInt32(t),
+                                               d: UInt32(D),
+                                               eps: eps)
+                    }
                     sharedCB.commit()
                     try waitForCompletion(sharedCB)
 
@@ -1368,24 +1691,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                                       queryCount: UInt32(t),
                                                       topK: UInt32(cfg.topKExperts),
                                                       d: UInt32(D))
-                    let scalarBits = views.layerScalar.buffer.contents()
-                        .advanced(by: Int(views.layerScalar.offset))
-                        .assumingMemoryBound(to: UInt16.self)[0]
-                    prefillLayerTail.encode(commandBuffer: tailCB,
-                                            h2: scratch.h2,
-                                            h1: scratch.h1,
-                                            hidden: scratch.hidden,
-                                            postFFN2Weight: views.postFFN2.buffer,
-                                            postFFN2WeightOffset: Int(views.postFFN2.offset),
-                                            postFFNWeight: views.postFFN.buffer,
-                                            postFFNWeightOffset: Int(views.postFFN.offset),
-                                            queryCount: UInt32(t),
-                                            d: UInt32(D),
-                                            h2StrideElements: UInt32(D),
-                                            h1StrideElements: UInt32(D),
-                                            hiddenStrideElements: UInt32(D),
-                                            eps: eps,
-                                            layerScalar: Quantization.bf16ToFloat(scalarBits))
+                    try encodePrefillLayerTail(commandBuffer: tailCB, views: views)
                     tailCB.commit()
                     try withExtendedLifetime(metadata) {
                         try waitForCompletion(tailCB)
@@ -1529,6 +1835,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         for L in 0..<cfg.numLayers {
             let isFull = cfg.layerKindMask[L] == 1
             let isLinear = cfg.layerKindMask[L] == 2
+            // Dense-MLP (Laguna) layers skip MoE routing entirely. Qwen3.6 has
+            // none, so this is always false there.
+            let isDense = cfg.isDenseMLP(atLayer: L)
             let headDimL = isFull ? cfg.fullHeadDim : cfg.headDim
             // Qwen3.6 has numFullKVHeads=0 — full-attn layers reuse numKVHeads.
             let numKVL   = isFull ? max(cfg.numFullKVHeads, cfg.numKVHeads) : cfg.numKVHeads
@@ -1565,31 +1874,46 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 kNorm = try model.kNorm(layer: L)
             }
             let sharedProj = sharedExpertProjections[L]
-            let routerW  = try model.router(layer: L)
+            let routerW: TensorView? = isDense ? nil : (try model.router(layer: L))
             let isQwen36 = cfg.topology == .qwen36
             // Qwen3.6's full-attention layers use Qwen3-Next gated attention:
             // q_proj emits query AND a per-head output gate, and the attention
             // result is scaled by sigmoid(gate) before o_proj.
             let isGatedAttn = isQwen36 && isFull
-            // Gemma-only tensors — Qwen3.6 pre-norm skips these.
+            // Gemma-only tensors — Qwen3.6 pre-norm skips these; dense-MLP
+            // (Laguna) layers have no routed branch either.
             let preFFN   = isQwen36 ? postAttn : (try model.preFFN(layer: L))
             let preFFN2  = isQwen36 ? postAttn : (try model.preFFN2(layer: L))
             let postF2   = isQwen36 ? postAttn : (try model.postFFN2(layer: L))
             let postF    = isQwen36 ? postAttn : (try model.postFFN(layer: L))
-            let perExpertScale: TensorView
-            let layerScalarView: TensorView
-            if isQwen36 {
+            // Qwen3.6's sigmoidTopK router has no `per_expert_scale` tensor —
+            // multiply gathered weights by an all-ones dummy buffer instead
+            // (`dummyPerExpertScale`, allocated once at init).
+            let perExpertScale: TensorView?
+            if isDense {
+                perExpertScale = nil
+            } else if isQwen36 {
                 perExpertScale = TensorView(
                     buffer: dummyPerExpertScale!, offset: 0,
                     length: UInt64(cfg.numExperts * MemoryLayout<UInt16>.size),
                     scaleOffset: 0, scaleLength: 0,
                     biasOffset: 0, biasLength: 0,
                     shape: (UInt32(cfg.numExperts), 1, 1, 1), dtype: 2)
-                layerScalarView = postAttn  // unused in pre-norm
             } else {
                 perExpertScale = try model.routerPerExpertScale(layer: L)
-                layerScalarView = try model.layerScalar(layer: L)
             }
+            // nil under `.softmaxTopK`, which has no selection bias; non-nil
+            // for Qwen3.6, whose sigmoidTopK router applies an
+            // auxiliary-loss-free selection bias to the routing scores
+            // (arXiv:2408.15664) — same tensor the prefill path already reads.
+            let selectionBias = isDense ? nil : (try model.routerSelectionBias(layer: L))
+            // 1.0 under `.preNorm` (Qwen3.6), which has no per-layer residual gain.
+            let layerScalar: Float = try model.layerScalar(layer: L).map {
+                Quantization.bf16ToFloat(
+                    $0.buffer.contents()
+                        .advanced(by: Int($0.offset))
+                        .assumingMemoryBound(to: UInt16.self)[0])
+            } ?? 1.0
 
             let tCb1Start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
             // Everything up to and including the router runs in a single CB:
@@ -1603,7 +1927,41 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                 d: D, eps: eps)
             }
 
+            let attnQuant = attentionQuantByLayer[L]
             let gQKV: (MTLCommandBuffer) -> Void = { [self] cb in
+                // Anything other than 4-bit goes to the generic wrapper. The
+                // 4-bit branch is the original call, unchanged, so a uniformly
+                // 4-bit checkpoint encodes exactly what it did before.
+                if attnQuant.weightBits != 4 {
+                    guard let wide = fusedQKVGEMVWide[attnQuant.weightBits] else {
+                        // init builds a pipeline for every distinct non-4-bit
+                        // width or throws, so this is unreachable. Trap rather
+                        // than fall through: the 4-bit encoder would happily
+                        // read these bytes as nibbles and produce numbers that
+                        // look plausible and are entirely wrong.
+                        preconditionFailure(
+                            "no QKV pipeline for \(attnQuant.weightBits)-bit attention at layer \(L)")
+                    }
+                    wide.encode(commandBuffer: cb,
+                                qWeights: q.buffer, qWeightsOffset: Int(q.offset),
+                                qScales: q.buffer, qScalesOffset: Int(q.scaleOffset),
+                                qBiases: q.buffer, qBiasesOffset: Int(q.biasOffset),
+                                kWeights: k.buffer, kWeightsOffset: Int(k.offset),
+                                kScales: k.buffer, kScalesOffset: Int(k.scaleOffset),
+                                kBiases: k.buffer, kBiasesOffset: Int(k.biasOffset),
+                                vWeights: vProj.buffer, vWeightsOffset: Int(vProj.offset),
+                                vScales: vProj.buffer, vScalesOffset: Int(vProj.scaleOffset),
+                                vBiases: vProj.buffer, vBiasesOffset: Int(vProj.biasOffset),
+                                x: normed,
+                                qOut: qScratch,
+                                kOut: kSlot.buffer, kOutOffset: kSlot.offset,
+                                vOut: vSlot.buffer, vOutOffset: vSlot.offset,
+                                qRows: qDim,
+                                kvRows: kvDim,
+                                n: UInt32(D),
+                                groupSize: UInt32(attnQuant.groupSize))
+                    return
+                }
                 fusedQKVGEMV.encode(commandBuffer: cb,
                                     qWeights: q.buffer, qWeightsOffset: Int(q.offset),
                                     qScales: q.buffer, qScalesOffset: Int(q.scaleOffset),
@@ -1623,6 +1981,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                     n: D)
             }
 
+            let scaling = cfg.ropeScaling(atLayer: L)
             let gQKVEpilogue: (MTLCommandBuffer) -> Void = { [self] cb in
                 let rotated = isFull
                     ? UInt32(Double(cfg.fullHeadDim) * cfg.partialRotaryFactor / 2.0)
@@ -1646,9 +2005,11 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                         eps: eps,
                                         ropePairStride: isQwen36 ? rotated : nil,
                                         ropeFreqDim: isQwen36 ? 2 * rotated : nil,
-                                        normalizeV: !isQwen36)
+                                        normalizeV: !isQwen36,
+                                        scaling: scaling)
             }
 
+            let attnScale = isFull ? Float(scaling?.attentionFactor ?? 1.0) : 1.0
             let gAttention: (MTLCommandBuffer) -> Void = { [self] cb in
                 guard kv != nil else {
                     preconditionFailure("FP16 attention requires an FP16 KV cache")
@@ -1663,10 +2024,14 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                          numQHeads: UInt32(cfg.numHeads),
                                          numKVHeads: UInt32(numKVL),
                                          seqLen: seqLen,
-                                         // Gemma folds 1/sqrt(head_dim) into
-                                         // its q_norm weights; Qwen3.6 does not.
+                                         // Gemma folds 1/sqrt(head_dim) into its
+                                         // q_norm weights (scale 1.0, or
+                                         // `attnScale` under Laguna's per-layer
+                                         // YaRoPE attention factor); Qwen3.6
+                                         // does not fold it, so it needs the
+                                         // explicit 1/sqrt(head_dim) term.
                                          scale: isQwen36
-                                             ? 1 / Float(headDimL).squareRoot() : 1.0)
+                                             ? 1 / Float(headDimL).squareRoot() : attnScale)
                 } else {
                     let ringCapacity = kv?.ringCapacity(layer: L) ?? 0
                     let activeRingCapacity = ringCapacity > 0 && Int(seqLen) > ringCapacity
@@ -1696,7 +2061,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
 
             let gPostAttnSetup: (MTLCommandBuffer) -> Void = { [self] cb in
                 if isQwen36 {
-                    // Pre-norm: raw residual + single pre-FFN norm.
+                    // Pre-norm: raw residual + single pre-FFN norm, reused as
+                    // the dense/shared, routed, AND router input alike (all
+                    // three read `denseX` below — see `gRouter`).
                     // DeltaNet layers skip attention — no oOut to add.
                     if !isLinear {
                         elementwiseAdd.encode(commandBuffer: cb,
@@ -1709,34 +2076,72 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                     out: denseX,  // ffInput reused in denseX
                                     d: D, eps: eps)
                 } else {
-                    fusedPostAttentionSetup.encode(commandBuffer: cb,
-                                                   hidden: hidden,
-                                                   attn: oOut,
-                                                   denseX: denseX,
-                                                   routedX: routedX,
-                                                   routerX: routerInput,
-                                                   postAttentionWeight: postAttn.buffer,
-                                                   postAttentionWeightOffset: Int(postAttn.offset),
-                                                   preFFNWeight: preFFN.buffer,
-                                                   preFFNWeightOffset: Int(preFFN.offset),
-                                                   preFFN2Weight: preFFN2.buffer,
-                                                   preFFN2WeightOffset: Int(preFFN2.offset),
-                                                   d: D,
-                                                   eps: eps)
+                    switch cfg.normTopology {
+                    case .preNorm:
+                        fusedPostAttentionSetup.encodePreNorm(commandBuffer: cb,
+                                                              hidden: hidden,
+                                                              attn: oOut,
+                                                              denseX: denseX,
+                                                              routedX: routedX,
+                                                              routerX: routerInput,
+                                                              preFFNWeight: preFFN.buffer,
+                                                              preFFNWeightOffset: Int(preFFN.offset),
+                                                              d: D,
+                                                              eps: eps)
+                    case .sandwich:
+                        fusedPostAttentionSetup.encode(commandBuffer: cb,
+                                                       hidden: hidden,
+                                                       attn: oOut,
+                                                       denseX: denseX,
+                                                       routedX: routedX,
+                                                       routerX: routerInput,
+                                                       postAttentionWeight: postAttn.buffer,
+                                                       postAttentionWeightOffset: Int(postAttn.offset),
+                                                       preFFNWeight: preFFN.buffer,
+                                                       preFFNWeightOffset: Int(preFFN.offset),
+                                                       preFFN2Weight: preFFN2.buffer,
+                                                       preFFN2WeightOffset: Int(preFFN2.offset),
+                                                       d: D,
+                                                       eps: eps)
+                    }
                 }
             }
 
             let gRouter: (MTLCommandBuffer) -> Void = { [self] cb in
-                moe.encodeRouterGemma4(commandBuffer: cb,
-                    weights: routerW.buffer, weightsOffset: Int(routerW.offset),
-                    scales:  routerW.buffer, scalesOffset:  Int(routerW.scaleOffset),
-                    biases:  routerW.buffer, biasesOffset:  Int(routerW.biasOffset),
-                    hidden: isQwen36 ? denseX : routerInput,
-                    effectiveScale: effectiveScaleBuffers[L],
-                    perExpertScale: perExpertScale.buffer,
-                    perExpertScaleOffset: Int(perExpertScale.offset),
-                    outIndices: outIndices, outWeights: outWeights,
-                    numExperts: UInt32(cfg.numExperts), d: D, topK: UInt32(cfg.topKExperts))
+                guard let routerW else { return }
+                // Qwen3.6's pre-norm block only populates `denseX` above (not
+                // `routerInput`), and reuses it as the router input too.
+                let routerHidden = isQwen36 ? denseX : routerInput
+                if cfg.routerScoring == .sigmoidTopK {
+                    guard let selectionBias else { return }
+                    moe.encodeRouterSigmoid(commandBuffer: cb,
+                        weights: routerW.buffer, weightsOffset: Int(routerW.offset),
+                        scales:  routerW.buffer, scalesOffset:  Int(routerW.scaleOffset),
+                        biases:  routerW.buffer, biasesOffset:  Int(routerW.biasOffset),
+                        hidden: routerHidden,
+                        effectiveScale: effectiveScaleBuffers[L],
+                        perExpertScale: routerOnesPerExpert,
+                        selectionBias: selectionBias.buffer,
+                        selectionBiasOffset: Int(selectionBias.offset),
+                        outIndices: outIndices, outWeights: outWeights,
+                        numExperts: UInt32(cfg.numExperts), d: D, topK: UInt32(cfg.topKExperts),
+                        groupSize: UInt32(model.routerGroupSize),
+                        useBF16: routerW.scaleLength == 0)
+                } else {
+                    guard let perExpertScale else { return }
+                    moe.encodeRouterGemma4(commandBuffer: cb,
+                        weights: routerW.buffer, weightsOffset: Int(routerW.offset),
+                        scales:  routerW.buffer, scalesOffset:  Int(routerW.scaleOffset),
+                        biases:  routerW.buffer, biasesOffset:  Int(routerW.biasOffset),
+                        hidden: routerHidden,
+                        effectiveScale: effectiveScaleBuffers[L],
+                        perExpertScale: perExpertScale.buffer,
+                        perExpertScaleOffset: Int(perExpertScale.offset),
+                        outIndices: outIndices, outWeights: outWeights,
+                        numExperts: UInt32(cfg.numExperts), d: D, topK: UInt32(cfg.topKExperts),
+                        groupSize: UInt32(model.routerGroupSize),
+                        useBF16: routerW.scaleLength == 0)
+                }
             }
 
             if isLinear {
@@ -1805,8 +2210,66 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 gOProj(cb)
             }
             gPostAttnSetup(cb)
-            gRouter(cb)
+            if !isDense {
+                gRouter(cb)
+            }
             cb.commit()
+
+            if isDense {
+                let tWait = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+                try waitForCompletion(cb)
+                let waitNanos = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tWait
+                if let pending = pendingRoutedCommand {
+                    try finishPendingRoutedCommand(pending, waitIfNeeded: false)
+                    pendingRoutedCommand = nil
+                }
+                totalCb1Nanos &+= clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tCb1Start - waitNanos
+
+                memset(h2Buf.contents(), 0, h2Buf.length)
+
+                let gSharedFFN: (MTLCommandBuffer) -> Void = { [self] cb in
+                    try! shared.encode(commandBuffer: cb,
+                                       x: denseX,
+                                       gate: sharedProj.gate,
+                                       up: sharedProj.up,
+                                       down: sharedProj.down,
+                                       y: h1Buf,
+                                       scratchGate: denseScratchGate,
+                                       scratchUp: denseScratchUp,
+                                       scratchAct: denseScratchAct)
+                }
+                let gSharedNorm: (MTLCommandBuffer) -> Void = { [self] cb in
+                    guard let postF1 = sharedProj.postF1 else { return }
+                    rms.encodeBF16W(commandBuffer: cb, x: h1Buf,
+                                    weight: postF1.buffer,
+                                    weightOffset: Int(postF1.offset),
+                                    out: h1Buf, d: D, eps: eps)
+                }
+                let sharedCB = ctx.queue.makeCommandBuffer()!
+                gSharedFFN(sharedCB)
+                gSharedNorm(sharedCB)
+                sharedCB.commit()
+
+
+                let gTail: (MTLCommandBuffer) -> Void = { [self] cb in
+                    encodeDecodeLayerTail(cb, postF2: postF2, postF: postF,
+                                          layerScalar: layerScalar)
+                }
+                let tCb2Start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+                let denseTailCB = ctx.queue.makeCommandBuffer()!
+                gTail(denseTailCB)
+                denseTailCB.commit()
+                precondition(pendingRoutedCommand == nil,
+                             "routed command-buffer pipeline drained before queuing the next layer")
+                pendingRoutedCommand = PendingRoutedCommand(
+                    cb: denseTailCB,
+                    sharedCB: sharedCB,
+                    phase1HitCB: nil,
+                    encodeAndCommitNanos: clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tCb2Start,
+                    pinnedLayer: L,
+                    pinnedSlots: [])
+                continue
+            }
             let tWait = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
             waitUntilCompleted(cb)
             let waitNanos = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tWait
@@ -1824,7 +2287,6 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             for i in 0..<cfg.topKExperts {
                 experts[i] = min(Int(idxPtr[i]), cfg.numExperts - 1)
             }
-
             let routedOffsets = model.routedExpertOffsets(layer: L)
             let topK = UInt32(cfg.topKExperts)
             let canPlanPhase1HitSplit =
@@ -1866,7 +2328,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                                         acts: moeActs,
                                                         d: D,
                                                         f: FmoE,
-                                                        topK: topK)
+                                                        topK: topK,
+                                                        groupSize: UInt32(model.routedExpertGroupSize))
             }
 
             func encodeRoutedPhase1Subset(
@@ -1889,7 +2352,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     activeCount: activeCount,
                     d: D,
                     f: FmoE,
-                    topK: topK)
+                    topK: topK,
+                    groupSize: UInt32(model.routedExpertGroupSize))
             }
 
             if let plan = plannedFetch,
@@ -1929,14 +2393,16 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                    scratchUp: denseScratchUp,
                                    scratchAct: denseScratchAct)
             }
-            // Qwen3.6 pre-norm skips the post-FFN norm — h1Buf is raw MLP output.
+            // Pre-norm topologies (Qwen3.6, and any generalized dense-MLP arch
+            // using `.preNorm`) skip the post-FFN norm — h1Buf is raw MLP
+            // output. `sharedProj.postF1` is nil exactly in that case.
             let sharedCB: MTLCommandBuffer
-            if !isQwen36 {
+            if let postF1 = sharedProj.postF1 {
                 sharedCB = ctx.queue.makeCommandBuffer()!
                 gSharedFFN(sharedCB)
                 rms.encodeBF16W(commandBuffer: sharedCB, x: h1Buf,
-                                weight: sharedProj.postF1.buffer,
-                                weightOffset: Int(sharedProj.postF1.offset),
+                                weight: postF1.buffer,
+                                weightOffset: Int(postF1.offset),
                                 out: h1Buf, d: D, eps: eps)
                 sharedCB.commit()
             } else {
@@ -2000,31 +2466,14 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             totalIoNanos &+= layerIo
             let routedBufs = blobs.map { $0.buffer }
             let tCb2Start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-            let scalarPtr = layerScalarView.buffer.contents()
-                .advanced(by: Int(layerScalarView.offset))
-                .assumingMemoryBound(to: UInt16.self)
-            let layerScalar = Quantization.bf16ToFloat(scalarPtr[0])
-
             let gTail: (MTLCommandBuffer) -> Void = { [self] cb in
-                if isQwen36 {
-                    // Pre-norm: raw combines, no norms, no layer scalar.
-                    elementwiseAdd.encode(commandBuffer: cb,
-                                          a: h1Buf, b: h2Buf, count: D)
-                    elementwiseAdd.encode(commandBuffer: cb,
-                                          a: hidden, b: h1Buf, count: D)
-                } else {
-                    fusedTail.encode(commandBuffer: cb,
-                                     h2: h2Buf,
-                                     h1: h1Buf,
-                                     hidden: hidden,
-                                     postFFN2Weight: postF2.buffer,
-                                     postFFN2WeightOffset: Int(postF2.offset),
-                                     postFFNWeight: postF.buffer,
-                                     postFFNWeightOffset: Int(postF.offset),
-                                     d: D,
-                                     eps: eps,
-                                     layerScalar: layerScalar)
-                }
+                // `encodeDecodeLayerTail` dispatches on `model.config.normTopology`:
+                // `.preNorm` (Qwen3.6) ignores postF2/postF and does the raw
+                // hidden + h1 + routedScale*h2 combine — numerically identical
+                // to the old manual two-elementwiseAdd version since Qwen3.6's
+                // `routedScalingFactor` is the default 1.0.
+                encodeDecodeLayerTail(cb, postF2: postF2, postF: postF,
+                                      layerScalar: layerScalar)
             }
             let routedCB = ctx.queue.makeCommandBuffer()!
             let splitArgBuf = phase1HitCB != nil && !phase1MissSlots.isEmpty
@@ -2057,7 +2506,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                                    y: h2Buf,
                                                    d: D,
                                                    f: FmoE,
-                                                   topK: topK)
+                                                   topK: topK,
+                                                   groupSize: UInt32(model.routedExpertGroupSize))
             gTail(routedCB)
             routedCB.commit()
             precondition(pendingRoutedCommand == nil,

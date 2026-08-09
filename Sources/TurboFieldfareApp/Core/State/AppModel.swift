@@ -11,6 +11,7 @@ public final class AppModel {
     }
 
     public var modelPathText: String
+    public var selectedModelSourceID: String = SupportedModelSource.default.id
     public var promptText: String = ""
     public private(set) var outputPromptText: String = ""
     public var outputText: String = ""
@@ -67,7 +68,7 @@ public final class AppModel {
                 installer: any AppModelInstallerClient = RepackModelInstallerClient(),
                 memorySampler: AppMemorySampler = AppMemorySampler(),
                 settingsPersistenceEnabled: Bool = false) {
-        let directory = (modelDirectory ?? AppModelLocation.defaultURL()).standardizedFileURL
+        let directory = (modelDirectory ?? AppModelLocation.defaultURL(forCatalogID: "gemma4")).standardizedFileURL
         let installETAClock = SuspendingClock()
         let settings = settingsPersistenceEnabled
             ? MacAppSettingsFileStore.loadOrCreate(forModelDirectory: directory)
@@ -93,6 +94,12 @@ public final class AppModel {
         self.installETAClock = installETAClock
         self.installETAOrigin = installETAClock.now
         refreshInstallReadiness()
+        // Auto-load if the model is already installed at startup.
+        if isModelInstalled {
+            Task { @MainActor in
+                loadModel()
+            }
+        }
     }
 
     public var isRunning: Bool { runState == .running }
@@ -126,6 +133,26 @@ public final class AppModel {
     public var requiresModelInstallation: Bool { !isModelInstalled }
 
     public var installDescriptor: AppModelInstallDescriptor { installer.descriptor }
+
+    public var availableModelSources: [ModelSource] { SupportedModelSource.installable }
+    public var currentModelSource: ModelSource? { SupportedModelSource.source(id: selectedModelSourceID) }
+
+    public func switchModelSource(to source: ModelSource) {
+        guard source.id != selectedModelSourceID else { return }
+        selectedModelSourceID = source.id
+        let descriptor = AppModelInstallDescriptor(source: source)
+        installer.rebind(descriptor: descriptor)
+        let newDir = AppModelLocation.defaultURL(for: source)
+        setModelURL(newDir)
+        if isModelInstalled {
+            loadModel()
+        }
+    }
+
+    public func switchModelSource(toID id: String) {
+        guard let source = SupportedModelSource.source(id: id) else { return }
+        switchModelSource(to: source)
+    }
 
     public var installRequirement: AppModelInstallRequirement? {
         installReadiness.requirement

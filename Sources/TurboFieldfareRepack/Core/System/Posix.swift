@@ -257,6 +257,14 @@ public enum Posix {
         return UInt64(st.st_size)
     }
 
+    /// Convenience: open `path`, stat, close. For one-shot size checks
+    /// where the caller does not already hold a descriptor.
+    public static func fileSize(_ path: String) throws -> UInt64 {
+        let fd = try openReadNoFollow(path)
+        defer { close(fd) }
+        return try fileSize(fd: fd, path: path)
+    }
+
     public static func descriptorMatchesPath(_ fd: Int32, path: String) throws -> Bool {
         var descriptorInfo = stat()
         guard fstat(fd, &descriptorInfo) == 0 else {

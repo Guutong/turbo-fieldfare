@@ -35,6 +35,40 @@ public struct Model {
     public var modelID: String { manifest.modelID }
     public var sourceSnapshotHash: String? { manifest.sourceSnapshotHash }
     public var sharedExpertWeightBits: Int { manifest.quant?.sharedExpert.weightBits ?? 8 }
+    public var sharedExpertGroupSize: Int { manifest.quant?.sharedExpert.groupSize ?? Quantization.groupSize }
+    public var routerGroupSize: Int { manifest.quant?.router.groupSize ?? Quantization.groupSize }
+    public var routedExpertGroupSize: Int { manifest.quant?.routedExpert.groupSize ?? Quantization.groupSize }
+
+    /// Quantization of this layer's attention projections.
+    ///
+    /// Per layer rather than per model because some checkpoints vary it:
+    /// Laguna-S-2.1 uses 5-bit attention on 20 layers and 8-bit on the other
+    /// 28. Uniform checkpoints answer the same thing at every layer, so
+    /// callers do not need to know which kind they have.
+    ///
+    /// Falls back to Gemma's 4-bit group-64 when a manifest carries no quant
+    /// block at all — the same default the rest of this type uses for that
+    /// case, and the reason the 4-bit dispatch stays untouched for it.
+    public func attentionQuant(atLayer layer: Int) -> (weightBits: Int, groupSize: Int) {
+        Model.attentionQuant(manifest.quant?.attention, atLayer: layer)
+    }
+
+    /// The resolution rule on its own, so the fallback can be tested without
+    /// standing up a whole `Model` — the case that matters here is a manifest
+    /// with no quant block, which is awkward to construct and easy to get
+    /// wrong by asserting on the fixture instead of the behaviour.
+    static func attentionQuant(_ slot: ManifestQuantSlot?,
+                               atLayer layer: Int) -> (weightBits: Int, groupSize: Int) {
+        guard let slot else { return (4, Quantization.groupSize) }
+        return slot.resolved(atLayer: layer)
+    }
+
+    /// Every distinct attention quantization the model uses, so a runner can
+    /// build exactly the pipelines it needs up front instead of discovering
+    /// them mid-decode.
+    public var distinctAttentionQuants: [(weightBits: Int, groupSize: Int)] {
+        manifest.quant?.attention.distinctConfigurations ?? [(4, Quantization.groupSize)]
+    }
 
     let residentBuffer: ResidentBuffer
     let residentIndex: ResidentIndex
@@ -115,46 +149,47 @@ public struct Model {
     public func oProj(layer L: Int) throws -> TensorView {
         try resident(name: "language_model.model.layers.\(L).self_attn.o_proj.weight")
     }
-    /// Writer emits `.router.proj.weight` (no `.mlp.` segment) for Gemma 4.
-    /// Qwen3.6 names the router Linear `mlp.gate` — the router IS the gate projection.
+    /// Gemma spells the router `.router.proj.weight`; Laguna spells it
+    /// `.mlp.gate.proj.weight`; Qwen3.6 names the router Linear `mlp.gate` —
+    /// the router IS the gate projection, spelled `.mlp.gate.weight`. All are
+    /// stored as-is from the source checkpoint, so probe the resident index
+    /// rather than branching solely on topology.
     public func router(layer L: Int) throws -> TensorView {
-        let name: String
-        if config.topology == .qwen36 {
-            name = "language_model.model.layers.\(L).mlp.gate.weight"
-        } else {
-            name = "language_model.model.layers.\(L).router.proj.weight"
+        let name = "language_model.model.layers.\(L).router.proj.weight"
+        if residentIndex.entries[name] != nil {
+            return try resident(name: name)
         }
-        return try resident(name: name)
+        if config.topology == .qwen36 {
+            return try resident(name: "language_model.model.layers.\(L).mlp.gate.weight")
+        }
+        return try resident(name: "language_model.model.layers.\(L).mlp.gate.proj.weight")
     }
     /// Writer emits the shared-expert FFN as `.mlp.{gate,up,down}_proj.weight`
     /// without a `.shared_expert.` segment for Gemma 4.
     /// Qwen3.6 uses `.mlp.shared_expert.{gate,up,down}_proj.weight`.
     public func sharedExpertGate(layer L: Int) throws -> TensorView {
-        let name: String
-        if config.topology == .qwen36 {
-            name = "language_model.model.layers.\(L).mlp.shared_expert.gate_proj.weight"
-        } else {
-            name = "language_model.model.layers.\(L).mlp.gate_proj.weight"
+        let name = "language_model.model.layers.\(L).mlp.shared_expert.gate_proj.weight"
+        if residentIndex.entries[name] != nil {
+            return try resident(name: name)
         }
-        return try resident(name: name)
+        return try resident(name: "language_model.model.layers.\(L).mlp.gate_proj.weight")
     }
     public func sharedExpertUp(layer L: Int) throws -> TensorView {
-        let name: String
-        if config.topology == .qwen36 {
-            name = "language_model.model.layers.\(L).mlp.shared_expert.up_proj.weight"
-        } else {
-            name = "language_model.model.layers.\(L).mlp.up_proj.weight"
+        let name = "language_model.model.layers.\(L).mlp.shared_expert.up_proj.weight"
+        if residentIndex.entries[name] != nil {
+            return try resident(name: name)
         }
-        return try resident(name: name)
+        return try resident(name: "language_model.model.layers.\(L).mlp.up_proj.weight")
     }
     public func sharedExpertDown(layer L: Int) throws -> TensorView {
-        let name: String
-        if config.topology == .qwen36 {
-            name = "language_model.model.layers.\(L).mlp.shared_expert.down_proj.weight"
-        } else {
-            name = "language_model.model.layers.\(L).mlp.down_proj.weight"
+        let name = "language_model.model.layers.\(L).mlp.shared_expert.down_proj.weight"
+        if residentIndex.entries[name] != nil {
+            return try resident(name: name)
         }
-        return try resident(name: name)
+        return try resident(name: "language_model.model.layers.\(L).mlp.down_proj.weight")
+    }
+    public func gProj(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).self_attn.g_proj.weight")
     }
     public func inputNorm(layer L: Int) throws -> TensorView {
         try resident(name: "language_model.model.layers.\(L).input_layernorm.weight")
@@ -217,27 +252,43 @@ public struct Model {
 
     // MARK: - Feed-forward norms
     //
-    // The Gemma 4 sandwich wraps two parallel FFN branches:
+    // The Gemma 4 sandwich (`normTopology == .sandwich`) wraps two parallel FFN
+    // branches:
     //   pre_feedforward_layernorm        -> dense MLP input
     //   pre_feedforward_layernorm_2      -> routed expert input
     //   post_feedforward_layernorm_1     -> dense MLP output
     //   post_feedforward_layernorm_2     -> routed expert output
     //   post_feedforward_layernorm       -> combined (h1+h2) output
+    //
+    // A `.preNorm` model has none of those five. Both branches read the same
+    // single pre-MLP norm — which that convention confusingly calls
+    // `post_attention_layernorm` — and nothing is normed on the way out. The
+    // `postFFN*` accessors therefore return nil rather than throwing, so the
+    // forward pass can ask without knowing the topology.
 
     public func preFFN(layer L: Int) throws -> TensorView {
-        try resident(name: "language_model.model.layers.\(L).pre_feedforward_layernorm.weight")
+        if config.normTopology == .preNorm {
+            return try postAttnNorm(layer: L)
+        }
+        return try resident(name: "language_model.model.layers.\(L).pre_feedforward_layernorm.weight")
     }
     public func preFFN2(layer L: Int) throws -> TensorView {
-        try resident(name: "language_model.model.layers.\(L).pre_feedforward_layernorm_2.weight")
+        if config.normTopology == .preNorm {
+            return try postAttnNorm(layer: L)
+        }
+        return try resident(name: "language_model.model.layers.\(L).pre_feedforward_layernorm_2.weight")
     }
-    public func postFFN1(layer L: Int) throws -> TensorView {
-        try resident(name: "language_model.model.layers.\(L).post_feedforward_layernorm_1.weight")
+    public func postFFN1(layer L: Int) throws -> TensorView? {
+        guard config.normTopology == .sandwich else { return nil }
+        return try resident(name: "language_model.model.layers.\(L).post_feedforward_layernorm_1.weight")
     }
-    public func postFFN2(layer L: Int) throws -> TensorView {
-        try resident(name: "language_model.model.layers.\(L).post_feedforward_layernorm_2.weight")
+    public func postFFN2(layer L: Int) throws -> TensorView? {
+        guard config.normTopology == .sandwich else { return nil }
+        return try resident(name: "language_model.model.layers.\(L).post_feedforward_layernorm_2.weight")
     }
-    public func postFFN(layer L: Int) throws -> TensorView {
-        try resident(name: "language_model.model.layers.\(L).post_feedforward_layernorm.weight")
+    public func postFFN(layer L: Int) throws -> TensorView? {
+        guard config.normTopology == .sandwich else { return nil }
+        return try resident(name: "language_model.model.layers.\(L).post_feedforward_layernorm.weight")
     }
 
     // MARK: - Router auxiliaries
@@ -246,17 +297,32 @@ public struct Model {
     // (post-RMSNorm), fused with 1/sqrt(hidden_size). `per_expert_scale` is
     // applied to the top-k routing weights after softmax over top-k.
 
-    public func routerScale(layer L: Int) throws -> TensorView {
-        try resident(name: "language_model.model.layers.\(L).router.scale")
+    /// Both are Gemma-only: a `.sigmoidTopK` router scales neither its input
+    /// nor its output, so these return nil there rather than throwing.
+    public func routerScale(layer L: Int) throws -> TensorView? {
+        guard config.routerScoring == .softmaxTopK else { return nil }
+        return try resident(name: "language_model.model.layers.\(L).router.scale")
     }
-    public func routerPerExpertScale(layer L: Int) throws -> TensorView {
-        try resident(name: "language_model.model.layers.\(L).router.per_expert_scale")
+    public func routerPerExpertScale(layer L: Int) throws -> TensorView? {
+        guard config.routerScoring == .softmaxTopK else { return nil }
+        return try resident(name: "language_model.model.layers.\(L).router.per_expert_scale")
+    }
+
+    /// Per-expert additive bias on the *selection* scores only, for
+    /// auxiliary-loss-free load balancing (arXiv:2408.15664). The gathered
+    /// routing weights stay unbiased, so this must not be folded into them.
+    /// `.sigmoidTopK` models only; shape `[numExperts]`, BF16.
+    public func routerSelectionBias(layer L: Int) throws -> TensorView? {
+        guard config.routerScoring == .sigmoidTopK else { return nil }
+        return try resident(name: "language_model.model.layers.\(L).mlp.gate.e_score_correction_bias")
     }
 
     /// Per-layer scalar gain applied to the entire residual stream at the end
-    /// of the layer; shape `[1]`, BF16.
-    public func layerScalar(layer L: Int) throws -> TensorView {
-        try resident(name: "language_model.model.layers.\(L).layer_scalar")
+    /// of the layer; shape `[1]`, BF16. Gemma-only — a `.preNorm` block has no
+    /// such term, which is a gain of 1.0.
+    public func layerScalar(layer L: Int) throws -> TensorView? {
+        guard config.normTopology == .sandwich else { return nil }
+        return try resident(name: "language_model.model.layers.\(L).layer_scalar")
     }
 
     /// Resolve a tensor name to a `TensorView` against the resident buffer.
@@ -342,6 +408,10 @@ public struct Model {
         if streamersBox.streamers[L] != nil {
             return
         }
+        // Dense-MLP layers have no routed experts to stream.
+        if packedExpertsLayout.layers[L].experts.isEmpty {
+            return
+        }
         let basename = packedExpertsLayout.layers[L].file
         let url = directoryURL
             .appendingPathComponent("packed_experts")
@@ -407,7 +477,7 @@ extension Model {
     /// files are verified lazily on first `routedExpert(...)` touch.
     public static func load(directoryURL: URL,
                             device: MTLDevice,
-                            expecting: ArchConfig = .gemma4_26B_A4B,
+                            expecting: ArchConfig? = nil,
                             streamingMode: ExpertStreamingMode = .pread(slotCount: 16),
                             expertCachePolicy: ExpertCachePolicy = PreadExpertStreamer.cachePolicyDefault,
                             integrityPolicy: ModelIntegrityPolicy? = nil,
@@ -521,7 +591,7 @@ extension Model {
         try validateRuntimeSchema(residentIndex: residentIndex,
                                   layout: layout,
                                   manifest: manifest,
-                                  config: expecting)
+                                  config: expecting ?? manifest.arch.asArchConfig)
 
         // The resident index must account for the complete weights file.
         let fileSize = weightsSize
@@ -544,7 +614,7 @@ extension Model {
 
         return Model(
             device: device,
-            config: expecting,
+            config: manifest.arch.asArchConfig,
             streamingMode: streamingMode,
             expertCachePolicy: expertCachePolicy,
             integrityPolicy: resolvedIntegrityPolicy,
@@ -571,9 +641,17 @@ extension Model {
                 actualSize = try modelDirectory.fileSize(
                     fileDescriptor: fd, relativePath: relativePath)
             }
-            guard actualSize == manifestEntry.size else {
+            // Dense-MLP layers carry no experts; their file is a 0-byte
+            // placeholder that keeps layer indexing uniform.
+            let expectedSize = layer.experts.isEmpty
+                ? 0
+                : UInt64(layout.expertsPerLayer) * layout.expertStride
+            guard actualSize == manifestEntry.size, manifestEntry.size == expectedSize else {
                 throw ModelError.trustedReceiptInvalid(
                     detail: "\(relativePath) size \(actualSize) != \(manifestEntry.size)")
+            }
+            guard layer.experts.isEmpty || layer.experts.count == layout.expertsPerLayer else {
+                throw ModelError.trustedReceiptInvalid(detail: "\(relativePath) expert count mismatch")
             }
         }
     }

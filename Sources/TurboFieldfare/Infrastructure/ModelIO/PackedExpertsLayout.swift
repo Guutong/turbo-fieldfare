@@ -55,6 +55,12 @@ struct PackedExpertsLayout: Sendable {
 }
 
 enum PackedExpertsLayoutReader {
+    /// Sanity bound on layout.json, which grows as layers x experts x
+    /// sub-tensors. Laguna (47 sparse layers x 256 experts x 8 sub-tensors)
+    /// lands around 10 MB and Qwen3.6 (30 sparse layers x 256 experts) is
+    /// similar; `GTurboFormatV1.layoutMaxBytes` (64 MB) leaves headroom for
+    /// larger expert counts while still rejecting an absurd file before it
+    /// is read into memory.
     static let defaultMaxBytes: UInt64 = GTurboFormatV1.layoutMaxBytes
 
     static func load(directoryURL: URL,

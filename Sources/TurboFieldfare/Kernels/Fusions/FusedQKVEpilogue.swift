@@ -65,7 +65,11 @@ final class FusedQKVEpilogue {
                        ropeFreqDim: UInt32? = nil,
                        // Gemma applies a no-scale per-head RMSNorm to V;
                        // Qwen3.6 uses raw V.
-                       normalizeV: Bool = true) {
+                       normalizeV: Bool = true,
+                       // Laguna's YaRN-style long-context frequency scaling,
+                       // applied on top of whichever pairing/frequency-dim
+                       // convention above resolves to.
+                       scaling: RopeScaling? = nil) {
         precondition(headDim <= 512,
                      "headDim > 512 exceeds the fused QKV epilogue scratch")
         precondition(rotatedPairs * 2 <= headDim,
@@ -88,6 +92,7 @@ final class FusedQKVEpilogue {
         var thetaVar = theta
         var rotatedVar = rotatedPairs
         var epsVar = eps
+        var scalingParams = MetalRopeScalingParams(scaling: scaling)
         enc.setBytes(&headDimVar, length: MemoryLayout<UInt32>.size, index: 5)
         enc.setBytes(&numQVar,    length: MemoryLayout<UInt32>.size, index: 6)
         enc.setBytes(&numKVVar,   length: MemoryLayout<UInt32>.size, index: 7)
@@ -99,6 +104,7 @@ final class FusedQKVEpilogue {
         var freqDimVar = ropeFreqDim ?? headDim
         enc.setBytes(&strideVar,  length: MemoryLayout<UInt32>.size, index: 12)
         enc.setBytes(&freqDimVar, length: MemoryLayout<UInt32>.size, index: 13)
+        enc.setBytes(&scalingParams, length: MemoryLayout<MetalRopeScalingParams>.size, index: 14)
 
         let threads = min(Int(pso.maxTotalThreadsPerThreadgroup), 256)
         let groups = Int(numQHeads + (normalizeV ? 2 : 1) * numKVHeads)

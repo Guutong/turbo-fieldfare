@@ -3,27 +3,36 @@ import TurboFieldfareRepackCore
 
 private let usage = """
 Usage:
-  TurboFieldfareRepack --output <model.gturbo> [--overwrite] [--resume]
-  TurboFieldfareRepack --output <model.gturbo> --local <snapshot_dir>
+  TurboFieldfareRepack --output <model.gturbo> [--model <id>] [--overwrite] [--resume]
+  TurboFieldfareRepack --output <model.gturbo> --local-checkpoint <path>
   TurboFieldfareRepack --discard-partial --output <model.gturbo>
   TurboFieldfareRepack --verify-install --input-gturbo <model.gturbo>
   TurboFieldfareRepack --help
 
-The installer streams the supported Gemma 4 checkpoint from Hugging Face and
-repackages it without materializing the source checkpoint on disk. Set HF_TOKEN
-only if Hugging Face requests authentication. A cancelled or interrupted
-download can be continued with --resume or removed with --discard-partial.
-Use --local <snapshot_dir> to repack a checkpoint already on disk.
+The installer streams a supported checkpoint from Hugging Face and repackages
+it without materializing the source checkpoint on disk. --model selects which
+catalog entry to install (default: \(SupportedModelSource.default.id)); valid ids:
+\(SupportedModelSource.all.map(\.id).joined(separator: ", ")). Set HF_TOKEN only
+if Hugging Face requests authentication.
+
+--local-checkpoint reads from a local HF-style checkpoint directory instead of
+streaming from Hugging Face. The directory must contain config.json,
+model.safetensors.index.json, and the safetensors shards.
+
+A cancelled or interrupted download can be continued with --resume or removed
+with --discard-partial (remote mode only; local checkpoints do not support
+resume).
 """
 
 private struct Arguments {
     var output: String?
+    var model: String?
     var overwrite = false
     var resume = false
     var discardPartial = false
     var verifyInstall = false
     var inputGTurbo: String?
-    var localSnapshotDir: String?
+    var localCheckpoint: String?
 
     static func parse(_ values: [String]) throws -> Arguments {
         var parsed = Arguments()
@@ -45,20 +54,16 @@ private struct Arguments {
             case "--verify-install":
                 parsed.verifyInstall = true
                 index += 1
-            case "--local":
+            case "--output", "--input-gturbo", "--model", "--local-checkpoint":
                 guard index + 1 < values.count else {
                     throw ParseError.missingValue(flag)
                 }
-                parsed.localSnapshotDir = values[index + 1]
-                index += 2
-            case "--output", "--input-gturbo":
-                guard index + 1 < values.count else {
-                    throw ParseError.missingValue(flag)
-                }
-                if flag == "--output" {
-                    parsed.output = values[index + 1]
-                } else {
-                    parsed.inputGTurbo = values[index + 1]
+                switch flag {
+                case "--output":            parsed.output = values[index + 1]
+                case "--input-gturbo":      parsed.inputGTurbo = values[index + 1]
+                case "--model":             parsed.model = values[index + 1]
+                case "--local-checkpoint":  parsed.localCheckpoint = values[index + 1]
+                default: break
                 }
                 index += 2
             default:
@@ -69,14 +74,15 @@ private struct Arguments {
         guard !(parsed.resume && parsed.discardPartial) else {
             throw ParseError.invalidMode("--resume and --discard-partial are mutually exclusive")
         }
-        guard !(parsed.resume && parsed.localSnapshotDir != nil) else {
-            throw ParseError.invalidMode("--resume and --local are mutually exclusive")
+        guard !(parsed.resume && parsed.localCheckpoint != nil) else {
+            throw ParseError.invalidMode("--resume and --local-checkpoint are mutually exclusive")
         }
         if parsed.discardPartial {
             guard parsed.output != nil else {
                 throw ParseError.missingRequired("--output")
             }
-            guard parsed.inputGTurbo == nil, !parsed.overwrite, !parsed.verifyInstall else {
+            guard parsed.inputGTurbo == nil, !parsed.overwrite, !parsed.verifyInstall,
+                  parsed.model == nil else {
                 throw ParseError.invalidMode("--discard-partial only accepts --output")
             }
             return parsed
@@ -85,7 +91,8 @@ private struct Arguments {
             guard parsed.inputGTurbo != nil else {
                 throw ParseError.missingRequired("--input-gturbo")
             }
-            guard parsed.output == nil, !parsed.overwrite, !parsed.resume else {
+            guard parsed.output == nil, !parsed.overwrite, !parsed.resume,
+                  parsed.model == nil else {
                 throw ParseError.invalidMode("verification accepts only --input-gturbo")
             }
         } else {
@@ -159,29 +166,49 @@ private func run(_ values: [String]) async -> Int32 {
     }
 
     guard let output = arguments.output else { return 2 }
-    if let localDir = arguments.localSnapshotDir {
+
+    let options: RemoteStreamingRepackOptions
+    if let localPath = arguments.localCheckpoint {
+        // Local checkpoint mode: reads all files from a local directory.
+        // repoID/revision are synthetic — they exist only for checkpoint
+        // identity and are not used for network requests.
+        let repoID = "local/checkpoint"
+        let revision = "local"
+        options = RemoteStreamingRepackOptions(
+            repoID: repoID,
+            revision: revision,
+            outputDir: output,
+            token: nil,
+            requireKnownSource: false,
+            overwrite: arguments.overwrite,
+            resume: arguments.resume,
+            localCheckpointPath: localPath)
+    } else {
+        let source: ModelSource
         do {
-            let result = try LocalRepacker.repack(
-                snapshotDir: localDir,
-                outputDirectory: output,
-                overwrite: arguments.overwrite)
-            print("Installed \(result.displayName)")
-            print("Source revision: \(result.resolvedCommit)")
-            print("Model: \(result.outputDir)")
-            return 0
+            source = try SupportedModelSource.resolve(modelID: arguments.model)
+        } catch ModelSelectionError.unknownID(let id, let validIDs) {
+            printError("error: unknown model id \"\(id)\"; valid ids: "
+                + "\(validIDs.joined(separator: ", "))\n\n\(usage)")
+            return 2
         } catch {
             printError("install failed: \(error)")
             return 1
         }
+        options = source.installOptions(
+            outputDirectory: URL(fileURLWithPath: output),
+            overwrite: arguments.overwrite,
+            token: ProcessInfo.processInfo.environment["HF_TOKEN"],
+            resume: arguments.resume)
     }
-    let options = SupportedModelSource.installOptions(
-        outputDirectory: URL(fileURLWithPath: output),
-        overwrite: arguments.overwrite,
-        token: ProcessInfo.processInfo.environment["HF_TOKEN"],
-        resume: arguments.resume)
     do {
         let result = try await RemoteStreamingRepacker(options: options).run()
-        print("Installed \(SupportedModelSource.displayName)")
+        if arguments.localCheckpoint != nil {
+            print("Repacked from local checkpoint")
+        } else {
+            let src = try SupportedModelSource.resolve(modelID: arguments.model)
+            print("Installed \(src.displayName)")
+        }
         print("Source revision: \(result.resolvedCommit)")
         print("Model: \(result.outputDir)")
         return 0

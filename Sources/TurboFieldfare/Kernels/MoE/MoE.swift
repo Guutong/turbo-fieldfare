@@ -29,7 +29,8 @@ public struct MoEExpertOffsets {
 }
 
 final class MoE {
-    static let maxStreamedExperts = 8
+    /// Upper bound on topK. The actual K used at runtime must be <= this.
+    static let maxStreamedExperts = 16
 
     private static let realDecodeD: UInt32 = 2816
     private static let realDecodeF: UInt32 = 704
@@ -41,16 +42,6 @@ final class MoE {
         MetalFunctionConstant(index: 2, value: .uint32(realDecodeTopK)),
         MetalFunctionConstant(index: 3, value: .bool(true)),
     ]
-    private static let realDecodeMoESiluConstants: [MetalFunctionConstant] = [
-        MetalFunctionConstant(index: 0, value: .uint32(realDecodeD)),
-        MetalFunctionConstant(index: 1, value: .uint32(realDecodeF)),
-        MetalFunctionConstant(index: 2, value: .uint32(realDecodeTopK)),
-        MetalFunctionConstant(index: 3, value: .bool(true)),
-        MetalFunctionConstant(index: 4, value: .bool(true)),
-    ]
-    private static let moeSiluConstants: [MetalFunctionConstant] = [
-        MetalFunctionConstant(index: 4, value: .bool(true)),
-    ]
     private static let realDecodeRouterConstants: [MetalFunctionConstant] = [
         MetalFunctionConstant(index: 40, value: .uint32(realDecodeNumExperts)),
         MetalFunctionConstant(index: 41, value: .uint32(realDecodeD)),
@@ -60,26 +51,48 @@ final class MoE {
 
     private let routerGemvPSO: MTLComputePipelineState
     private let routerGemvSpecializedPSO: MTLComputePipelineState
-    private let routerSelectK8PSO: MTLComputePipelineState
-    private let routerSelectK8SpecializedPSO: MTLComputePipelineState
+    private let routerGemvGenericPSO: MTLComputePipelineState
+    private let routerGemvBF16PSO: MTLComputePipelineState
+    private let routerSelectPSO: MTLComputePipelineState
+    private let routerSelectSpecializedPSO: MTLComputePipelineState
+    private let routerSigmoidSelectPSO: MTLComputePipelineState
     private let routerLogits: MTLBuffer
     private let phase1U16PSO: MTLComputePipelineState
     private let phase1U16SpecializedPSO: MTLComputePipelineState
-    private let phase1U16SiluPSO: MTLComputePipelineState
-    private let phase1U16SiluSpecializedPSO: MTLComputePipelineState
     private let phase1SubsetU16PSO: MTLComputePipelineState
     private let phase1SubsetU16SpecializedPSO: MTLComputePipelineState
-    private let phase1SubsetU16SiluPSO: MTLComputePipelineState
-    private let phase1SubsetU16SiluSpecializedPSO: MTLComputePipelineState
+    // HEAD (Qwen3.6) had reserved a topK=8-specialized reduce pipeline
+    // ("moe_phase2_down_reduce_k8") for a future fast path; it is not yet
+    // wired into encodeRoutedPersistentPhase2Reduce below (that dispatches
+    // phase2Reduce{,Specialized,Generic}PSO), so these are kept allocated
+    // but unused pending that follow-up.
     private let phase2ReduceK8PSO: MTLComputePipelineState
     private let phase2ReduceK8SpecializedPSO: MTLComputePipelineState
+    private let phase2ReducePSO: MTLComputePipelineState
+    private let phase2ReduceSpecializedPSO: MTLComputePipelineState
+    // Group sizes other than Quantization.groupSize (currently only 128, for
+    // Laguna's routed experts) go through these generic strided-loop
+    // pipelines instead of the group-64 block-vectorized ones above, so the
+    // group-64 pipelines and their dispatch stay exactly what they were
+    // before group-128 support existed — the regression argument for Gemma.
+    private let phase1U16GenericPSO: MTLComputePipelineState
+    private let phase1SubsetU16GenericPSO: MTLComputePipelineState
+    private let phase2ReduceGenericPSO: MTLComputePipelineState
     private let routedArgEncoder: MTLArgumentEncoder
     private let reusableRoutedArgBuffer: MTLBuffer
     private let activation: ActivationType
 
     init(context: MetalContext, activation: ActivationType = .geluPytorchTanh) throws {
         self.activation = activation
+        let useSilu = activation == .silu
         let routerName = "router_gemv_gemma4_r4"
+        // FC_USE_SILU (function_constant 87) is the single shared activation
+        // flag baked into a pipeline at construction time; MoE instances are
+        // constructed once per model with one activation, so there is no
+        // need for parallel Silu/non-Silu pipeline variants selected at
+        // dispatch time.
+        let siluConst: [MetalFunctionConstant] =
+            useSilu ? [MetalFunctionConstant(index: 87, value: .bool(true))] : []
         self.routerGemvPSO = try context.pipeline(
             routerName,
             constants: [],
@@ -88,34 +101,51 @@ final class MoE {
             routerName,
             constants: Self.realDecodeRouterConstants,
             maxTotalThreadsPerThreadgroup: 512)
-        self.routerSelectK8PSO = try context.pipeline("router_topk_select_k8")
-        self.routerSelectK8SpecializedPSO = try context.pipeline(
-            "router_topk_select_k8",
+        // groupSize != Quantization.groupSize goes through the generic
+        // strided-loop kernel, which takes groupSize as a runtime buffer; no
+        // FC_ROUTER_* function constants there, per the generic-kernel
+        // convention.
+        self.routerGemvGenericPSO = try context.pipeline(
+            "router_gemv_gemma4_r4_generic",
+            constants: [],
+            maxTotalThreadsPerThreadgroup: 512)
+        self.routerGemvBF16PSO = try context.pipeline(
+            "router_gemv_bf16_r4",
+            constants: [],
+            maxTotalThreadsPerThreadgroup: 512)
+        self.routerSelectPSO = try context.pipeline("router_topk_select")
+        self.routerSigmoidSelectPSO = try context.pipeline("router_topk_sigmoid")
+        self.routerSelectSpecializedPSO = try context.pipeline(
+            "router_topk_select",
             constants: Self.realDecodeRouterConstants)
-        self.phase1U16PSO = try context.pipeline("moe_phase1_gate_up_act_u16load")
+        self.phase1U16PSO = try context.pipeline(
+            "moe_phase1_gate_up_act_u16load",
+            constants: siluConst)
         self.phase1U16SpecializedPSO = try context.pipeline(
             "moe_phase1_gate_up_act_u16load",
-            constants: Self.realDecodeMoEConstants)
-        self.phase1U16SiluPSO = try context.pipeline(
-            "moe_phase1_gate_up_act_u16load",
-            constants: Self.moeSiluConstants)
-        self.phase1U16SiluSpecializedPSO = try context.pipeline(
-            "moe_phase1_gate_up_act_u16load",
-            constants: Self.realDecodeMoESiluConstants)
-        self.phase1SubsetU16PSO = try context.pipeline("moe_phase1_gate_up_act_subset_u16load")
+            constants: Self.realDecodeMoEConstants + siluConst)
+        self.phase1SubsetU16PSO = try context.pipeline(
+            "moe_phase1_gate_up_act_subset_u16load",
+            constants: siluConst)
         self.phase1SubsetU16SpecializedPSO = try context.pipeline(
             "moe_phase1_gate_up_act_subset_u16load",
+            constants: Self.realDecodeMoEConstants + siluConst)
+        self.phase2ReducePSO = try context.pipeline("moe_phase2_down_reduce")
+        self.phase2ReduceSpecializedPSO = try context.pipeline(
+            "moe_phase2_down_reduce",
             constants: Self.realDecodeMoEConstants)
-        self.phase1SubsetU16SiluPSO = try context.pipeline(
-            "moe_phase1_gate_up_act_subset_u16load",
-            constants: Self.moeSiluConstants)
-        self.phase1SubsetU16SiluSpecializedPSO = try context.pipeline(
-            "moe_phase1_gate_up_act_subset_u16load",
-            constants: Self.realDecodeMoESiluConstants)
         self.phase2ReduceK8PSO = try context.pipeline("moe_phase2_down_reduce_k8")
         self.phase2ReduceK8SpecializedPSO = try context.pipeline(
             "moe_phase2_down_reduce_k8",
             constants: Self.realDecodeMoEConstants)
+        self.phase1U16GenericPSO = try context.pipeline(
+            "moe_phase1_gate_up_act_u16load_generic",
+            constants: siluConst)
+        self.phase1SubsetU16GenericPSO = try context.pipeline(
+            "moe_phase1_gate_up_act_subset_u16load_generic",
+            constants: siluConst)
+        self.phase2ReduceGenericPSO = try context.pipeline(
+            "moe_phase2_down_reduce_generic")
 
         guard let logits = context.device.makeBuffer(
             length: 256 * MemoryLayout<Float>.stride,
@@ -134,6 +164,57 @@ final class MoE {
         self.reusableRoutedArgBuffer = reusable
     }
 
+    /// Shared GEMV front half for both router scoring paths: one 8-bit row of
+    /// `num_experts` x `d` into `routerLogits`. groupSize ==
+    /// Quantization.groupSize keeps the group-64 pipelines with the identical
+    /// dispatch they had before group-128 support existed; any other groupSize
+    /// goes through the generic strided-loop pipeline, which takes groupSize
+    /// as a runtime buffer (index 8).
+    private func encodeRouterGEMVFront(commandBuffer: MTLCommandBuffer,
+                                       weights: MTLBuffer, weightsOffset: Int,
+                                       scales: MTLBuffer, scalesOffset: Int,
+                                       biases: MTLBuffer, biasesOffset: Int,
+                                       hidden: MTLBuffer,
+                                       effectiveScale: MTLBuffer, effectiveScaleOffset: Int,
+                                       outLogits: MTLBuffer,
+                                       numExperts: UInt32,
+                                       d: UInt32,
+                                       groupSize: UInt32,
+                                       useBF16: Bool = false) {
+        var expertCount = numExperts
+        var dimension = d
+        let useGeneric = !useBF16 && groupSize != UInt32(Quantization.groupSize)
+        let useSpecialized = !useBF16 && !useGeneric
+            && numExperts == Self.realDecodeNumExperts
+            && d == Self.realDecodeD
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            if useBF16 {
+                encoder.setComputePipelineState(routerGemvBF16PSO)
+            } else {
+                encoder.setComputePipelineState(
+                    useGeneric
+                        ? routerGemvGenericPSO
+                        : (useSpecialized ? routerGemvSpecializedPSO : routerGemvPSO))
+            }
+            encoder.setBuffer(weights, offset: weightsOffset, index: 0)
+            encoder.setBuffer(scales, offset: scalesOffset, index: 1)
+            encoder.setBuffer(biases, offset: biasesOffset, index: 2)
+            encoder.setBuffer(hidden, offset: 0, index: 3)
+            encoder.setBuffer(effectiveScale, offset: effectiveScaleOffset, index: 4)
+            encoder.setBuffer(outLogits, offset: 0, index: 5)
+            encoder.setBytes(&expertCount, length: MemoryLayout<UInt32>.stride, index: 6)
+            encoder.setBytes(&dimension, length: MemoryLayout<UInt32>.stride, index: 7)
+            if useGeneric {
+                var group = groupSize
+                encoder.setBytes(&group, length: MemoryLayout<UInt32>.stride, index: 8)
+            }
+            encoder.dispatchThreadgroups(
+                MTLSize(width: (Int(numExperts) + 3) / 4, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+            encoder.endEncoding()
+        }
+    }
+
     func encodeRouterGemma4(commandBuffer: MTLCommandBuffer,
                                    weights: MTLBuffer, weightsOffset: Int = 0,
                                    scales: MTLBuffer, scalesOffset: Int = 0,
@@ -145,40 +226,93 @@ final class MoE {
                                    outWeights: MTLBuffer,
                                    numExperts: UInt32,
                                    d: UInt32,
-                                   topK: UInt32) {
-        precondition(d.isMultiple(of: UInt32(Quantization.groupSize)))
+                                   topK: UInt32,
+                                   groupSize: UInt32 = UInt32(Quantization.groupSize),
+                                   useBF16: Bool = false) {
+        precondition(useBF16 || d.isMultiple(of: groupSize), "D must be a multiple of groupSize")
         precondition(numExperts <= 256)
-        precondition(topK == UInt32(Self.maxStreamedExperts))
+        precondition(topK >= 1 && topK <= UInt32(Self.maxStreamedExperts))
 
         var expertCount = numExperts
-        var dimension = d
-        let useSpecialized = numExperts == Self.realDecodeNumExperts
+        let useSpecialized = !useBF16
+            && numExperts == Self.realDecodeNumExperts
             && d == Self.realDecodeD
-        if let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.setComputePipelineState(
-                useSpecialized ? routerGemvSpecializedPSO : routerGemvPSO)
-            encoder.setBuffer(weights, offset: weightsOffset, index: 0)
-            encoder.setBuffer(scales, offset: scalesOffset, index: 1)
-            encoder.setBuffer(biases, offset: biasesOffset, index: 2)
-            encoder.setBuffer(hidden, offset: 0, index: 3)
-            encoder.setBuffer(effectiveScale, offset: effectiveScaleOffset, index: 4)
-            encoder.setBuffer(routerLogits, offset: 0, index: 5)
-            encoder.setBytes(&expertCount, length: MemoryLayout<UInt32>.stride, index: 6)
-            encoder.setBytes(&dimension, length: MemoryLayout<UInt32>.stride, index: 7)
-            encoder.dispatchThreadgroups(
-                MTLSize(width: (Int(numExperts) + 3) / 4, height: 1, depth: 1),
-                threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
-            encoder.endEncoding()
-        }
+        encodeRouterGEMVFront(commandBuffer: commandBuffer,
+                              weights: weights, weightsOffset: weightsOffset,
+                              scales: scales, scalesOffset: scalesOffset,
+                              biases: biases, biasesOffset: biasesOffset,
+                              hidden: hidden,
+                              effectiveScale: effectiveScale,
+                              effectiveScaleOffset: effectiveScaleOffset,
+                              outLogits: routerLogits,
+                              numExperts: numExperts, d: d,
+                              groupSize: groupSize,
+                              useBF16: useBF16)
 
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.setComputePipelineState(
-                useSpecialized ? routerSelectK8SpecializedPSO : routerSelectK8PSO)
+                useSpecialized ? routerSelectSpecializedPSO : routerSelectPSO)
             encoder.setBuffer(routerLogits, offset: 0, index: 0)
             encoder.setBuffer(perExpertScale, offset: perExpertScaleOffset, index: 1)
             encoder.setBuffer(outIndices, offset: 0, index: 2)
             encoder.setBuffer(outWeights, offset: 0, index: 3)
             encoder.setBytes(&expertCount, length: MemoryLayout<UInt32>.stride, index: 4)
+            var selectedExperts = topK
+            encoder.setBytes(&selectedExperts, length: MemoryLayout<UInt32>.stride, index: 5)
+            encoder.dispatchThreadgroups(
+                MTLSize(width: 1, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            encoder.endEncoding()
+        }
+    }
+
+    /// Sigmoid-over-all-experts routing (Laguna's `LagunaTopKRouter`). The
+    /// GEMV front half is identical to `encodeRouterGemma4`; only the scoring
+    /// tail differs — sigmoid over every expert, an additive selection bias
+    /// that shifts *which* experts win (not the gathered weights), and
+    /// sum-division renormalization of the unbiased scores.
+    func encodeRouterSigmoid(commandBuffer: MTLCommandBuffer,
+                             weights: MTLBuffer, weightsOffset: Int = 0,
+                             scales: MTLBuffer, scalesOffset: Int = 0,
+                             biases: MTLBuffer, biasesOffset: Int = 0,
+                             hidden: MTLBuffer,
+                             effectiveScale: MTLBuffer, effectiveScaleOffset: Int = 0,
+                             perExpertScale: MTLBuffer, perExpertScaleOffset: Int = 0,
+                             selectionBias: MTLBuffer, selectionBiasOffset: Int = 0,
+                             outIndices: MTLBuffer,
+                             outWeights: MTLBuffer,
+                             numExperts: UInt32,
+                             d: UInt32,
+                             topK: UInt32,
+                             groupSize: UInt32 = UInt32(Quantization.groupSize),
+                             useBF16: Bool = false) {
+        precondition(useBF16 || d.isMultiple(of: groupSize), "D must be a multiple of groupSize")
+        precondition(numExperts <= 256)
+        precondition(topK >= 1 && topK <= UInt32(Self.maxStreamedExperts))
+
+        var expertCount = numExperts
+        var selectedExperts = topK
+        encodeRouterGEMVFront(commandBuffer: commandBuffer,
+                              weights: weights, weightsOffset: weightsOffset,
+                              scales: scales, scalesOffset: scalesOffset,
+                              biases: biases, biasesOffset: biasesOffset,
+                              hidden: hidden,
+                              effectiveScale: effectiveScale,
+                              effectiveScaleOffset: effectiveScaleOffset,
+                              outLogits: routerLogits,
+                              numExperts: numExperts, d: d,
+                              groupSize: groupSize,
+                              useBF16: useBF16)
+
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.setComputePipelineState(routerSigmoidSelectPSO)
+            encoder.setBuffer(routerLogits, offset: 0, index: 0)
+            encoder.setBuffer(perExpertScale, offset: perExpertScaleOffset, index: 1)
+            encoder.setBuffer(outIndices, offset: 0, index: 2)
+            encoder.setBuffer(outWeights, offset: 0, index: 3)
+            encoder.setBytes(&expertCount, length: MemoryLayout<UInt32>.stride, index: 4)
+            encoder.setBuffer(selectionBias, offset: selectionBiasOffset, index: 5)
+            encoder.setBytes(&selectedExperts, length: MemoryLayout<UInt32>.stride, index: 6)
             encoder.dispatchThreadgroups(
                 MTLSize(width: 1, height: 1, depth: 1),
                 threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
@@ -214,17 +348,27 @@ final class MoE {
         acts: MTLBuffer,
         d: UInt32,
         f: UInt32,
-        topK: UInt32
+        topK: UInt32,
+        groupSize: UInt32 = UInt32(Quantization.groupSize)
     ) {
         validate(routedBlobs: routedBlobs, topK: topK)
+        precondition(d % groupSize == 0, "D must be a multiple of \(groupSize)")
         var dimension = d
         var intermediate = f
         var expertCount = topK
+        var group = groupSize
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        // groupSize == Quantization.groupSize keeps using the group-64
+        // block-vectorized pipelines (identical dispatch to before group-128
+        // existed); any other groupSize goes through the generic
+        // strided-loop pipeline, which takes groupSize as a runtime buffer.
+        let useGeneric = groupSize != UInt32(Quantization.groupSize)
         encoder.setComputePipelineState(
-            useRealDecodeConstants(d: d, f: f)
-                ? (activation == .silu ? phase1U16SiluSpecializedPSO : phase1U16SpecializedPSO)
-                : (activation == .silu ? phase1U16SiluPSO : phase1U16PSO))
+            useGeneric
+                ? phase1U16GenericPSO
+                : (useRealDecodeConstants(d: d, f: f)
+                    ? phase1U16SpecializedPSO
+                    : phase1U16PSO))
         encoder.setBuffer(routedArgBuffer, offset: 0, index: 0)
         for buffer in routedBlobs { encoder.useResource(buffer, usage: .read) }
         var offsets = routedOffsets
@@ -234,6 +378,9 @@ final class MoE {
         encoder.setBytes(&dimension, length: MemoryLayout<UInt32>.stride, index: 4)
         encoder.setBytes(&intermediate, length: MemoryLayout<UInt32>.stride, index: 5)
         encoder.setBytes(&expertCount, length: MemoryLayout<UInt32>.stride, index: 6)
+        if useGeneric {
+            encoder.setBytes(&group, length: MemoryLayout<UInt32>.stride, index: 7)
+        }
         encoder.dispatchThreadgroups(
             MTLSize(width: (Int(topK * f) + 7) / 8, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
@@ -252,20 +399,26 @@ final class MoE {
         activeCount: UInt32,
         d: UInt32,
         f: UInt32,
-        topK: UInt32
+        topK: UInt32,
+        groupSize: UInt32 = UInt32(Quantization.groupSize)
     ) {
         guard activeCount > 0 else { return }
         validate(routedBlobs: routedBlobs, topK: topK)
         precondition(activeSlotIndices.count == Int(activeCount))
+        precondition(d % groupSize == 0, "D must be a multiple of \(groupSize)")
         var dimension = d
         var intermediate = f
         var expertCount = topK
         var active = activeCount
+        var group = groupSize
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        let useGeneric = groupSize != UInt32(Quantization.groupSize)
         encoder.setComputePipelineState(
-            useRealDecodeConstants(d: d, f: f)
-                ? (activation == .silu ? phase1SubsetU16SiluSpecializedPSO : phase1SubsetU16SpecializedPSO)
-                : (activation == .silu ? phase1SubsetU16SiluPSO : phase1SubsetU16PSO))
+            useGeneric
+                ? phase1SubsetU16GenericPSO
+                : (useRealDecodeConstants(d: d, f: f)
+                    ? phase1SubsetU16SpecializedPSO
+                    : phase1SubsetU16PSO))
         encoder.setBuffer(routedArgBuffer, offset: 0, index: 0)
         for slot in activeSlotIndices {
             encoder.useResource(routedBlobs[Int(slot)], usage: .read)
@@ -279,6 +432,9 @@ final class MoE {
         encoder.setBytes(&expertCount, length: MemoryLayout<UInt32>.stride, index: 6)
         encoder.setBuffer(activeSlots, offset: 0, index: 7)
         encoder.setBytes(&active, length: MemoryLayout<UInt32>.stride, index: 8)
+        if useGeneric {
+            encoder.setBytes(&group, length: MemoryLayout<UInt32>.stride, index: 9)
+        }
         encoder.dispatchThreadgroups(
             MTLSize(width: (Int(activeCount * f) + 7) / 8, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
@@ -296,16 +452,22 @@ final class MoE {
         y: MTLBuffer,
         d: UInt32,
         f: UInt32,
-        topK: UInt32
+        topK: UInt32,
+        groupSize: UInt32 = UInt32(Quantization.groupSize)
     ) {
         validate(routedBlobs: routedBlobs, topK: topK)
+        precondition(f % groupSize == 0, "F must be a multiple of \(groupSize)")
         var dimension = d
         var intermediate = f
+        var group = groupSize
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        let useGeneric = groupSize != UInt32(Quantization.groupSize)
         encoder.setComputePipelineState(
-            useRealDecodeConstants(d: d, f: f)
-                ? phase2ReduceK8SpecializedPSO
-                : phase2ReduceK8PSO)
+            useGeneric
+                ? phase2ReduceGenericPSO
+                : (useRealDecodeConstants(d: d, f: f)
+                    ? phase2ReduceSpecializedPSO
+                    : phase2ReducePSO))
         encoder.setBuffer(routedArgBuffer, offset: 0, index: 0)
         for buffer in routedBlobs { encoder.useResource(buffer, usage: .read) }
         var offsets = routedOffsets
@@ -316,14 +478,21 @@ final class MoE {
         encoder.setBuffer(y, offset: 0, index: 5)
         encoder.setBytes(&dimension, length: MemoryLayout<UInt32>.stride, index: 6)
         encoder.setBytes(&intermediate, length: MemoryLayout<UInt32>.stride, index: 7)
+        var selectedExperts = topK
+        encoder.setBytes(&selectedExperts, length: MemoryLayout<UInt32>.stride, index: 8)
+        if useGeneric {
+            encoder.setBytes(&group, length: MemoryLayout<UInt32>.stride, index: 9)
+        }
+        // One simdgroup per routed expert. Slots past topK still launch so the
+        // whole threadgroup reaches the kernel's barrier; they contribute zero.
         encoder.dispatchThreadgroups(
             MTLSize(width: Int(d), height: 1, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+            threadsPerThreadgroup: MTLSize(width: Int(topK) * 32, height: 1, depth: 1))
         encoder.endEncoding()
     }
 
     private func validate(routedBlobs: [MTLBuffer], topK: UInt32) {
-        precondition(topK == UInt32(Self.maxStreamedExperts))
+        precondition(topK >= 1 && topK <= UInt32(Self.maxStreamedExperts))
         precondition(routedBlobs.count == Int(topK))
     }
 

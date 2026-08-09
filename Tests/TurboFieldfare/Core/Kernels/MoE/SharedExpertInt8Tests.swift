@@ -75,6 +75,8 @@ import TurboFieldfareValidationSupport
 
         guard let xBuf = Fp16Buffer.make(ctx.device, values: xFp32),
               let yBuf = Fp16Buffer.make(ctx.device, count: Sizes.D),
+              let sg   = Fp16Buffer.make(ctx.device, count: Sizes.F),
+              let su   = Fp16Buffer.make(ctx.device, count: Sizes.F),
               let sa   = Fp16Buffer.make(ctx.device, count: Sizes.F) else {
             Issue.record("alloc failed"); return
         }
@@ -102,7 +104,7 @@ import TurboFieldfareValidationSupport
         try wrapper.encode(commandBuffer: cb,
                            x: xBuf, gate: gateProj, up: upProj, down: downProj,
                            y: yBuf,
-                           scratchAct: sa)
+                           scratchGate: sg, scratchUp: su, scratchAct: sa)
         cb.commit(); cb.waitUntilCompleted()
 
         let actual = Fp16Buffer.read(yBuf, count: Sizes.D)
@@ -110,4 +112,103 @@ import TurboFieldfareValidationSupport
         #expect(rel < Tolerance.quantInt8 * 4, "shared-expert int8 rel=\(rel)")
     }
 
+    @Test func sharedExpertInt8_group128_matchesReference() throws {
+        var rng = SeedTree(0x602).key("shared-expert-int8-g128")
+        let D = 128
+        let F = 128
+        let groupSize = 128
+
+        let xFp32 = (0..<D).map { _ in rng.uniform(-0.4, 0.4) }
+        let gate = (0..<F).map { _ in (0..<D).map { _ in rng.uniform(-0.4, 0.4) } }
+        let up   = (0..<F).map { _ in (0..<D).map { _ in rng.uniform(-0.4, 0.4) } }
+        let down = (0..<D).map { _ in (0..<F).map { _ in rng.uniform(-0.4, 0.4) } }
+
+        func packMatrixSubByte(_ rows: [[Float]])
+            -> (rows: [QuantizationSubByte.Int8AffineRow],
+                packed: [UInt8], scales: [UInt16], biases: [UInt16]) {
+            let M = rows.count
+            let N = rows[0].count
+            let gpr = N / groupSize
+            var packed = [UInt8](repeating: 0, count: M * N)
+            var scales = [UInt16](repeating: 0, count: M * gpr)
+            var biases = [UInt16](repeating: 0, count: M * gpr)
+            var rowsOut: [QuantizationSubByte.Int8AffineRow] = []
+            rowsOut.reserveCapacity(M)
+            for m in 0..<M {
+                let q = QuantizationSubByte.quantizeInt8Affine(rows[m], groupSize: groupSize)
+                for i in 0..<N { packed[m * N + i] = q.packed[i] }
+                for g in 0..<gpr {
+                    scales[m * gpr + g] = q.scales[g]
+                    biases[m * gpr + g] = q.biases[g]
+                }
+                rowsOut.append(q)
+            }
+            return (rowsOut, packed, scales, biases)
+        }
+
+        let xFp16 = xFp32.map { Float(Float16($0)) }
+        let gatePack = packMatrixSubByte(gate)
+        let upPack   = packMatrixSubByte(up)
+        let downPack = packMatrixSubByte(down)
+
+        func dequantMat(_ packed: (rows: [QuantizationSubByte.Int8AffineRow],
+                                  packed: [UInt8], scales: [UInt16], biases: [UInt16]),
+                        n: Int, x: [Float]) -> [Float] {
+            var out = [Float](repeating: 0, count: packed.rows.count)
+            for r in 0..<packed.rows.count {
+                let dq = QuantizationSubByte.dequantizeInt8Affine(packed.rows[r], n: n)
+                var sum: Float = 0
+                for c in 0..<n { sum += dq[c] * x[c] }
+                out[r] = sum
+            }
+            return out
+        }
+
+        let gateOut = dequantMat(gatePack, n: D, x: xFp16)
+        let upOut   = dequantMat(upPack,   n: D, x: xFp16)
+
+        let act: [Float] = zip(gateOut, upOut).map { g, u in
+            let x3 = g * g * g
+            let inner = 0.7978845608028654 * Double(g + 0.044715 * x3)
+            let gelu = 0.5 * Double(g) * (1.0 + tanh(inner))
+            return Float(Float16(Float(gelu) * u))
+        }
+        let yRef = dequantMat(downPack, n: F, x: act)
+
+        let ctx = try MetalContext()
+        let wrapper = try SharedExpertInt8(context: ctx)
+
+        guard let xBuf  = Fp16Buffer.make(ctx.device, values: xFp32),
+              let yBuf  = Fp16Buffer.make(ctx.device, count: D),
+              let sgBuf = Fp16Buffer.make(ctx.device, count: F),
+              let suBuf = Fp16Buffer.make(ctx.device, count: F),
+              let saBuf = Fp16Buffer.make(ctx.device, count: F) else {
+            Issue.record("alloc failed"); return
+        }
+
+        func packProj(_ p: (rows: [QuantizationSubByte.Int8AffineRow],
+                            packed: [UInt8], scales: [UInt16], biases: [UInt16]),
+                      rows: UInt32, cols: UInt32) -> SharedExpertInt8Proj {
+            let wBuf = ctx.device.makeBuffer(bytes: p.packed, length: p.packed.count, options: .storageModeShared)!
+            let sBuf = ctx.device.makeBuffer(bytes: p.scales, length: p.scales.count * 2, options: .storageModeShared)!
+            let bBuf = ctx.device.makeBuffer(bytes: p.biases, length: p.biases.count * 2, options: .storageModeShared)!
+            return SharedExpertInt8Proj(weights: wBuf, scales: sBuf, biases: bBuf,
+                                        rows: rows, cols: cols, groupSize: groupSize)
+        }
+
+        let gateProj = packProj(gatePack, rows: UInt32(F), cols: UInt32(D))
+        let upProj   = packProj(upPack,   rows: UInt32(F), cols: UInt32(D))
+        let downProj = packProj(downPack, rows: UInt32(D), cols: UInt32(F))
+
+        let cb = ctx.queue.makeCommandBuffer()!
+        try wrapper.encode(commandBuffer: cb,
+                           x: xBuf, gate: gateProj, up: upProj, down: downProj,
+                           y: yBuf,
+                           scratchGate: sgBuf, scratchUp: suBuf, scratchAct: saBuf)
+        cb.commit(); cb.waitUntilCompleted()
+
+        let actual = Fp16Buffer.read(yBuf, count: D)
+        let rel = RelError.compute(actual: actual, reference: yRef)
+        #expect(rel < Tolerance.quantInt8 * 4, "shared-expert int8 group 128 rel=\(rel)")
+    }
 }

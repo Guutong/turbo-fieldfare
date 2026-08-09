@@ -49,3 +49,6 @@ __pycache__/
 *.pyc
 .venv/
 *.env.*
+
+# Ephemeral subagent worktrees
+.claude/worktrees/

@@ -19,6 +19,7 @@ constant uint FC_INT8_M [[function_constant(70)]];
 constant uint FC_INT8_N [[function_constant(71)]];
 constant bool FC_INT8_USE_FC [[function_constant(72)]];
 constant uint FC_SHARED_INT8_ROWS_PER_TG [[function_constant(73)]];
+constant bool FC_USE_SILU [[function_constant(87)]];
 constant constexpr float kInt8GeluSqrt2OverPi = 0.7978845608028654f;
 constant constexpr float kInt8GeluCubicCoeff  = 0.044715f;
 constant bool FC_INT8_ACT_SILU [[function_constant(74)]];
@@ -47,6 +48,10 @@ inline float int8_gelu_pytorch_tanh(float x) {
     return 0.5f * x * (1.0f + tanh(inner));
 }
 
+// x * sigmoid(x). shared_int8_gate_up_act_simd below is selected between this
+// and the GELU-tanh approximation via FC_INT8_ACT_SILU (wired from
+// SharedExpertInt8.swift, index 74) — this kernel's own translation unit, so
+// it does not need to share moe.metal's/prefill.metal's separate `silu`.
 static inline float int8_silu(float x) {
     return x / (1.0f + precise::exp(-x));
 }

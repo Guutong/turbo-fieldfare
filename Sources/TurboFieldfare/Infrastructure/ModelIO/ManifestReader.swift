@@ -29,6 +29,90 @@ public struct ManifestArch: Decodable, Equatable, Sendable {
     public let hiddenActivation: String
     public let fullAttentionLayerMask: [Int]
     public let layerKindMask: [Int]?
+
+    // Optional so manifests written before these fields existed still decode.
+    // Absent means "Gemma's behaviour", matching the `ArchConfig` defaults.
+    public let headsPerLayer: [Int]?
+    public let denseMLPLayerMask: [Int]?
+    public let denseMLPIntermediateSize: Int?
+    public let fullPartialRotaryFactor: Double?
+    public let fullRopeScaling: ManifestRopeScaling?
+    public let attentionGating: String?
+    public let routedScalingFactor: Double?
+    public let normTopology: String?
+    public let routerScoring: String?
+}
+
+public struct ManifestRopeScaling: Decodable, Equatable, Sendable {
+    public let factor: Double
+    public let originalMaxPositionEmbeddings: Int
+    public let betaFast: Double
+    public let betaSlow: Double
+    public let attentionFactor: Double
+
+    var asRopeScaling: RopeScaling {
+        RopeScaling(factor: factor,
+                    originalMaxPositionEmbeddings: originalMaxPositionEmbeddings,
+                    betaFast: betaFast,
+                    betaSlow: betaSlow,
+                    attentionFactor: attentionFactor)
+    }
+}
+
+extension ManifestArch {
+    /// Build the `ArchConfig` this manifest describes. The manifest's arch
+    /// block is authoritative; when no separate expected config is provided
+    /// at load time, this becomes both the actual and the expected, so the
+    /// arch-validation gate passes trivially for a correctly-written manifest.
+    var asArchConfig: ArchConfig {
+        let headsPerLayer = headsPerLayer ?? []
+        return ArchConfig(
+            hiddenSize: hiddenSize,
+            intermediateSize: ffnIntermediate,
+            moeIntermediateSize: moeIntermediateSize,
+            numHeads: numHeads,
+            numKVHeads: numKVHeads,
+            numFullKVHeads: numFullKVHeads,
+            headDim: headDim,
+            fullHeadDim: fullHeadDim,
+            vocabSize: vocabSize,
+            slidingWindow: slidingWindow,
+            finalLogitSoftcap: finalLogitSoftcap,
+            ropeTheta: ropeTheta,
+            fullRopeTheta: fullRopeTheta,
+            partialRotaryFactor: partialRotaryFactor,
+            numLayers: numLayers,
+            numExperts: numExperts,
+            topKExperts: topKExperts,
+            tieWordEmbeddings: tieWordEmbeddings,
+            attentionKEqV: attentionKEqV,
+            fullAttentionLayerMask: fullAttentionLayerMask.map { UInt8($0) },
+            layerKindMask: (layerKindMask?.isEmpty == false)
+                ? layerKindMask!.map { UInt8($0) }
+                : fullAttentionLayerMask.map { UInt8($0) },
+            hiddenActivation: hiddenActivation,
+            headsPerLayer: headsPerLayer,
+            denseMLPLayerMask: denseMLPLayerMask?.map { UInt8($0) } ?? [],
+            denseMLPIntermediateSize: denseMLPIntermediateSize ?? 0,
+            fullPartialRotaryFactor: fullPartialRotaryFactor,
+            fullRopeScaling: fullRopeScaling?.asRopeScaling,
+            attentionGating: AttentionGating(rawValue: attentionGating ?? "none") ?? .none,
+            routedScalingFactor: routedScalingFactor ?? 1.0,
+            normTopology: NormTopology(rawValue: normTopology ?? "sandwich") ?? .sandwich,
+            routerScoring: RouterScoring(rawValue: routerScoring ?? "softmaxTopK") ?? .softmaxTopK
+        )
+    }
+}
+
+/// One layer's exception to a slot's `weightBits`/`groupSize`.
+///
+/// Only the two fields that vary are overridable. `scheme`/`scaleType`/
+/// `biasType` stay on the slot because no known checkpoint varies them per
+/// layer, and a field that can differ is a field every reader has to check.
+public struct ManifestQuantLayerOverride: Decodable, Equatable, Sendable {
+    public let layer: Int
+    public let weightBits: Int
+    public let groupSize: Int
 }
 
 public struct ManifestQuantSlot: Decodable, Equatable, Sendable {
@@ -37,6 +121,40 @@ public struct ManifestQuantSlot: Decodable, Equatable, Sendable {
     public let scaleType: String
     public let biasType: String
     public let groupSize: Int
+    /// Sparse per-layer exceptions, or nil when the slot is uniform.
+    ///
+    /// Some checkpoints quantize per *layer*, not per role. Laguna-S-2.1
+    /// quantizes attention at 5 bits on 20 layers and 8 bits on the other 28,
+    /// which a single `weightBits` cannot describe at all. The shape here
+    /// mirrors the upstream `config.json`: scalar defaults plus a sparse
+    /// override table, so the common uniform case costs nothing.
+    ///
+    /// Optional on purpose — existing manifests have no such key and decode
+    /// with this nil, which is what keeps already-installed `.gturbo` files
+    /// readable byte-for-byte.
+    public let perLayer: [ManifestQuantLayerOverride]?
+
+    /// The `(weightBits, groupSize)` in effect at `layer`, which is the slot's
+    /// own values unless an override names that layer.
+    public func resolved(atLayer layer: Int) -> (weightBits: Int, groupSize: Int) {
+        if let o = perLayer?.first(where: { $0.layer == layer }) {
+            return (o.weightBits, o.groupSize)
+        }
+        return (weightBits, groupSize)
+    }
+
+    /// Every distinct `(weightBits, groupSize)` this slot can present, which is
+    /// what validation has to clear — checking only the scalar would admit a
+    /// manifest whose overrides name a width no kernel implements.
+    public var distinctConfigurations: [(weightBits: Int, groupSize: Int)] {
+        var seen: [(weightBits: Int, groupSize: Int)] = [(weightBits, groupSize)]
+        for o in perLayer ?? [] where !seen.contains(where: {
+            $0.weightBits == o.weightBits && $0.groupSize == o.groupSize
+        }) {
+            seen.append((o.weightBits, o.groupSize))
+        }
+        return seen
+    }
 }
 
 public struct ManifestQuant: Decodable, Equatable, Sendable {
@@ -76,7 +194,7 @@ public enum ManifestReader {
     ]
 
     public static func load(directoryURL: URL,
-                            expecting: ArchConfig,
+                            expecting: ArchConfig?,
                             maxBytes: UInt64 = defaultMaxBytes) throws -> Manifest {
         let directory = try GTurboModelDirectory(rootURL: directoryURL)
         let data: Data
@@ -89,7 +207,7 @@ public enum ManifestReader {
     }
 
     package static func decode(data: Data,
-                               expecting: ArchConfig) throws -> Manifest {
+                               expecting: ArchConfig?) throws -> Manifest {
         let manifest: Manifest
         do {
             let wire = try GTurboManifestCodec.decodeUnchecked(data)
@@ -117,7 +235,12 @@ public enum ManifestReader {
             throw ModelError.indexCorrupt(detail: "manifest.json: \(error)")
         }
 
-        try validate(manifest, against: expecting)
+        // When no external expected config is provided, use the manifest's own
+        // arch — the manifest is authoritative about what model it contains.
+        // A caller that passes a specific config (e.g. for a service that only
+        // runs one model) still gets the full archMismatch gate.
+        let expected = expecting ?? manifest.arch.asArchConfig
+        try validate(manifest, against: expected)
         return manifest
     }
 
@@ -141,21 +264,58 @@ public enum ManifestReader {
 
     private static func validateQuant(_ quant: ManifestQuant,
                                        topology: LayerTopology = .gemma4) throws {
-        let routerBits: Set<Int> = topology == .qwen36 ? [4, 8] : [8]
-        let slots: [(String, ManifestQuantSlot, Set<Int>)] = [
-            ("embedding", quant.embedding, [4]),
-            ("attention", quant.attention, [4]),
-            ("router", quant.router, routerBits),
-            ("sharedExpert", quant.sharedExpert, [4, 8]),
-            ("routedExpert", quant.routedExpert, [4]),
+        // Router bits: both `router_topk_select` (Gemma's softmax router,
+        // 8-bit) and `router_topk_sigmoid` (Qwen3.6/Laguna's sigmoid router)
+        // decode 4- and 8-bit, so this is not topology-gated.
+        let routerBits: Set<Int> = [4, 8]
+        // Group sizes are allowed per slot, not globally, because each slot is
+        // read by a different kernel and they do not all handle 128 yet.
+        // `dequant_int4_gemv_generic` strides by lane and so takes any
+        // multiple of 32; `routedExpert` is decoded by the group-size-generic
+        // MoE kernels (`moe_phase1_gate_up_act_u16load_generic` /
+        // `moe_phase1_gate_up_act_subset_u16load_generic` /
+        // `moe_phase2_down_reduce_generic` in Metal/MoE/moe.metal), which now
+        // handle 128 the same way. `router` and `sharedExpert` still feed the
+        // group-64-only kernels (`router_gemv_gemma4_r4`,
+        // `moe_int4_gemv_row_simd_dev_vec` for the shared MLP path) — widen
+        // those together with their kernels, not before. Admitting 128 for a
+        // slot its kernel cannot decode would turn a clean load-time rejection
+        // into silently wrong numbers at inference.
+        let int4GenericGroups: Set<Int> = [Quantization.groupSize, 128]
+        let slots: [(String, ManifestQuantSlot, Set<Int>, Set<Int>)] = [
+            ("embedding", quant.embedding, [4, 8], int4GenericGroups),
+            ("attention", quant.attention, [4, 5, 8], int4GenericGroups),
+            ("router", quant.router, routerBits, int4GenericGroups),
+            ("sharedExpert", quant.sharedExpert, [4, 8], int4GenericGroups),
+            ("routedExpert", quant.routedExpert, [4], int4GenericGroups),
         ]
-        for (name, slot, allowedBits) in slots {
-            guard allowedBits.contains(slot.weightBits),
-                  slot.scheme.lowercased() == "affine",
+        for (name, slot, allowedBits, allowedGroupSizes) in slots {
+            guard slot.scheme.lowercased() == "affine",
                   slot.scaleType.lowercased() == "bf16",
-                  slot.biasType.lowercased() == "bf16",
-                  slot.groupSize == Quantization.groupSize else {
+                  slot.biasType.lowercased() == "bf16" else {
                 throw ModelError.indexCorrupt(detail: "unsupported quantization for \(name)")
+            }
+            // Every configuration the slot can present has to clear the gate,
+            // not just the scalar default. A per-layer override is a value the
+            // kernels will actually be handed, so admitting the slot on its
+            // default alone would let an override smuggle in a bit width or
+            // group size nothing can decode — exactly the silent-wrong-numbers
+            // trade this guard exists to prevent.
+            for config in slot.distinctConfigurations {
+                guard allowedBits.contains(config.weightBits),
+                      allowedGroupSizes.contains(config.groupSize) else {
+                    throw ModelError.indexCorrupt(
+                        detail: "unsupported quantization for \(name): "
+                            + "\(config.weightBits)-bit group \(config.groupSize)")
+                }
+            }
+            // A duplicate layer entry means two different answers to "what is
+            // the width at layer N", and `resolved(atLayer:)` would silently
+            // take the first. Reject rather than pick.
+            let layers = (slot.perLayer ?? []).map(\.layer)
+            guard Set(layers).count == layers.count else {
+                throw ModelError.indexCorrupt(
+                    detail: "duplicate per-layer quant override for \(name)")
             }
         }
     }
@@ -199,6 +359,49 @@ public enum ManifestReader {
                       actualKind.description,
                       e.layerKindMask.description)
         }
+
+        // Fields absent from older manifests default to the `ArchConfig`
+        // defaults, so a Gemma manifest written before they existed still
+        // validates against `ArchConfig.gemma4_26B_A4B` unchanged.
+        try check("headsPerLayer",
+                  (a.headsPerLayer ?? []).description,
+                  e.headsPerLayer.description)
+        try check("denseMLPLayerMask",
+                  (a.denseMLPLayerMask ?? []).map { UInt8($0) }.description,
+                  e.denseMLPLayerMask.description)
+        try check("denseMLPIntermediateSize",
+                  a.denseMLPIntermediateSize ?? 0,
+                  e.denseMLPIntermediateSize)
+        try check("fullPartialRotaryFactor",
+                  (a.fullPartialRotaryFactor.map { "\($0)" } ?? "nil"),
+                  (e.fullPartialRotaryFactor.map { "\($0)" } ?? "nil"))
+        try check("fullRopeScaling",
+                  (a.fullRopeScaling?.asRopeScaling).map { "\($0)" } ?? "nil",
+                  e.fullRopeScaling.map { "\($0)" } ?? "nil")
+        try check("attentionGating",
+                  a.attentionGating ?? AttentionGating.none.rawValue,
+                  e.attentionGating.rawValue)
+        try check("routedScalingFactor",
+                  a.routedScalingFactor ?? 1.0,
+                  e.routedScalingFactor)
+        try check("normTopology",
+                  a.normTopology ?? NormTopology.sandwich.rawValue,
+                  e.normTopology.rawValue)
+        try check("routerScoring",
+                  a.routerScoring ?? RouterScoring.softmaxTopK.rawValue,
+                  e.routerScoring.rawValue)
+
+        // Per-layer arrays, when present, must cover every layer.
+        if let heads = a.headsPerLayer, !heads.isEmpty, heads.count != a.numLayers {
+            throw ModelError.archMismatch(field: "headsPerLayer.count",
+                                          expected: "\(a.numLayers)",
+                                          actual: "\(heads.count)")
+        }
+        if let dense = a.denseMLPLayerMask, !dense.isEmpty, dense.count != a.numLayers {
+            throw ModelError.archMismatch(field: "denseMLPLayerMask.count",
+                                          expected: "\(a.numLayers)",
+                                          actual: "\(dense.count)")
+        }
     }
 }
 
@@ -230,8 +433,25 @@ private extension ManifestArch {
                   tieWordEmbeddings: wire.tieWordEmbeddings,
                   attentionKEqV: wire.attentionKEqV,
                   hiddenActivation: wire.hiddenActivation,
-                   fullAttentionLayerMask: wire.fullAttentionLayerMask,
-                   layerKindMask: wire.layerKindMask)
+                  fullAttentionLayerMask: wire.fullAttentionLayerMask,
+                  layerKindMask: wire.layerKindMask,
+                  // The wire format (GTurboManifestArchV1) does not yet carry
+                  // most of these fields; absent means "Gemma's behaviour",
+                  // matching the `ArchConfig` defaults. A future format bump
+                  // can wire the rest through once a checkpoint needs them.
+                  // `normTopology`/`routerScoring` ARE carried (added to
+                  // unblock Qwen3.6, which needs preNorm/sigmoidTopK to
+                  // decode correctly rather than silently defaulting to
+                  // Gemma's sandwich/softmaxTopK).
+                  headsPerLayer: nil,
+                  denseMLPLayerMask: nil,
+                  denseMLPIntermediateSize: nil,
+                  fullPartialRotaryFactor: nil,
+                  fullRopeScaling: nil,
+                  attentionGating: nil,
+                  routedScalingFactor: nil,
+                  normTopology: wire.normTopology,
+                  routerScoring: wire.routerScoring)
     }
 }
 
@@ -239,7 +459,11 @@ private extension ManifestQuantSlot {
     init(wire: GTurboManifestQuantSlotV1) {
         self.init(weightBits: wire.weightBits, scheme: wire.scheme,
                   scaleType: wire.scaleType, biasType: wire.biasType,
-                  groupSize: wire.groupSize)
+                  groupSize: wire.groupSize,
+                  perLayer: wire.perLayer?.map {
+                      ManifestQuantLayerOverride(layer: $0.layer, weightBits: $0.weightBits,
+                                                  groupSize: $0.groupSize)
+                  })
     }
 }
 

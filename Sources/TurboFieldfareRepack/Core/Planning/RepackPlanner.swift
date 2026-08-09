@@ -105,12 +105,23 @@ enum RepackPlanner {
         case unknown
     }
 
-    static func classify(_ name: String, numLayers: Int) -> Bucket {
+    /// - Parameter denseMLPLayerMask: `arch.denseMLPLayerMask`, 1 where a layer
+    ///   uses a plain dense MLP instead of routed experts (Laguna layer 0).
+    ///   Dense layers never actually produce a name that matches
+    ///   `routedExpertMarkers` — their MLP tensors keep the plain
+    ///   `mlp.{gate,up,down}_proj` names, not the routed module's — but this
+    ///   is the belt to that naming suspenders: if a future family's dense
+    ///   and routed MLPs ever share a marker, the mask still keeps a dense
+    ///   layer's tensors out of the routed-expert bucket instead of silently
+    ///   feeding a dense weight into per-expert packing.
+    static func classify(_ name: String, numLayers: Int,
+                         denseMLPLayerMask: [UInt8] = []) -> Bucket {
         if name.hasPrefix("language_model.") {
             // Routed expert?
             if let role = routedExpertRole(in: name),
                let layer = layerIndex(in: name),
-               layer >= 0 && layer < numLayers {
+               layer >= 0 && layer < numLayers,
+               !isDenseMLPLayer(layer, mask: denseMLPLayerMask) {
                 return .routedExpert(role: role, layer: layer)
             }
             return .lmResident
@@ -121,14 +132,119 @@ enum RepackPlanner {
         return .unknown
     }
 
+    /// Substrings that mark a tensor as belonging to the routed-expert
+    /// module, one per known model family. Both families pack routed experts
+    /// as a single U32 tensor with a leading `numExperts` dim, but name the
+    /// containing module differently. Adding a third family means adding one
+    /// entry here, not another ad hoc `.contains(...)` somewhere else.
+    private static let routedExpertMarkers = [
+        ".experts.switch_glu.",   // Gemma 4 26B-A4B
+        ".mlp.switch_mlp.",       // Qwen3.6-35B-A3B and poolside/Laguna-S-2.1
+    ]
+
     private static func routedExpertRole(in name: String) -> String? {
-        // Gemma: "...experts.switch_glu.{gate,up,down}_proj...".
-        // Qwen3.6: "...switch_mlp.{gate,up,down}_proj..." (no "experts." segment).
-        guard name.contains(".experts.switch_glu.") || name.contains(".switch_mlp.") else { return nil }
+        guard routedExpertMarkers.contains(where: { name.contains($0) }) else { return nil }
         if name.contains(".gate_proj.") { return "gate" }
         if name.contains(".up_proj.")   { return "up" }
         if name.contains(".down_proj.") { return "down" }
         return nil
+    }
+
+    /// Suffixes that identify the tensor whose quantization stands in for a
+    /// whole manifest slot's bit width. Same table shape as
+    /// `routedExpertMarkers`, and same reason: a third family adds an entry.
+    ///
+    /// Order matters. Laguna's shared expert is `.mlp.shared_expert.gate_proj.`
+    /// while its *dense* layer-0 MLP is the plain `.mlp.gate_proj.` — the bare
+    /// suffix matches both, so the qualified one has to be tested first or
+    /// layer 0's bit width silently lands in the sharedExpert slot.
+    static let sharedExpertProbeSuffixes = [
+        ".mlp.shared_expert.gate_proj.weight",  // poolside/Laguna-S-2.1
+        ".mlp.gate_proj.weight",                // Gemma 4 26B-A4B
+    ]
+
+    /// Gemma spells the router `.router.proj.`; Laguna spells it
+    /// `.mlp.gate.proj.` — note the dot, which distinguishes it from the
+    /// `gate_proj` of an MLP.
+    static let routerProbeSuffixes = [
+        ".router.proj.weight",    // Gemma 4 26B-A4B
+        ".mlp.gate.proj.weight",  // poolside/Laguna-S-2.1
+    ]
+
+    /// Collapse every tensor that feeds one manifest quant slot down to the
+    /// single bit width the manifest can record, refusing when the checkpoint
+    /// does not actually have one.
+    ///
+    /// The manifest's `quant` object holds one `weightBits` per slot, which
+    /// silently assumes a slot is quantized uniformly. Gemma satisfies that;
+    /// Laguna does not. Its `config.json` quantizes attention projections at
+    /// **5 bits on 20 layers and 8 bits on the other 28**, so there is no
+    /// single correct answer for the `attention` slot. The previous probe was
+    /// a plain assignment inside a loop over entries, i.e. last-write-wins:
+    /// it would record whichever layer the plan happened to visit last and
+    /// produce a manifest that loads cleanly and misdescribes 20 layers.
+    ///
+    /// Ordering cannot fix this the way it fixed the shared-expert probe —
+    /// there both candidates named different tensors and one was right. Here
+    /// both observations are right about their own layers and the *format* is
+    /// what cannot express them. So this refuses, and per-layer quantization
+    /// stays an explicit format change rather than something a repack run
+    /// papers over. Returns nil when nothing matched, letting the caller keep
+    /// its default.
+    static func uniformBits(slot: String,
+                            observations: [(name: String, bits: Int)]) throws -> Int? {
+        guard !observations.isEmpty else { return nil }
+        let distinct = Set(observations.map(\.bits))
+        guard distinct.count == 1 else {
+            // Name one tensor per distinct width, so the error points at the
+            // disagreement itself rather than at an arbitrary prefix of a list
+            // that may be dominated by the majority width.
+            let sample = distinct.sorted().compactMap { b in
+                observations.first { $0.bits == b }?.name
+            }
+            throw RepackError.quantSlotNotUniform(slot: slot,
+                                                  bits: Array(distinct),
+                                                  sample: sample)
+        }
+        return distinct.first
+    }
+
+    /// Extracts per-layer `(weightBits, groupSize)` for the attention slot
+    /// from a list of `(tensorName, bits)` observations. Returns `nil` when
+    /// all layers share the same bits and group size (the uniform case), or
+    /// when observations are empty. When widths vary — as they do on
+    /// Laguna-S-2.1 — the caller writes a `perLayer` override table instead
+    /// of a single `weightBits`.
+    ///
+    /// Group size is inferred from the quant spec on each entry rather than
+    /// assumed from `plan.baseGroupSize`, so a future checkpoint that varies
+    /// group size per layer works without a separate code path.
+    static func perLayerAttentionBits(
+        observations: [(name: String, bits: Int)]
+    ) -> [(layer: Int, weightBits: Int, groupSize: Int)]? {
+        guard !observations.isEmpty else { return nil }
+        // Map: layer -> (weightBits, groupSize). The observation entries carry
+        // `bits` but not `groupSize` — we assume the plan's base group size
+        // since the manifest format records one group per slot.  If a future
+        // checkpoint varies group size per layer, the observations struct
+        // will need a `groupSize` field.
+        var byLayer: [Int: Int] = [:]
+        for (name, bits) in observations {
+            guard let idx = layerIndex(in: name) else { continue }
+            byLayer[idx] = bits
+        }
+        guard !byLayer.isEmpty else { return nil }
+        let distinct = Set(byLayer.values)
+        guard distinct.count > 1 else { return nil }  // uniform — caller uses scalar
+        // All attention layers in known checkpoints share the same group size.
+        // The caller supplies the group size from the plan.
+        return byLayer.map { (layer: $0.key, weightBits: $0.value, groupSize: 64) }
+            .sorted { $0.layer < $1.layer }
+    }
+
+    private static func isDenseMLPLayer(_ layer: Int, mask: [UInt8]) -> Bool {
+        guard layer >= 0, layer < mask.count else { return false }
+        return mask[layer] == 1
     }
 
     private static func layerIndex(in name: String) -> Int? {
@@ -237,7 +353,8 @@ enum RepackPlanner {
                 excludedMultimodalNames.append(name)
             }
             if name.hasSuffix(".scales") || name.hasSuffix(".biases") { continue }
-            let b = classify(name, numLayers: arch.numLayers)
+            let b = classify(name, numLayers: arch.numLayers,
+                             denseMLPLayerMask: arch.denseMLPLayerMask)
             switch b {
             case .lmResident:                   lmResidentBases.append(name)
             case .routedExpert(let role, let layer):
@@ -270,6 +387,10 @@ enum RepackPlanner {
             // Synthetic snapshots may legitimately have no routed experts.
             guard let gName = bundle["gate"], let uName = bundle["up"], let dName = bundle["down"] else {
                 if bundle.isEmpty {
+                    // Dense-MLP layer (Laguna layer 0) — no routed experts.
+                    // The layout keeps an entry with 0 experts so indexing by
+                    // layer number stays trivial; an empty placeholder file is
+                    // written alongside the real expert files.
                     layerPlans.append(LayerFilePlan(layerIndex: layer,
                                                     path: (layersDir as NSString).appendingPathComponent("layer_\(String(format: "%02d", layer)).bin"),
                                                     expertsPerLayer: 0,
@@ -505,13 +626,25 @@ enum RepackPlanner {
         return out
     }
 
+    /// Both known families spell the embedding and final-norm tensors the
+    /// same way, but this is the one place that fact lives — the manifest
+    /// writer (`RemoteStreamingRepacker.writeManifest`) reads the same name
+    /// rather than repeating the literal.
+    static let embedTokensWeightName = "language_model.model.embed_tokens.weight"
+    private static let finalNormWeightName = "language_model.model.norm.weight"
+    /// Untied output projection. Gemma ties embeddings (`tie_word_embeddings:
+    /// true`) and has no such tensor; Laguna does not tie and carries one.
+    private static let lmHeadWeightName = "language_model.lm_head.weight"
+
     /// Stable order for the resident LM tensor list. Embedding first, then
-    /// per-layer groups in layer index order, then the final norm.
+    /// per-layer groups in layer index order, then the final norm and (when
+    /// present) the untied lm_head.
     private static func lmResidentOrdering() -> (String, String) -> Bool {
         // Compute a sort key per name; we order by (group rank, layer, slot rank, name).
         func key(_ n: String) -> (Int, Int, Int, String) {
-            if n == "language_model.model.embed_tokens.weight" { return (0, 0, 0, n) }
-            if n == "language_model.model.norm.weight"          { return (3, 0, 0, n) }
+            if n == embedTokensWeightName { return (0, 0, 0, n) }
+            if n == finalNormWeightName    { return (3, 0, 0, n) }
+            if n == lmHeadWeightName       { return (4, 0, 0, n) }
             if let li = layerIndex(in: n) {
                 let slot = slotRank(in: n)
                 return (1, li, slot, n)
@@ -550,6 +683,15 @@ enum RepackPlanner {
         if n.hasSuffix(".post_feedforward_layernorm_1.weight") { return 17 }
         if n.hasSuffix(".post_feedforward_layernorm_2.weight") { return 18 }
         if n.hasSuffix(".layer_scalar")           { return 19 }
+        // Laguna-only slots, appended rather than interleaved above so the
+        // numbers Gemma actually hits (0-19) never move and its resident
+        // file byte layout stays identical to before this family existed.
+        if n.contains(".self_attn.g_proj.weight")            { return 20 }  // per-head gate
+        if n.contains(".mlp.gate.proj.weight")                { return 21 }  // router proj
+        if n.contains(".mlp.gate.e_score_correction_bias")    { return 22 }  // router bias
+        if n.contains(".mlp.shared_expert.gate_proj.weight")  { return 23 }
+        if n.contains(".mlp.shared_expert.up_proj.weight")    { return 24 }
+        if n.contains(".mlp.shared_expert.down_proj.weight")  { return 25 }
         return 100
     }
 }

@@ -17,10 +17,11 @@ public enum ActivationType: String, Sendable, Equatable, CustomStringConvertible
     }
 }
 
-/// Layer topology — controls the norm/residual structure of the decode and
-/// prefill loops. Gemma 4 uses a "sandwich" (norms before AND after each
-/// sublayer); Qwen3.6 uses pure pre-norm (one norm before each sublayer,
-/// raw residuals).
+/// Layer topology — controls which decode/prefill code path a layer runs
+/// through (Qwen3.6's DeltaNet/full-attention interleave vs. everything
+/// else). Distinct from `NormTopology`, which controls the norm/residual
+/// *arrangement* within a layer; the two vary independently in principle,
+/// though today only Qwen3.6 combines `.qwen36` with `.preNorm`.
 public enum LayerTopology: String, Sendable, Equatable, CustomStringConvertible {
     case gemma4
     case qwen36
@@ -28,8 +29,122 @@ public enum LayerTopology: String, Sendable, Equatable, CustomStringConvertible 
     public var description: String { rawValue }
 }
 
-/// Compile-time architecture baseline. `manifest.json -> arch` must match this
-/// field-by-field at load time; mismatches throw `ModelError.archMismatch`.
+/// YaRN RoPE scaling parameters. Applied per layer type: Laguna-S-2.1 scales
+/// its full-attention layers with YaRN while leaving sliding layers on plain
+/// RoPE, so this is carried separately from `ropeTheta`/`fullRopeTheta`.
+/// `nil` on an `ArchConfig` means no scaling, which is Gemma's behaviour.
+public struct RopeScaling: Sendable, Equatable {
+    public let factor: Double
+    public let originalMaxPositionEmbeddings: Int
+    public let betaFast: Double
+    public let betaSlow: Double
+    /// Multiplier on attention scores that accompanies the frequency scaling.
+    public let attentionFactor: Double
+
+    public init(factor: Double,
+                originalMaxPositionEmbeddings: Int,
+                betaFast: Double,
+                betaSlow: Double,
+                attentionFactor: Double) {
+        self.factor = factor
+        self.originalMaxPositionEmbeddings = originalMaxPositionEmbeddings
+        self.betaFast = betaFast
+        self.betaSlow = betaSlow
+        self.attentionFactor = attentionFactor
+    }
+}
+
+/// Metal-compatible packed struct matching `RopeScalingParams` in Metal shaders.
+public struct MetalRopeScalingParams: Sendable, Equatable {
+    public var enabled: UInt32
+    public var factor: Float
+    public var originalMaxPositionEmbeddings: Float
+    public var betaFast: Float
+    public var betaSlow: Float
+
+    public init(scaling: RopeScaling?) {
+        if let s = scaling, s.factor > 1.0 {
+            self.enabled = 1
+            self.factor = Float(s.factor)
+            self.originalMaxPositionEmbeddings = Float(s.originalMaxPositionEmbeddings)
+            self.betaFast = Float(s.betaFast)
+            self.betaSlow = Float(s.betaSlow)
+        } else {
+            self.enabled = 0
+            self.factor = 1.0
+            self.originalMaxPositionEmbeddings = 1.0
+            self.betaFast = 1.0
+            self.betaSlow = 1.0
+        }
+    }
+}
+
+
+/// Gating applied to the attention output before `o_proj`.
+///
+/// Laguna computes `gate = softplus(g_proj(hidden))` and multiplies the
+/// attention output by it. `perHead` emits one gate per query head (broadcast
+/// across `headDim`); `perElement` emits one per `(head, headDim)` channel.
+/// Gemma has no such projection, hence `.none`.
+public enum AttentionGating: String, Sendable, Equatable {
+    case none
+    case perHead
+    case perElement
+}
+
+/// How the decoder layer arranges its RMSNorms around the two residual adds.
+///
+/// `sandwich` is Gemma 4: the attention output is normed before joining the
+/// residual, each FFN branch is normed on the way in *and* on the way out, and
+/// their sum is normed once more before the second residual add.
+///
+/// ```
+/// h1 = rmsnorm(dense(pre_ffn(x)),   post_ffn_1)
+/// h2 = rmsnorm(routed(pre_ffn_2(x)), post_ffn_2)
+/// h  = x + layer_scalar * rmsnorm(h1 + h2, post_ffn)
+/// ```
+///
+/// `preNorm` is the Qwen/Laguna arrangement: one norm before attention, one
+/// before the MLP, and nothing on the way out.
+///
+/// ```
+/// h = x + attn(input_layernorm(x))
+/// h = h + mlp(post_attention_layernorm(h))
+/// ```
+///
+/// The two are not interchangeable by substituting weights — a unit-weight
+/// RMSNorm still divides by the RMS, so `preNorm` needs the norm *skipped*, not
+/// neutralized. Note also that `post_attention_layernorm` names different
+/// things in the two conventions: under `sandwich` it norms the attention
+/// output, under `preNorm` it norms the residual on the way into the MLP.
+public enum NormTopology: String, Sendable, Equatable {
+    case sandwich
+    case preNorm
+}
+
+/// How the router turns hidden state into top-K experts and their weights.
+///
+/// `softmaxTopK` is Gemma 4: scale the router input by `router.scale` (fused
+/// with `1/sqrt(D)`), take top-K of the logits, softmax over those K, then
+/// multiply by `router.per_expert_scale`.
+///
+/// `sigmoidTopK` is Laguna (`LagunaTopKRouter`): sigmoid over *all* experts,
+/// add `e_score_correction_bias` for selection only, gather the **unbiased**
+/// scores at the selected indices, and renormalize them to sum to 1. The bias
+/// deliberately does not survive into the weights — it is load-balancing
+/// pressure on *which* experts win, not on how much they contribute.
+public enum RouterScoring: String, Sendable, Equatable {
+    case softmaxTopK
+    case sigmoidTopK
+}
+
+/// Architecture description for the loaded model. `manifest.json -> arch` must
+/// match the config the runtime was handed, field-by-field, at load time;
+/// mismatches throw `ModelError.archMismatch`.
+///
+/// Fields below the `tieWordEmbeddings` line describe variation that Gemma 4
+/// does not exercise. They all default to Gemma's behaviour so existing
+/// manifests and call sites are unaffected.
 public struct ArchConfig: Sendable, Equatable {
     public let hiddenSize: Int
     public let intermediateSize: Int          // shared expert FFN (== ffnIntermediate in manifest)
@@ -54,6 +169,33 @@ public struct ArchConfig: Sendable, Equatable {
     public let layerKindMask: [UInt8]
     public let hiddenActivation: String
 
+    /// Per-layer query-head count. Empty means every layer uses `numHeads`.
+    /// Laguna varies it by layer type (48 on full-attention, 72 on sliding).
+    public let headsPerLayer: [Int]
+    /// 1 = the layer uses a plain dense MLP instead of routed experts, of
+    /// width `denseMLPIntermediateSize`. Empty means every layer is sparse.
+    /// Laguna marks layer 0 dense (`mlp_only_layers: [0]`).
+    public let denseMLPLayerMask: [UInt8]
+    /// FFN width of the dense layers selected by `denseMLPLayerMask`. This is
+    /// the model's `intermediate_size`, which is distinct from the shared
+    /// expert width carried in `intermediateSize` (Laguna: 12288 vs 1024).
+    /// 0 when the model has no dense layers.
+    public let denseMLPIntermediateSize: Int
+    /// Partial rotary factor for full-attention layers when it differs from
+    /// `partialRotaryFactor` (which then covers sliding layers only).
+    /// `nil` means both layer types share `partialRotaryFactor`.
+    public let fullPartialRotaryFactor: Double?
+    /// YaRN scaling for full-attention layers. `nil` = plain RoPE.
+    public let fullRopeScaling: RopeScaling?
+    public let attentionGating: AttentionGating
+    /// Multiplier on the routed-expert contribution (Laguna: 2.5).
+    /// 1.0 is a no-op and matches Gemma.
+    public let routedScalingFactor: Double
+    /// Arrangement of the layer's RMSNorms. See `NormTopology`.
+    public let normTopology: NormTopology
+    /// Router scoring function. See `RouterScoring`.
+    public let routerScoring: RouterScoring
+
     public init(
         hiddenSize: Int,
         intermediateSize: Int,
@@ -76,7 +218,16 @@ public struct ArchConfig: Sendable, Equatable {
         attentionKEqV: Bool,
         fullAttentionLayerMask: [UInt8],
         layerKindMask: [UInt8],
-        hiddenActivation: String
+        hiddenActivation: String,
+        headsPerLayer: [Int] = [],
+        denseMLPLayerMask: [UInt8] = [],
+        denseMLPIntermediateSize: Int = 0,
+        fullPartialRotaryFactor: Double? = nil,
+        fullRopeScaling: RopeScaling? = nil,
+        attentionGating: AttentionGating = .none,
+        routedScalingFactor: Double = 1.0,
+        normTopology: NormTopology = .sandwich,
+        routerScoring: RouterScoring = .softmaxTopK
     ) {
         self.hiddenSize = hiddenSize
         self.intermediateSize = intermediateSize
@@ -100,6 +251,76 @@ public struct ArchConfig: Sendable, Equatable {
         self.fullAttentionLayerMask = fullAttentionLayerMask
         self.layerKindMask = layerKindMask
         self.hiddenActivation = hiddenActivation
+        self.headsPerLayer = headsPerLayer
+        self.denseMLPLayerMask = denseMLPLayerMask
+        self.denseMLPIntermediateSize = denseMLPIntermediateSize
+        self.fullPartialRotaryFactor = fullPartialRotaryFactor
+        self.fullRopeScaling = fullRopeScaling
+        self.attentionGating = attentionGating
+        self.routedScalingFactor = routedScalingFactor
+        self.normTopology = normTopology
+        self.routerScoring = routerScoring
+    }
+
+    // MARK: - Per-layer accessors
+    //
+    // Every caller should go through these rather than reading `numHeads` or
+    // `partialRotaryFactor` directly, so a model that varies them per layer
+    // behaves correctly without touching each call site again.
+
+    /// Query-head count for `layer`. Falls back to the uniform `numHeads`.
+    public func numHeads(atLayer layer: Int) -> Int {
+        guard layer >= 0, layer < headsPerLayer.count else { return numHeads }
+        return headsPerLayer[layer]
+    }
+
+    /// Largest query-head count across all layers. Scratch buffers that must
+    /// cover every layer size from one allocation should use this.
+    public var maxNumHeads: Int {
+        max(numHeads, headsPerLayer.max() ?? 0)
+    }
+
+    /// True when `layer` uses full attention rather than a sliding window.
+    public func isFullAttention(layer: Int) -> Bool {
+        guard layer >= 0, layer < fullAttentionLayerMask.count else { return false }
+        return fullAttentionLayerMask[layer] == 1
+    }
+
+    /// True when `layer` uses a dense MLP instead of routed experts.
+    public func isDenseMLP(layer: Int) -> Bool {
+        guard layer >= 0, layer < denseMLPLayerMask.count else { return false }
+        return denseMLPLayerMask[layer] == 1
+    }
+
+    /// True when `layer` uses a dense MLP instead of routed experts.
+    public func isDenseMLP(atLayer layer: Int) -> Bool {
+        return isDenseMLP(layer: layer)
+    }
+
+    /// Number of layers that actually carry routed experts. Expert streaming
+    /// and packing should size themselves from this, not `numLayers`.
+    public var numSparseLayers: Int {
+        guard !denseMLPLayerMask.isEmpty else { return numLayers }
+        return (0..<numLayers).reduce(0) { $0 + (isDenseMLP(layer: $1) ? 0 : 1) }
+    }
+
+    /// Partial rotary factor for `layer`, honouring a distinct full-attention
+    /// value when the model specifies one.
+    public func partialRotaryFactor(atLayer layer: Int) -> Double {
+        guard isFullAttention(layer: layer), let full = fullPartialRotaryFactor else {
+            return partialRotaryFactor
+        }
+        return full
+    }
+
+    /// RoPE base for `layer`.
+    public func ropeTheta(atLayer layer: Int) -> Double {
+        isFullAttention(layer: layer) ? fullRopeTheta : ropeTheta
+    }
+
+    /// YaRN scaling for `layer`, if the model scales that layer type.
+    public func ropeScaling(atLayer layer: Int) -> RopeScaling? {
+        isFullAttention(layer: layer) ? fullRopeScaling : nil
     }
 
     /// Parsed activation type, defaults to `.geluPytorchTanh` for unknown
@@ -171,7 +392,9 @@ public struct ArchConfig: Sendable, Equatable {
         attentionKEqV: false,
         fullAttentionLayerMask: Self.qwen36FullAttentionMask(),
         layerKindMask: Self.qwen36LayerKindMask(),
-        hiddenActivation: "silu"
+        hiddenActivation: "silu",
+        normTopology: .preNorm,
+        routerScoring: .sigmoidTopK
     )
 
     private static func gemma4LayerMask() -> [UInt8] {
@@ -203,6 +426,72 @@ public struct ArchConfig: Sendable, Equatable {
         }
         return .gemma4_26B_A4B
     }
+
+    /// poolside/Laguna-S-2.1, transcribed from its `config.json`.
+    ///
+    /// This is the generalization target: it exercises every field Gemma does
+    /// not — per-layer head counts, a dense layer 0, YaRN on full-attention
+    /// layers only, per-head attention gating, top-10 routing, and a routed
+    /// scaling factor. Not yet loadable; see the phase 0 work items.
+    ///
+    /// `intermediateSize` is the shared-expert width (1024); the dense layer-0
+    /// FFN width (12288) is carried in `denseMLPIntermediateSize`.
+    public static let lagunaS2_1 = ArchConfig(
+        hiddenSize: 3072,
+        intermediateSize: 1024,
+        moeIntermediateSize: 1024,
+        numHeads: 48,
+        numKVHeads: 8,
+        numFullKVHeads: 8,
+        headDim: 128,
+        fullHeadDim: 128,
+        vocabSize: 100352,
+        slidingWindow: 512,
+        finalLogitSoftcap: 0.0,
+        ropeTheta: 10_000.0,
+        fullRopeTheta: 500_000.0,
+        partialRotaryFactor: 1.0,
+        numLayers: 48,
+        numExperts: 256,
+        topKExperts: 10,
+        tieWordEmbeddings: false,
+        attentionKEqV: false,
+        fullAttentionLayerMask: Self.lagunaLayerMask(),
+        layerKindMask: Self.lagunaLayerMask(),
+        hiddenActivation: "silu",
+        headsPerLayer: Self.lagunaHeadsPerLayer(),
+        denseMLPLayerMask: Self.lagunaDenseMask(),
+        denseMLPIntermediateSize: 12288,
+        fullPartialRotaryFactor: 0.5,
+        fullRopeScaling: RopeScaling(factor: 128.0,
+                                     originalMaxPositionEmbeddings: 8192,
+                                     betaFast: 32.0,
+                                     betaSlow: 1.0,
+                                     attentionFactor: 1.4852030263919618),
+        attentionGating: .perHead,
+        routedScalingFactor: 2.5,
+        normTopology: .preNorm,
+        routerScoring: .sigmoidTopK
+    )
+
+    /// Full attention every 4th layer starting at 0.
+    private static func lagunaLayerMask() -> [UInt8] {
+        var mask = [UInt8](repeating: 0, count: 48)
+        for i in stride(from: 0, to: 48, by: 4) { mask[i] = 1 }
+        return mask
+    }
+
+    /// 48 query heads on full-attention layers, 72 on sliding layers.
+    private static func lagunaHeadsPerLayer() -> [Int] {
+        lagunaLayerMask().map { $0 == 1 ? 48 : 72 }
+    }
+
+    /// Only layer 0 is dense (`mlp_only_layers: [0]`).
+    private static func lagunaDenseMask() -> [UInt8] {
+        var mask = [UInt8](repeating: 0, count: 48)
+        mask[0] = 1
+        return mask
+    }
 }
 
 /// Failure modes for the validation gates in `Model.load`.
@@ -221,6 +510,13 @@ enum ModelError: Error, CustomStringConvertible, Equatable {
     case indexCorrupt(detail: String)
     case posixFailed(call: String, errno: Int32)
     case trustedReceiptInvalid(detail: String)
+    /// The manifest describes an architecture feature the kernels do not
+    /// implement yet. Distinct from `archMismatch`, which is a disagreement
+    /// between two descriptions of the same model — this one means the model
+    /// is described correctly and the runtime cannot execute it. It exists so
+    /// such a model refuses to load instead of running the nearest available
+    /// kernel and returning plausible wrong numbers.
+    case unsupportedArchFeature(feature: String, value: String, detail: String)
 
     public var description: String {
         switch self {
@@ -250,6 +546,8 @@ enum ModelError: Error, CustomStringConvertible, Equatable {
             return "resident index is corrupt: \(d)"
         case .posixFailed(let c, let e):
             return "\(c) failed with errno \(e)"
+        case .unsupportedArchFeature(let feature, let value, let detail):
+            return "arch.\(feature) = \(value) is not implemented: \(detail)"
         case .trustedReceiptInvalid(let detail):
             return "trusted install receipt invalid: \(detail)"
         }

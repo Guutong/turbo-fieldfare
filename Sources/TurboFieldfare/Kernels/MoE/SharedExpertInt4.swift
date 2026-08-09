@@ -21,12 +21,10 @@ public enum SharedExpertError: Error, CustomStringConvertible {
 public final class SharedExpertInt4 {
     private let int4: DequantInt4GEMV
     private let geluMulPSO: MTLComputePipelineState
-    private let siluMulPSO: MTLComputePipelineState
 
     public init(context: MetalContext) throws {
         self.int4 = try DequantInt4GEMV(context: context)
         self.geluMulPSO = try context.pipeline("gelu_mul_fp16")
-        self.siluMulPSO = try context.pipeline("silu_mul_fp16")
     }
 
     public func encode(commandBuffer cb: MTLCommandBuffer,
@@ -76,14 +74,15 @@ public final class SharedExpertInt4 {
                     m: up.rows, n: up.cols)
 
         guard let encoder = cb.makeComputeCommandEncoder() else { return }
-        let actPSO = activation == .silu ? siluMulPSO : geluMulPSO
-        encoder.setComputePipelineState(actPSO)
+        encoder.setComputePipelineState(geluMulPSO)
         encoder.setBuffer(scratchGate, offset: scratchGateOffset, index: 0)
         encoder.setBuffer(scratchUp, offset: scratchUpOffset, index: 1)
         encoder.setBuffer(scratchAct, offset: scratchActOffset, index: 2)
         var count = UInt32(intermediate)
         encoder.setBytes(&count, length: MemoryLayout<UInt32>.size, index: 3)
-        let width = min(actPSO.maxTotalThreadsPerThreadgroup, 256)
+        var siluFlag = activation == .silu
+        encoder.setBytes(&siluFlag, length: MemoryLayout<Bool>.size, index: 4)
+        let width = min(geluMulPSO.maxTotalThreadsPerThreadgroup, 256)
         encoder.dispatchThreads(MTLSize(width: intermediate, height: 1, depth: 1),
                                 threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1))
         encoder.endEncoding()
@@ -139,6 +138,8 @@ public final class SharedExpertRuntime {
         case .int8(let runtime):
             try runtime.encode(commandBuffer: commandBuffer, x: x, xOffset: xOffset,
                                gate: gate, up: up, down: down, y: y, yOffset: yOffset,
+                               scratchGate: scratchGate, scratchGateOffset: scratchGateOffset,
+                               scratchUp: scratchUp, scratchUpOffset: scratchUpOffset,
                                scratchAct: scratchAct, scratchActOffset: scratchActOffset,
                                activation: activation)
         }

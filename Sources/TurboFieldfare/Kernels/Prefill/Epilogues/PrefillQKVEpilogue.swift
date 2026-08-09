@@ -30,7 +30,8 @@ final class PrefillQKVEpilogue {
                        kvTokenStrideElements: UInt32,
                        theta: Float,
                        rotatedPairs: UInt32,
-                       eps: Float) {
+                       eps: Float,
+                       scaling: RopeScaling? = nil) {
         precondition(queryCount > 0, "queryCount must be positive")
         precondition(headDim > 0 && headDim % 2 == 0, "headDim must be positive and even")
         precondition(numQHeads > 0, "numQHeads must be positive")
@@ -86,7 +87,8 @@ final class PrefillQKVEpilogue {
                                    headDim: headDim,
                                    numHeads: numQHeads,
                                    tokenStrideElements: qTokenStrideElements,
-                                   theta: theta)
+                                   theta: theta,
+                                   scaling: scaling)
             rope.encodeDefaultNeox(commandBuffer: commandBuffer,
                                    data: k,
                                    dataOffset: kOffset,
@@ -95,7 +97,8 @@ final class PrefillQKVEpilogue {
                                    headDim: headDim,
                                    numHeads: numKVHeads,
                                    tokenStrideElements: kvTokenStrideElements,
-                                   theta: theta)
+                                   theta: theta,
+                                   scaling: scaling)
         } else {
             rope.encodeProportionalNeox(commandBuffer: commandBuffer,
                                         data: q,
@@ -106,7 +109,8 @@ final class PrefillQKVEpilogue {
                                         numHeads: numQHeads,
                                         rotatedPairs: rotatedPairs,
                                         tokenStrideElements: qTokenStrideElements,
-                                        theta: theta)
+                                        theta: theta,
+                                        scaling: scaling)
             rope.encodeProportionalNeox(commandBuffer: commandBuffer,
                                         data: k,
                                         dataOffset: kOffset,
@@ -116,7 +120,9 @@ final class PrefillQKVEpilogue {
                                         numHeads: numKVHeads,
                                         rotatedPairs: rotatedPairs,
                                         tokenStrideElements: kvTokenStrideElements,
-                                        theta: theta)
+                                        theta: theta,
+                                        scaling: scaling)
         }
     }
 }
+

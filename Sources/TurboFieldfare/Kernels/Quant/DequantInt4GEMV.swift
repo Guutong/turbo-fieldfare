@@ -20,6 +20,12 @@ final class DequantInt4GEMV {
 
     private let pipeline: MTLComputePipelineState
     private let specializedPipelines: [Shape: MTLComputePipelineState]
+    // Group sizes other than 64 (currently 128, for oQ4e's routed experts)
+    // go through the generic strided-loop kernel instead of the hand-
+    // vectorized group-64 fast path above, so `pipeline`/`specializedPipelines`
+    // and their dispatch stay byte-for-byte what they were before group-128
+    // support existed.
+    private let genericPipeline: MTLComputePipelineState
 
     init(context: MetalContext) throws {
         self.pipeline = try context.pipeline(
@@ -39,6 +45,11 @@ final class DequantInt4GEMV {
                 maxTotalThreadsPerThreadgroup: 512)
         }
         self.specializedPipelines = specializedPipelines
+
+        self.genericPipeline = try context.pipeline(
+            "dequant_int4_gemv_generic",
+            constants: [],
+            maxTotalThreadsPerThreadgroup: 512)
     }
 
     func encode(commandBuffer: MTLCommandBuffer,
@@ -53,16 +64,22 @@ final class DequantInt4GEMV {
                 y: MTLBuffer,
                 yOffset: Int = 0,
                 m: UInt32,
-                n: UInt32) {
-        precondition(n % UInt32(Quantization.groupSize) == 0,
-                     "N must be a multiple of \(Quantization.groupSize)")
+                n: UInt32,
+                groupSize: Int = Quantization.groupSize) {
+        precondition(n % UInt32(groupSize) == 0,
+                     "N must be a multiple of \(groupSize)")
         // The kernel reads packed weights through a `ushort*`; the repacker
         // guarantees two-byte sub-tensor alignment but not four-byte alignment.
         precondition(weightsOffset % 2 == 0,
                      "dequant_int4_gemv_simd needs a 2-aligned weightsOffset, got \(weightsOffset)")
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        // groupSize 64 keeps using the hand-vectorized fast path (identical
+        // pipeline objects and dispatch to before group-128 existed); any
+        // other groupSize (currently only 128) goes through the generic
+        // strided-loop kernel, which takes groupSize as a runtime buffer.
+        let useGeneric = groupSize != Quantization.groupSize
         encoder.setComputePipelineState(
-            specializedPipelines[Shape(m: m, n: n)] ?? pipeline)
+            useGeneric ? genericPipeline : (specializedPipelines[Shape(m: m, n: n)] ?? pipeline))
         encoder.setBuffer(weights, offset: weightsOffset, index: 0)
         encoder.setBuffer(scales, offset: scalesOffset, index: 1)
         encoder.setBuffer(biases, offset: biasesOffset, index: 2)
@@ -72,6 +89,10 @@ final class DequantInt4GEMV {
         var nValue = n
         encoder.setBytes(&mValue, length: MemoryLayout<UInt32>.size, index: 5)
         encoder.setBytes(&nValue, length: MemoryLayout<UInt32>.size, index: 6)
+        if useGeneric {
+            var gValue = UInt32(groupSize)
+            encoder.setBytes(&gValue, length: MemoryLayout<UInt32>.size, index: 7)
+        }
 
         let threadgroupSize = MTLSize(
             width: 32 * Self.rowsPerThreadgroup,

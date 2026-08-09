@@ -21,6 +21,7 @@ final class DequantInt8GEMV {
 
     private let pso: MTLComputePipelineState
     private let specializedPSOs: [Shape: MTLComputePipelineState]
+    private let genericPipeline: MTLComputePipelineState
     private static let realDecodeShapes: [Shape] = [
         Shape(m: 128, n: 2816),     // router.proj
         Shape(m: 2112, n: 2816),    // shared expert gate/up
@@ -42,6 +43,10 @@ final class DequantInt8GEMV {
                 ])
         }
         self.specializedPSOs = variants
+        self.genericPipeline = try context.pipeline(
+            "dequant_int8_gemv_generic",
+            constants: [],
+            maxTotalThreadsPerThreadgroup: 512)
     }
 
     /// Encodes the GEMV onto `commandBuffer`. Offsets allow passing the same
@@ -56,12 +61,15 @@ final class DequantInt8GEMV {
                        y:       MTLBuffer,
                        yOffset: Int = 0,
                        m: UInt32,
-                       n: UInt32) {
-        precondition(n % UInt32(Quantization.groupSize) == 0,
-                     "N must be a multiple of \(Quantization.groupSize)")
+                       n: UInt32,
+                       groupSize: Int = Quantization.groupSize) {
+        precondition(n % UInt32(groupSize) == 0,
+                     "N must be a multiple of \(groupSize)")
         precondition(xOffset >= 0 && yOffset >= 0, "buffer offsets must be non-negative")
         guard let enc = commandBuffer.makeComputeCommandEncoder() else { return }
-        enc.setComputePipelineState(specializedPSOs[Shape(m: m, n: n)] ?? pso)
+        let useGeneric = groupSize != Quantization.groupSize
+        enc.setComputePipelineState(
+            useGeneric ? genericPipeline : (specializedPSOs[Shape(m: m, n: n)] ?? pso))
         enc.setBuffer(weights, offset: weightsOffset, index: 0)
         enc.setBuffer(scales,  offset: scalesOffset,  index: 1)
         enc.setBuffer(biases,  offset: biasesOffset,  index: 2)
@@ -71,6 +79,10 @@ final class DequantInt8GEMV {
         var nVar = n
         enc.setBytes(&mVar, length: MemoryLayout<UInt32>.size, index: 5)
         enc.setBytes(&nVar, length: MemoryLayout<UInt32>.size, index: 6)
+        if useGeneric {
+            var gVar = UInt32(groupSize)
+            enc.setBytes(&gVar, length: MemoryLayout<UInt32>.size, index: 7)
+        }
 
         let rowsPerTG = 8
         let tgSize  = MTLSize(width: 32 * rowsPerTG, height: 1, depth: 1)

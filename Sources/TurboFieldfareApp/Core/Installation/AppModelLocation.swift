@@ -1,4 +1,5 @@
 import Foundation
+import TurboFieldfareRepackCore
 
 public enum AppModelLocation {
     /// Directory name each catalog entry installs into, keyed by
@@ -9,7 +10,28 @@ public enum AppModelLocation {
         "\(catalogID).gturbo"
     }
 
+    /// Install directory name for a `ModelSource` (the generalized,
+    /// multi-architecture catalog). Gemma keeps `gemma4.gturbo` because
+    /// installs predate the catalog and renaming would orphan a ~14 GB
+    /// directory on every existing machine; everything else is named from
+    /// its source id via `directoryName(forCatalogID:)`.
+    static func directoryName(for source: ModelSource) -> String {
+        source.id == SupportedModelSource.gemma4_26B_A4B.id
+            ? "gemma4.gturbo"
+            : directoryName(forCatalogID: source.id)
+    }
+
     public static func defaultURL(forCatalogID catalogID: String = "gemma4") -> URL {
+        defaultURL(directoryName: directoryName(forCatalogID: catalogID))
+    }
+
+    /// Default install location for a `ModelSource` from the generalized
+    /// catalog (Laguna and future architectures alongside Gemma/Qwen3.6).
+    static func defaultURL(for source: ModelSource) -> URL {
+        defaultURL(directoryName: directoryName(for: source))
+    }
+
+    private static func defaultURL(directoryName: String) -> URL {
         let fileManager = FileManager.default
         let applicationSupport = (try? fileManager.url(
             for: .applicationSupportDirectory,
@@ -23,16 +45,31 @@ public enum AppModelLocation {
                                      isDirectory: true),
             applicationSupportURL: applicationSupport,
             fileExists: fileManager.fileExists(atPath:),
-            catalogID: catalogID)
+            directoryName: directoryName)
     }
 
+    /// Test-facing entry point, keyed by catalog id (matches
+    /// `AppModelLocationTests`, which predates the `ModelSource` catalog).
     static func resolve(explicitURL: URL?,
                         executableURL: URL?,
                         currentDirectoryURL: URL,
                         applicationSupportURL: URL,
                         fileExists: (String) -> Bool,
                         catalogID: String = "gemma4") -> URL {
-        let directoryName = directoryName(forCatalogID: catalogID)
+        resolve(explicitURL: explicitURL,
+               executableURL: executableURL,
+               currentDirectoryURL: currentDirectoryURL,
+               applicationSupportURL: applicationSupportURL,
+               fileExists: fileExists,
+               directoryName: directoryName(forCatalogID: catalogID))
+    }
+
+    private static func resolve(explicitURL: URL?,
+                        executableURL: URL?,
+                        currentDirectoryURL: URL,
+                        applicationSupportURL: URL,
+                        fileExists: (String) -> Bool,
+                        directoryName: String) -> URL {
         if let explicitURL {
             return absoluteURL(explicitURL, relativeTo: currentDirectoryURL)
         }

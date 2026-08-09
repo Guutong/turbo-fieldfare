@@ -18,8 +18,10 @@ public struct VerifyInstallResult: Sendable {
 }
 
 public enum VerifiedInstallTool {
-    public static let metadataMaxBytes: UInt64 = 16 * 1024 * 1024
     public static let manifestMaxBytes: UInt64 = 4 * 1024 * 1024
+    /// layout.json scales with layers x experts x sub-tensors and outgrows the
+    /// general metadata cap on a large MoE, so it gets its own bound. Kept in
+    /// step with `PackedExpertsLayoutReader.defaultMaxBytes`.
     public static let layoutMaxBytes: UInt64 = GTurboFormatV1.layoutMaxBytes
 
     public static func run(options: VerifyInstallOptions) throws -> VerifyInstallResult {
@@ -152,8 +154,16 @@ public enum VerifiedInstallTool {
             throw RepackError.configurationInvalid(
                 detail: "packed expert layout does not match manifest: \(error)")
         }
-        let expectedLayerSize = UInt64(layout.expertsPerLayer) * layout.expertStride
+        let sparseLayerSize = UInt64(layout.expertsPerLayer) * layout.expertStride
         for layer in layout.layers {
+            // NOTE: `GTurboV1StructuralValidator.validate` (invoked during
+            // decode) currently requires `layer.experts.count ==
+            // layout.expertsPerLayer` for every layer, so a Laguna-style
+            // dense-MLP layer 0 with an empty experts list is not yet
+            // representable in this format. That gap lives in
+            // `GTurboPackedExpertsLayoutV1`/`GTurboV1StructuralValidator`
+            // (TurboFieldfareFormat), not here.
+            let expectedLayerSize = layer.experts.isEmpty ? 0 : sparseLayerSize
             let relativePath = "packed_experts/\(layer.file)"
             guard let manifestEntry = manifest.files[relativePath] else {
                 throw RepackError.configurationInvalid(detail: "manifest missing \(relativePath)")

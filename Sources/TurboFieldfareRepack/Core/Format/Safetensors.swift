@@ -79,4 +79,31 @@ enum Safetensors {
         }
         return Header(tensors: tensors)
     }
+
+    /// Parse the safetensors header from a local file at `path` using `pread`
+    /// instead of HTTP range requests. Reads the 8-byte header-size prefix
+    /// then the header payload, then delegates to `parseHeaderBytes` for the
+    /// JSON parsing.
+    static func parseLocalHeader(path: String,
+                                 fileSize: UInt64,
+                                 filename: String) throws -> Header {
+        let fd = try Posix.openReadNoFollow(path)
+        defer { Darwin.close(fd) }
+        var prefix: UInt64 = 0
+        try Posix.preadAll(fd: fd, path: path,
+                           buf: &prefix, count: 8, offset: 0)
+        let headerSize = UInt64(littleEndian: prefix)
+        guard headerSize <= maxHeaderBytes, headerSize <= fileSize - 8 else {
+            throw RepackError.safetensorsHeaderTooLarge(path: filename, size: headerSize)
+        }
+        var headerData = Data(count: Int(headerSize))
+        try headerData.withUnsafeMutableBytes { raw in
+            try Posix.preadAll(fd: fd, path: path,
+                               buf: raw.baseAddress!, count: Int(headerSize),
+                               offset: 8)
+        }
+        return try parseHeaderBytes(path: filename,
+                                     fileSize: fileSize,
+                                     headerBytes: headerData)
+    }
 }

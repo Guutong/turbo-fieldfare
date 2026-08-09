@@ -18,10 +18,15 @@ public final class RepackModelInstallerClient: AppModelInstallerClient, Sendable
         let value = Mutex<ActiveInstall?>(nil)
     }
 
-    public let descriptor: AppModelInstallDescriptor
+    nonisolated(unsafe) public private(set) var descriptor: AppModelInstallDescriptor
     private let runInstall: InstallRunner
     private let runDiscard: DiscardRunner
     private let taskState = InstallTaskState()
+
+    public func rebind(descriptor: AppModelInstallDescriptor) {
+        cancel()
+        self.descriptor = descriptor
+    }
 
     public init(descriptor: AppModelInstallDescriptor = .default) {
         self.descriptor = descriptor

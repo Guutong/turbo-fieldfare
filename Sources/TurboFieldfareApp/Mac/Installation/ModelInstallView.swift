@@ -10,9 +10,11 @@ struct ModelInstallView: View {
         ScrollView {
             VStack(spacing: 22) {
                 identity
+                modelPicker
                 storageCard
                 progressArea
                 actions
+                upcomingModels
             }
             .frame(maxWidth: 560)
             .padding(.horizontal, 28)
@@ -46,6 +48,32 @@ struct ModelInstallView: View {
                 .font(.body)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
+        }
+    }
+
+    @ViewBuilder
+    private var modelPicker: some View {
+        let sources = model.availableModelSources
+        if sources.count > 1 {
+            VStack(spacing: 6) {
+                Text("Choose Model")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Picker("Model", selection: Binding(
+                    get: { model.selectedModelSourceID },
+                    set: { newID in
+                        model.switchModelSource(toID: newID)
+                    }
+                )) {
+                    ForEach(sources) { source in
+                        Text(source.displayName).tag(source.id)
+                    }
+                }
+                .pickerStyle(.menu)
+                .labelsHidden()
+                .frame(maxWidth: 280)
+            }
+            .padding(.vertical, 4)
         }
     }
 
@@ -184,6 +212,30 @@ struct ModelInstallView: View {
             }
         }
         .controlSize(.large)
+    }
+
+    /// Catalog entries the runtime can't decode yet. Shown so the gap is
+    /// legible instead of the model just being absent, but never as a
+    /// selectable install option — that's what `isInstallable` guards.
+    @ViewBuilder
+    private var upcomingModels: some View {
+        let blocked = AppModelInstallDescriptor.unavailableCatalogEntries
+        if !blocked.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(blocked) { entry in
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("\(entry.displayName) — not yet supported")
+                            .font(.caption.weight(.medium))
+                        if let reason = entry.reason {
+                            Text(reason)
+                                .font(.caption)
+                        }
+                    }
+                }
+            }
+            .foregroundStyle(.tertiary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
     }
 
     private var readinessLabel: String {

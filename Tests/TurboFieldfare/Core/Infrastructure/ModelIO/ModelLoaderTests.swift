@@ -16,8 +16,8 @@ import Metal
     /// 8 experts, hidden 64, vocab 1024. Resident contains the embedding
     /// (alias: lmHead), final norm, and the tiny layer-resident tensors needed
     /// to construct `RealForwardRunner` in unit tests.
-    static func writeToySynthetic(includeQuant: Bool = true) throws -> URL {
-        let toy = ArchConfig.gemma4Toy()
+    static func writeToySynthetic(config toy: ArchConfig = .gemma4Toy(),
+                                  includeQuant: Bool = true) throws -> URL {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("gturbo-toy-\(UUID().uuidString)")
         let exp = dir.appendingPathComponent("packed_experts")
@@ -356,6 +356,7 @@ import Metal
         let expertStride: UInt64 = 16384
         let layerBytes = Int(expertStride) * toy.numExperts
         for L in 0..<toy.numLayers {
+            if toy.isDenseMLP(atLayer: L) { continue }
             var payload = Data(count: layerBytes)
             for E in 0..<toy.numExperts {
                 let blob = toyExpertBlob(expert: E).bytes
@@ -377,6 +378,7 @@ import Metal
         }
         var layerShaByName: [String: String] = [:]
         for L in 0..<toy.numLayers {
+            if toy.isDenseMLP(atLayer: L) { continue }
             let basename = String(format: "layer_%02d.bin", L)
             let url = exp.appendingPathComponent(basename)
             layerShaByName["packed_experts/\(basename)"] = try Sha256Verifier.hashFile(at: url)
@@ -385,6 +387,14 @@ import Metal
         // 3. layout.json
         var layersArr: [[String: Any]] = []
         for L in 0..<toy.numLayers {
+            if toy.isDenseMLP(atLayer: L) {
+                layersArr.append([
+                    "layer": L,
+                    "file": "",
+                    "experts": [] as [[String: Any]],
+                ])
+                continue
+            }
             var experts: [[String: Any]] = []
             for E in 0..<toy.numExperts {
                 let blob = toyExpertBlob(expert: E)

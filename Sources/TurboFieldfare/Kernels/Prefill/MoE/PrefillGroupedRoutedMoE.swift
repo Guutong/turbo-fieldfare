@@ -363,10 +363,14 @@ final class PrefillGroupedRoutedMoE {
     init(context: MetalContext, activation: ActivationType = .geluPytorchTanh) throws {
         self.activation = activation
         self.batchedPhase1PSO = try context.pipeline("prefill_grouped_routed_moe_batched_phase1")
+        // FC_USE_SILU (function_constant 87) is the single shared activation
+        // flag (see moe.metal/prefill.metal); baked into a dedicated PSO here
+        // since the streamed batched dispatch picks between the two at
+        // encode time based on self.activation, matching MoE.swift's router.
         self.batchedPhase1SiluPSO = try context.pipeline(
             "prefill_grouped_routed_moe_batched_phase1",
             constants: [
-                MetalFunctionConstant(index: 77, value: .bool(true)),
+                MetalFunctionConstant(index: 87, value: .bool(true)),
             ])
         self.batchedDownPSO = try context.pipeline("prefill_grouped_routed_moe_batched_down")
         guard let streamedFn = context.library.makeFunction(name: "prefill_grouped_routed_moe_batched_phase1") else {

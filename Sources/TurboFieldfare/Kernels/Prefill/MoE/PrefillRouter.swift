@@ -29,9 +29,13 @@ public struct PrefillTokenExpertPair: Equatable, Sendable {
 
 final class PrefillRouter {
     private let pso: MTLComputePipelineState
+    private let sigmoidPSO: MTLComputePipelineState
+    private let sigmoidBF16PSO: MTLComputePipelineState
 
     init(context: MetalContext) throws {
         self.pso = try context.pipeline("prefill_router_gemma4_block")
+        self.sigmoidPSO = try context.pipeline("prefill_router_sigmoid_block")
+        self.sigmoidBF16PSO = try context.pipeline("prefill_router_sigmoid_bf16_block")
     }
 
     func encodeGemma4Block(commandBuffer: MTLCommandBuffer,
@@ -55,12 +59,12 @@ final class PrefillRouter {
                                   numExperts: UInt32,
                                   d: UInt32,
                                   topK: UInt32,
-                                  hiddenStrideElements: UInt32) {
+                                  hiddenStrideElements: UInt32,
+                                  groupSize: UInt32 = UInt32(Quantization.groupSize)) {
         precondition(queryCount > 0, "queryCount must be positive")
         precondition(numExperts <= 256, "numExperts > 256 is not supported")
         precondition(topK > 0 && topK <= 64, "topK must be in 1...64")
-        precondition(d % UInt32(Quantization.groupSize) == 0,
-                     "D must be a multiple of \(Quantization.groupSize)")
+        precondition(d % groupSize == 0, "D must be a multiple of \(groupSize)")
         precondition(hiddenStrideElements >= d, "hidden stride is too small")
         guard let enc = commandBuffer.makeComputeCommandEncoder() else { return }
         enc.setComputePipelineState(pso)
@@ -77,12 +81,79 @@ final class PrefillRouter {
         var dVar = d
         var topKVar = topK
         var strideVar = hiddenStrideElements
+        var groupVar = groupSize
         enc.setBytes(&tVar, length: MemoryLayout<UInt32>.size, index: 8)
         enc.setBytes(&neVar, length: MemoryLayout<UInt32>.size, index: 9)
         enc.setBytes(&dVar, length: MemoryLayout<UInt32>.size, index: 10)
         enc.setBytes(&topKVar, length: MemoryLayout<UInt32>.size, index: 11)
         enc.setBytes(&strideVar, length: MemoryLayout<UInt32>.size, index: 12)
+        enc.setBytes(&groupVar, length: MemoryLayout<UInt32>.size, index: 13)
         let tgWidth = min(max(Int(numExperts), 32), pso.maxTotalThreadsPerThreadgroup)
+        enc.dispatchThreadgroups(MTLSize(width: Int(queryCount), height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: tgWidth, height: 1, depth: 1))
+        enc.endEncoding()
+    }
+
+    /// Sigmoid-over-all-experts routing, the prefill twin of
+    /// `encodeGemma4Block` (Laguna's `LagunaTopKRouter`). The GEMV front half
+    /// is identical; only the scoring tail differs. `selectionBias` is the
+    /// per-expert additive bias that shifts *which* experts win, never the
+    /// gathered weights.
+    func encodeSigmoidBlock(commandBuffer: MTLCommandBuffer,
+                            weights: MTLBuffer,
+                            weightsOffset: Int = 0,
+                            scales: MTLBuffer,
+                            scalesOffset: Int = 0,
+                            biases: MTLBuffer,
+                            biasesOffset: Int = 0,
+                            hidden: MTLBuffer,
+                            hiddenOffset: Int = 0,
+                            effectiveScale: MTLBuffer,
+                            effectiveScaleOffset: Int = 0,
+                            perExpertScale: MTLBuffer,
+                            perExpertScaleOffset: Int = 0,
+                            selectionBias: MTLBuffer,
+                            selectionBiasOffset: Int = 0,
+                            outIndices: MTLBuffer,
+                            outIndicesOffset: Int = 0,
+                            outWeights: MTLBuffer,
+                            outWeightsOffset: Int = 0,
+                            queryCount: UInt32,
+                            numExperts: UInt32,
+                            d: UInt32,
+                            topK: UInt32,
+                            hiddenStrideElements: UInt32,
+                            groupSize: UInt32 = UInt32(Quantization.groupSize),
+                            useBF16: Bool = false) {
+        precondition(queryCount > 0, "queryCount must be positive")
+        precondition(numExperts <= 256, "numExperts > 256 is not supported")
+        precondition(topK > 0 && topK <= 64, "topK must be in 1...64")
+        precondition(useBF16 || d % groupSize == 0, "D must be a multiple of \(groupSize)")
+        precondition(hiddenStrideElements >= d, "hidden stride is too small")
+        guard let enc = commandBuffer.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(useBF16 ? sigmoidBF16PSO : sigmoidPSO)
+        enc.setBuffer(weights, offset: weightsOffset, index: 0)
+        enc.setBuffer(scales, offset: scalesOffset, index: 1)
+        enc.setBuffer(biases, offset: biasesOffset, index: 2)
+        enc.setBuffer(hidden, offset: hiddenOffset, index: 3)
+        enc.setBuffer(effectiveScale, offset: effectiveScaleOffset, index: 4)
+        enc.setBuffer(perExpertScale, offset: perExpertScaleOffset, index: 5)
+        enc.setBuffer(outIndices, offset: outIndicesOffset, index: 6)
+        enc.setBuffer(outWeights, offset: outWeightsOffset, index: 7)
+        var tVar = queryCount
+        var neVar = numExperts
+        var dVar = d
+        var topKVar = topK
+        var strideVar = hiddenStrideElements
+        var groupVar = groupSize
+        enc.setBytes(&tVar, length: MemoryLayout<UInt32>.size, index: 8)
+        enc.setBytes(&neVar, length: MemoryLayout<UInt32>.size, index: 9)
+        enc.setBytes(&dVar, length: MemoryLayout<UInt32>.size, index: 10)
+        enc.setBytes(&topKVar, length: MemoryLayout<UInt32>.size, index: 11)
+        enc.setBytes(&strideVar, length: MemoryLayout<UInt32>.size, index: 12)
+        enc.setBytes(&groupVar, length: MemoryLayout<UInt32>.size, index: 13)
+        enc.setBuffer(selectionBias, offset: selectionBiasOffset, index: 14)
+        let tgWidth = min(max(Int(numExperts), 32), sigmoidPSO.maxTotalThreadsPerThreadgroup)
         enc.dispatchThreadgroups(MTLSize(width: Int(queryCount), height: 1, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: tgWidth, height: 1, depth: 1))
         enc.endEncoding()

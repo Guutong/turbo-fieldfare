@@ -33,6 +33,13 @@ package struct GTurboManifestArchV1: Codable, Equatable, Sendable {
     package let hiddenActivation: String
     package let fullAttentionLayerMask: [Int]
     package let layerKindMask: [Int]?
+    /// Decoder-block topology: "sandwich" (Gemma) or "preNorm" (Qwen3.6/Laguna).
+    /// Optional so pre-existing manifests (written before this field existed)
+    /// decode as nil, which the reader maps to the Gemma-compatible default.
+    package let normTopology: String?
+    /// Router formula: "softmaxTopK" (Gemma) or "sigmoidTopK" (Qwen3.6/Laguna).
+    /// Optional for the same backward-compatibility reason as `normTopology`.
+    package let routerScoring: String?
 
     package init(hiddenSize: Int, ffnIntermediate: Int, moeIntermediateSize: Int,
                  numHeads: Int, numKVHeads: Int, numFullKVHeads: Int,
@@ -42,7 +49,9 @@ package struct GTurboManifestArchV1: Codable, Equatable, Sendable {
                  partialRotaryFactor: Double, numLayers: Int, numExperts: Int,
                  topKExperts: Int, tieWordEmbeddings: Bool, attentionKEqV: Bool,
                  hiddenActivation: String, fullAttentionLayerMask: [Int],
-                 layerKindMask: [Int]? = nil) {
+                 layerKindMask: [Int]? = nil,
+                 normTopology: String? = nil,
+                 routerScoring: String? = nil) {
         self.hiddenSize = hiddenSize
         self.ffnIntermediate = ffnIntermediate
         self.moeIntermediateSize = moeIntermediateSize
@@ -65,6 +74,20 @@ package struct GTurboManifestArchV1: Codable, Equatable, Sendable {
         self.hiddenActivation = hiddenActivation
         self.fullAttentionLayerMask = fullAttentionLayerMask
         self.layerKindMask = layerKindMask
+        self.normTopology = normTopology
+        self.routerScoring = routerScoring
+    }
+}
+
+package struct GTurboManifestQuantLayerOverrideV1: Codable, Equatable, Sendable {
+    package let layer: Int
+    package let weightBits: Int
+    package let groupSize: Int
+
+    package init(layer: Int, weightBits: Int, groupSize: Int) {
+        self.layer = layer
+        self.weightBits = weightBits
+        self.groupSize = groupSize
     }
 }
 
@@ -74,14 +97,19 @@ package struct GTurboManifestQuantSlotV1: Codable, Equatable, Sendable {
     package let scaleType: String
     package let biasType: String
     package let groupSize: Int
+    /// Sparse per-layer exceptions to the slot's scalar defaults. Optional so
+    /// manifests written before per-layer quant existed still decode as nil.
+    package let perLayer: [GTurboManifestQuantLayerOverrideV1]?
 
     package init(weightBits: Int, scheme: String, scaleType: String,
-                 biasType: String, groupSize: Int) {
+                 biasType: String, groupSize: Int,
+                 perLayer: [GTurboManifestQuantLayerOverrideV1]? = nil) {
         self.weightBits = weightBits
         self.scheme = scheme
         self.scaleType = scaleType
         self.biasType = biasType
         self.groupSize = groupSize
+        self.perLayer = perLayer
     }
 }
 

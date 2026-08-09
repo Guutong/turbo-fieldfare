@@ -107,7 +107,16 @@ import Testing
             attentionKEqV: config.attentionKEqV,
             fullAttentionLayerMask: config.fullAttentionLayerMask,
             layerKindMask: config.layerKindMask,
-            hiddenActivation: config.hiddenActivation)
+            hiddenActivation: config.hiddenActivation,
+            headsPerLayer: [],
+            denseMLPLayerMask: [],
+            denseMLPIntermediateSize: 0,
+            fullPartialRotaryFactor: nil,
+            fullRopeScaling: nil,
+            attentionGating: "none",
+            routedScalingFactor: 1.0,
+            normTopology: "sandwich",
+            routerScoring: "softmaxTopK")
         let source = SourceTensor(
             name: "fixture.weight", shardPath: "/dev/null", dtype: .u32,
             shape: [1, 1], absoluteOffset: 0, sizeBytes: 16)
@@ -119,7 +128,7 @@ import Testing
             fileOffset: indexSize, sizeBytes: 16,
             scaleOffset: indexSize + 16, scaleSize: 8,
             biasOffset: indexSize + 24, biasSize: 8,
-            quantSpec: QuantSpec(bits: 4),
+            quantSpec: QuantSpec(bits: 4, groupSize: 64),
             sourceWeight: source, sourceScales: source, sourceBiases: source)
         let nameBytes = Array(residentEntry.name.utf8)
         let resident = ResidentFilePlan(

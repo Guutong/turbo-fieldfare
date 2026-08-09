@@ -16,6 +16,11 @@ public struct RemoteStreamingRepackOptions: Sendable {
     public let baseURL: URL
     public let rangeRetryAttempts: Int
     public let retryBaseDelayNs: UInt64
+    /// When non-nil, reads checkpoint files from this local directory instead
+    /// of streaming from Hugging Face. The directory must contain
+    /// `config.json`, `model.safetensors.index.json`, and the safetensors
+    /// shards named by the index.
+    public let localCheckpointPath: String?
 
     public init(repoID: String,
                 revision: String,
@@ -32,7 +37,8 @@ public struct RemoteStreamingRepackOptions: Sendable {
                 downloadSession: RemoteDownloadSession = RemoteDownloadSession(),
                 baseURL: URL = URL(string: "https://huggingface.co")!,
                 rangeRetryAttempts: Int = 4,
-                retryBaseDelayNs: UInt64 = 1_000_000_000) {
+                retryBaseDelayNs: UInt64 = 1_000_000_000,
+                localCheckpointPath: String? = nil) {
         self.repoID = repoID
         self.revision = revision
         self.outputDir = outputDir
@@ -49,6 +55,7 @@ public struct RemoteStreamingRepackOptions: Sendable {
         self.baseURL = baseURL
         self.rangeRetryAttempts = rangeRetryAttempts
         self.retryBaseDelayNs = retryBaseDelayNs
+        self.localCheckpointPath = localCheckpointPath
     }
 }
 
@@ -168,21 +175,30 @@ public final class RemoteStreamingRepacker {
                     detail: "saved download belongs to a different source")
             }
         }
-        let retryPolicy = RemoteRetryPolicy(attempts: options.rangeRetryAttempts,
-                                            baseDelayNs: options.retryBaseDelayNs)
-        let remote = HuggingFaceRemoteSource(repoID: options.repoID,
-                                             requestedRevision: options.revision,
-                                             resolvedCommit: saved?.resolvedCommit,
-                                             token: options.token,
-                                             downloadSession: options.downloadSession,
-                                             baseURL: options.baseURL,
-                                             tempDirectory: paths.partialDirectory,
-                                             retryPolicy: retryPolicy)
-        progress(.downloadingMetadata)
-        let snapshot = try await RemoteSnapshotLoader.load(remote: remote,
+        let snapshot: RemoteSnapshot
+        let localCheckpointPath = options.localCheckpointPath
+        if let localPath = localCheckpointPath {
+            progress(.downloadingMetadata)
+            snapshot = try LocalCheckpointRepacker.loadSnapshot(
+                checkpointPath: localPath,
+                metadataDirectory: paths.metadataDirectory)
+        } else {
+            let retryPolicy = RemoteRetryPolicy(attempts: options.rangeRetryAttempts,
+                                                baseDelayNs: options.retryBaseDelayNs)
+            let remote = HuggingFaceRemoteSource(repoID: options.repoID,
+                                                 requestedRevision: options.revision,
+                                                 resolvedCommit: saved?.resolvedCommit,
+                                                 token: options.token,
+                                                 downloadSession: options.downloadSession,
+                                                 baseURL: options.baseURL,
+                                                 tempDirectory: paths.partialDirectory,
+                                                 retryPolicy: retryPolicy)
+            progress(.downloadingMetadata)
+            snapshot = try await RemoteSnapshotLoader.load(remote: remote,
                                                            requireKnownSource: options.requireKnownSource,
                                                            metadataDirectory: paths.metadataDirectory,
                                                            audit: audit)
+        }
         try Task.checkCancellation()
         let plan = try RepackPlanner.plan(meta: snapshot.metadata,
                                           arch: snapshot.arch,
@@ -278,9 +294,26 @@ public final class RemoteStreamingRepacker {
                 parentDirectory: paths.parentDirectory)
         }
 
-        let provider = HTTPRangeSourceByteProvider(remote: remote.pinned(commit: snapshot.resolvedCommit),
+        let provider: any SourceByteProvider
+        if let localPath = localCheckpointPath {
+            provider = LocalFileSourceByteProvider(checkpointPath: localPath,
+                                                    files: snapshot.remoteFiles,
+                                                    writeTileBytes: options.writeTileBytes)
+        } else {
+            let retryPolicy = RemoteRetryPolicy(attempts: options.rangeRetryAttempts,
+                                                baseDelayNs: options.retryBaseDelayNs)
+            let remote = HuggingFaceRemoteSource(repoID: options.repoID,
+                                                 requestedRevision: options.revision,
+                                                 resolvedCommit: snapshot.resolvedCommit,
+                                                 token: options.token,
+                                                 downloadSession: options.downloadSession,
+                                                 baseURL: options.baseURL,
+                                                 tempDirectory: paths.partialDirectory,
+                                                 retryPolicy: retryPolicy)
+            provider = HTTPRangeSourceByteProvider(remote: remote,
                                                    files: snapshot.remoteFiles,
                                                    writeTileBytes: options.writeTileBytes)
+        }
         let reusedBytes = checkpoint.completedRanges.reduce(UInt64(0)) {
             $0 + $1.sourceBytes
         }
@@ -318,6 +351,13 @@ public final class RemoteStreamingRepacker {
             let rel = "packed_experts/" + (layer.path as NSString).lastPathComponent
             try recordOutputFile(relativePath: rel, path: layer.path, progress: progress)
         }
+        // 0-expert placeholder files — record them so the manifest lists every
+        // layer file the layout references.
+        for layer in plan.layers where layer.expertsPerLayer == 0 {
+            try Task.checkCancellation()
+            let rel = "packed_experts/" + (layer.path as NSString).lastPathComponent
+            try recordOutputFile(relativePath: rel, path: layer.path, progress: progress)
+        }
 
         let layoutPath = ((paths.partialDirectory as NSString)
             .appendingPathComponent("packed_experts") as NSString)
@@ -331,10 +371,29 @@ public final class RemoteStreamingRepacker {
                              progress: progress)
 
         try Task.checkCancellation()
-        try await copyRemoteMetadataSidecars(snapshot: snapshot,
-                                             remote: remote,
-                                             partialDir: paths.partialDirectory,
-                                             progress: progress)
+        if let localPath = localCheckpointPath {
+            try copyLocalMetadataSidecars(snapshot: snapshot,
+                                          checkpointPath: localPath,
+                                          partialDir: paths.partialDirectory,
+                                          progress: progress)
+        } else {
+            // Rebuild remote for sidecar download (the byte-provider remote
+            // was already consumed by copyBatch above).
+            let retryPolicy = RemoteRetryPolicy(attempts: options.rangeRetryAttempts,
+                                                baseDelayNs: options.retryBaseDelayNs)
+            let sidecarRemote = HuggingFaceRemoteSource(repoID: options.repoID,
+                                                         requestedRevision: options.revision,
+                                                         resolvedCommit: snapshot.resolvedCommit,
+                                                         token: options.token,
+                                                         downloadSession: options.downloadSession,
+                                                         baseURL: options.baseURL,
+                                                         tempDirectory: paths.partialDirectory,
+                                                         retryPolicy: retryPolicy)
+            try await copyRemoteMetadataSidecars(snapshot: snapshot,
+                                                 remote: sidecarRemote,
+                                                 partialDir: paths.partialDirectory,
+                                                 progress: progress)
+        }
         try? FileManager.default.removeItem(atPath: paths.rangeTemporaryFile)
         try? FileManager.default.removeItem(atPath: paths.metadataDirectory)
         progress(.finalizing)
@@ -405,6 +464,15 @@ public final class RemoteStreamingRepacker {
             try Task.checkCancellation()
             let descriptor = try Posix.openCreateRW(layer.path)
             try Posix.ftruncate(descriptor, path: layer.path, size: layer.fileSize)
+            try Posix.fsync(descriptor, path: layer.path)
+            close(descriptor)
+        }
+        // Dense-MLP layers keep a 0-byte placeholder so the layout's layer
+        // indexing stays valid without special-casing sparse layers at runtime.
+        for layer in plan.layers where layer.expertsPerLayer == 0 {
+            try Task.checkCancellation()
+            let descriptor = try Posix.openCreateRW(layer.path)
+            // 0-byte file — create then truncate is a no-op, fsync is enough.
             try Posix.fsync(descriptor, path: layer.path)
             close(descriptor)
         }
@@ -559,6 +627,56 @@ public final class RemoteStreamingRepacker {
         return false
     }
 
+    /// Local-checkpoint counterpart to `copyRemoteMetadataSidecars`. Copies
+    /// `config.json` from the metadata directory and optional tokenizer files
+    /// from the checkpoint directory into the `.gturbo` tokenizer subtree.
+    private func copyLocalMetadataSidecars(snapshot: RemoteSnapshot,
+                                           checkpointPath: String,
+                                           partialDir: String,
+                                           progress: @Sendable (ModelInstallProgress) -> Void) throws {
+        let tokenizerDir = (partialDir as NSString).appendingPathComponent("tokenizer")
+        for filename in ["config.json"] {
+            let src = (snapshot.metadataDirectory as NSString).appendingPathComponent(filename)
+            guard FileManager.default.fileExists(atPath: src) else { continue }
+            try Posix.mkdirP(tokenizerDir)
+            let dst = (tokenizerDir as NSString).appendingPathComponent(filename)
+            if FileManager.default.fileExists(atPath: dst) {
+                try FileManager.default.removeItem(atPath: dst)
+            }
+            try FileManager.default.copyItem(atPath: src, toPath: dst)
+            try recordOutputFile(relativePath: "tokenizer/\(filename)",
+                                 path: dst,
+                                 progress: progress)
+        }
+
+        let tokenizerFiles: [(name: String, required: Bool)] = [
+            ("tokenizer.json", true),
+            ("tokenizer_config.json", true),
+            ("special_tokens_map.json", false),
+            ("chat_template.jinja", false),
+            ("chat_template.json", false),
+        ]
+        for file in tokenizerFiles {
+            let src = (checkpointPath as NSString).appendingPathComponent(file.name)
+            guard FileManager.default.fileExists(atPath: src) else {
+                if file.required {
+                    throw RepackError.configurationInvalid(
+                        detail: "required tokenizer file missing from checkpoint: \(file.name)")
+                }
+                continue
+            }
+            try Posix.mkdirP(tokenizerDir)
+            let dst = (tokenizerDir as NSString).appendingPathComponent(file.name)
+            if FileManager.default.fileExists(atPath: dst) {
+                try FileManager.default.removeItem(atPath: dst)
+            }
+            try FileManager.default.copyItem(atPath: src, toPath: dst)
+            try recordOutputFile(relativePath: "tokenizer/\(file.name)",
+                                 path: dst,
+                                 progress: progress)
+        }
+    }
+
     private func writeManifest(plan: RepackPlan,
                                partialDir: String,
                                metadata: IndexLoader.SourceMetadata,
@@ -570,23 +688,95 @@ public final class RemoteStreamingRepacker {
             router: 8,
             sharedExpert: 8,
             routedExpert: 4)
-        for e in plan.resident.entries {
-            if e.name == "language_model.model.embed_tokens.weight", let s = e.quantSpec {
-                bits.embedding = s.bits
-            }
-            if e.name.hasSuffix(".self_attn.q_proj.weight"), let s = e.quantSpec {
-                bits.attention = s.bits
-            }
-            if e.name.hasSuffix(".router.proj.weight"), let s = e.quantSpec {
-                bits.router = s.bits
-            }
-            if e.name.hasSuffix(".mlp.gate_proj.weight"), let s = e.quantSpec {
-                bits.sharedExpert = s.bits
+        // Each slot resolves across *all* matching entries rather than by
+        // last-write-wins, so a checkpoint that quantizes one slot at several
+        // bit widths is refused instead of silently recorded as whichever
+        // tensor came last. See `RepackPlanner.uniformBits`.
+        func observations(where matches: (String) -> Bool) -> [(name: String, bits: Int, groupSize: Int)] {
+            plan.resident.entries.compactMap { e in
+                guard matches(e.name), let s = e.quantSpec else { return nil }
+                return (e.name, s.bits, s.groupSize)
             }
         }
-        if let layer = plan.layers.first(where: { !$0.subTensors.isEmpty }),
-           let routedBits = layer.subTensors.first?.bitsForWeights {
-            bits.routedExpert = routedBits
+        // Both known families spell the embedding tensor identically;
+        // RepackPlanner owns that name so it isn't duplicated here.
+        // Derive correct groupSize for each slot from observed quant specs;
+        // plan.baseGroupSize is the model-wide default (128 for Laguna) but
+        // individual slots may differ (embedding/router/attention are g64).
+        func slotGroupSize(_ obs: [(name: String, bits: Int, groupSize: Int)]) -> Int? {
+            guard let gs = obs.first?.groupSize, gs != plan.baseGroupSize else { return nil }
+            return gs
+        }
+
+        let embeddingObs = observations { $0 == RepackPlanner.embedTokensWeightName }
+        if let b = try RepackPlanner.uniformBits(
+            slot: "embedding",
+            observations: embeddingObs.map { ($0.name, $0.bits) }) {
+            bits.embedding = b
+            if let gs = slotGroupSize(embeddingObs) { bits.slotGroupSizes["embedding"] = gs }
+        }
+        // Attention may vary per layer (Laguna: 5-bit on 20 layers, 8-bit on
+        // 28). When it does, emit perLayer overrides so the runtime can select
+        // per layer; when uniform, keep the scalar path unchanged.
+        let attentionObs = observations { $0.hasSuffix(".self_attn.q_proj.weight") }
+        let attentionByLayer = RepackPlanner.perLayerAttentionBits(
+            observations: attentionObs.map { ($0.name, $0.bits) })
+        let attnGroupSize = attentionObs.first?.groupSize ?? 64
+        if let perLayer = attentionByLayer {
+            let counts = Dictionary(grouping: perLayer) { $0.weightBits }.mapValues { $0.count }
+            let defaultBits = counts.max(by: { $0.value < $1.value })!.key
+            bits.attention = defaultBits
+            if attnGroupSize != plan.baseGroupSize { bits.slotGroupSizes["attention"] = attnGroupSize }
+            var overrides = bits.perLayer ?? [:]
+            overrides["attention"] = perLayer
+                .map { (layer: $0.layer, weightBits: $0.weightBits, groupSize: attnGroupSize) }
+                .filter { $0.weightBits != defaultBits }
+            bits.perLayer = overrides
+        } else if let b = try RepackPlanner.uniformBits(
+            slot: "attention",
+            observations: attentionObs.map { ($0.name, $0.bits) }) {
+            bits.attention = b
+            if attnGroupSize != plan.baseGroupSize { bits.slotGroupSizes["attention"] = attnGroupSize }
+        }
+        let routerObs = observations {
+            RepackPlanner.routerProbeSuffixes.contains(where: $0.hasSuffix)
+        }
+        if let b = try RepackPlanner.uniformBits(
+            slot: "router",
+            observations: routerObs.map { ($0.name, $0.bits) }) {
+            bits.router = b
+            if let gs = slotGroupSize(routerObs) { bits.slotGroupSizes["router"] = gs }
+        }
+        // The shared-expert probe additionally has to pick *which* suffix
+        // identifies the slot, because the table's entries overlap: Laguna's
+        // dense layer-0 `.mlp.gate_proj.weight` matches the generic probe
+        // while its real shared expert matches the qualified
+        // `.mlp.shared_expert.gate_proj.weight`. Scanning the table in order
+        // and stopping at the first suffix any entry matches keeps the dense
+        // layer from standing in for the shared expert; uniformity is then
+        // checked across every entry matching that chosen suffix.
+        for probe in RepackPlanner.sharedExpertProbeSuffixes {
+            let matching = observations { $0.hasSuffix(probe) }
+            guard !matching.isEmpty else { continue }
+            if let b = try RepackPlanner.uniformBits(slot: "sharedExpert",
+                                                     observations: matching.map { ($0.name, $0.bits) }) {
+                bits.sharedExpert = b
+            }
+            break
+        }
+        // Same uniformity rule for the routed path, across every layer and
+        // role rather than the first slice of the first layer. Both known
+        // families are uniformly 4-bit here, so this is a guard against a
+        // future checkpoint rather than a fix for a present one.
+        let routedObservations: [(name: String, bits: Int)] = plan.layers.flatMap { layer in
+            layer.subTensors.compactMap { slice in
+                guard let b = slice.bitsForWeights else { return nil }
+                return ("layer \(layer.layerIndex) \(slice.role)", b)
+            }
+        }
+        if let b = try RepackPlanner.uniformBits(slot: "routedExpert",
+                                                 observations: routedObservations) {
+            bits.routedExpert = b
         }
         let files = audit.outputFiles.map {
             ($0.relativePath, GTurboJSON.FileEntry(size: $0.size, sha256: $0.sha256))

@@ -26,4 +26,9 @@ struct SourceTensor: Sendable, Hashable {
 /// Bit-width override resolved from `config.json -> quantization`.
 struct QuantSpec: Sendable, Hashable {
     let bits: Int
+    /// The quantization group size this tensor actually uses, which may
+    /// differ from the model's global `baseGroupSize` (Laguna: attention
+    /// and embedding are group 64 while the base is 128). Defaults to
+    /// `baseGroupSize` when no tensor-level override exists.
+    let groupSize: Int
 }

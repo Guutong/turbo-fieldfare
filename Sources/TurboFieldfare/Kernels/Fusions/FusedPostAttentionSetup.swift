@@ -9,9 +9,15 @@ import Metal
 ///   dense_x = rmsnorm_bf16w(hidden, pre_feedforward_layernorm)
 ///   routed_x = rmsnorm_bf16w(hidden, pre_feedforward_layernorm_2)
 ///   router_x = rmsnorm_no_scale(hidden)
+///
+/// `encodePreNorm` is the Qwen/Laguna variant:
+///   hidden = hidden + attn                        (attention output not normed)
+///   dense_x = routed_x = router_x
+///           = rmsnorm_bf16w(hidden, post_attention_layernorm)
 final class FusedPostAttentionSetup {
     private let pso: MTLComputePipelineState
     private let specializedPSO: MTLComputePipelineState?
+    private let preNormPSO: MTLComputePipelineState
 
     init(context: MetalContext) throws {
         self.pso = try context.pipeline("fused_post_attn_setup")
@@ -21,6 +27,41 @@ final class FusedPostAttentionSetup {
                 MetalFunctionConstant(index: 80, value: .uint32(2816)),
                 MetalFunctionConstant(index: 86, value: .bool(true)),
             ])
+        self.preNormPSO = try context.pipeline("fused_post_attn_setup_prenorm")
+    }
+
+    /// Pre-norm block variant. `preFFNWeight` is the model's
+    /// `post_attention_layernorm`, which in this convention norms the residual
+    /// on the way into the MLP rather than the attention output.
+    func encodePreNorm(commandBuffer cb: MTLCommandBuffer,
+                       hidden: MTLBuffer,
+                       attn: MTLBuffer,
+                       denseX: MTLBuffer,
+                       routedX: MTLBuffer,
+                       routerX: MTLBuffer,
+                       preFFNWeight: MTLBuffer,
+                       preFFNWeightOffset: Int = 0,
+                       d: UInt32,
+                       eps: Float) {
+        precondition(d <= 4096,
+                     "D > 4096 exceeds the fused post-attention setup scratch")
+        guard let enc = cb.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(preNormPSO)
+        enc.setBuffer(hidden,       offset: 0,                  index: 0)
+        enc.setBuffer(attn,         offset: 0,                  index: 1)
+        enc.setBuffer(denseX,       offset: 0,                  index: 2)
+        enc.setBuffer(routedX,      offset: 0,                  index: 3)
+        enc.setBuffer(routerX,      offset: 0,                  index: 4)
+        enc.setBuffer(preFFNWeight, offset: preFFNWeightOffset, index: 5)
+        var dVar = d
+        var epsVar = eps
+        enc.setBytes(&dVar, length: MemoryLayout<UInt32>.size, index: 6)
+        enc.setBytes(&epsVar, length: MemoryLayout<Float>.size, index: 7)
+
+        let threads = min(Int(preNormPSO.maxTotalThreadsPerThreadgroup), 256)
+        enc.dispatchThreads(MTLSize(width: threads, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: threads, height: 1, depth: 1))
+        enc.endEncoding()
     }
 
     func encode(commandBuffer cb: MTLCommandBuffer,

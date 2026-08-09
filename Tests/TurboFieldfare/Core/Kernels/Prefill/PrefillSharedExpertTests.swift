@@ -132,6 +132,8 @@ import TurboFieldfareValidationSupport
                               down: downProj,
                               y: yRef,
                               yOffset: row * Self.d * halfBytes,
+                              scratchGate: scratchGate,
+                              scratchUp: scratchUp,
                               scratchAct: scratchAct)
             scalarRMS.encodeBF16W(commandBuffer: refCB,
                                   x: yRef,
@@ -213,6 +215,8 @@ import TurboFieldfareValidationSupport
                               down: downProj,
                               y: yRef,
                               yOffset: row * yStride * halfBytes,
+                              scratchGate: scratchGate,
+                              scratchUp: scratchUp,
                               scratchAct: scratchAct)
         }
         refCB.commit()

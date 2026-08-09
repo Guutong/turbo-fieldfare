@@ -51,6 +51,19 @@ struct TurboFieldfareMacApp: App {
                     .disabled(!model.canCancelInstall)
             }
             CommandMenu("Model") {
+                if model.availableModelSources.count > 1 {
+                    Picker("Selected Model", selection: Binding(
+                        get: { model.selectedModelSourceID },
+                        set: { newID in
+                            model.switchModelSource(toID: newID)
+                        }
+                    )) {
+                        ForEach(model.availableModelSources) { source in
+                            Text(source.displayName).tag(source.id)
+                        }
+                    }
+                    Divider()
+                }
                 Button("Load Model", action: model.loadModel)
                     .disabled(!model.canLoadModel)
                 Button("Reload Model", action: model.reloadModel)

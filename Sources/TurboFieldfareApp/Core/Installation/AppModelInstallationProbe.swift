@@ -10,7 +10,8 @@ public enum AppModelInstallationStatus: Equatable, Sendable {
 public enum AppModelInstallationProbe {
     public static func status(
         at directory: URL,
-        descriptor: AppModelInstallDescriptor = .default
+        descriptor: AppModelInstallDescriptor = .default,
+        architecture: ArchConfig? = nil
     ) -> AppModelInstallationStatus {
         let directory = directory.standardizedFileURL
         let manifestURL = directory.appendingPathComponent("manifest.json")
@@ -19,21 +20,11 @@ public enum AppModelInstallationProbe {
         }
 
         do {
-            // Auto-detect model family from manifest arch before validation.
-            let manifestData = try Data(contentsOf: manifestURL)
-            let expectedArch: ArchConfig
-            if let root = try JSONSerialization.jsonObject(with: manifestData) as? [String: Any],
-               let arch = root["arch"] as? [String: Any] {
-                expectedArch = ArchConfig.detect(
-                    hiddenSize: arch["hiddenSize"] as? Int ?? 0,
-                    numLayers: arch["numLayers"] as? Int ?? 0,
-                    numExperts: arch["numExperts"] as? Int ?? 0,
-                    numKVHeads: arch["numKVHeads"] as? Int ?? 0,
-                    numFullKVHeads: arch["numFullKVHeads"] as? Int ?? 0)
-            } else {
-                expectedArch = .gemma4_26B_A4B
-            }
-            let manifest = try ManifestReader.load(directoryURL: directory, expecting: expectedArch)
+            // architecture: nil → auto-detect from manifest. Needed for
+            // multi-model support (Laguna vs Qwen3.6 vs Gemma have different
+            // arch fields).
+            let manifest = try ManifestReader.load(directoryURL: directory,
+                                                   expecting: architecture)
             let expectedSource = "sha256:" + descriptor.sourceIndexSHA256
             guard manifest.sourceSnapshotHash == expectedSource else {
                 return .partial("installed checkpoint does not match \(descriptor.displayName)")
