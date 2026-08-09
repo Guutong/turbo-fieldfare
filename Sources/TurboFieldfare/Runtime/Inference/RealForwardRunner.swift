@@ -222,11 +222,13 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     private let dummyPerExpertScale: MTLBuffer?
     private let sharedExpertProjections: [LayerSharedExpertProjections]
 
-    // P3-4: plain-Swift-fp32 DeltaNet (ADR-0001) for Qwen3.6's 30 linear
-    // layers. nil for topologies with no DeltaNet layers (e.g. Gemma).
-    private let deltaNetDims: DeltaNetDimensions?
-    private let deltaNetWeights: DeltaNetCPUBlock.WeightsCache?
-    private let deltaNetState: DeltaNetStateStore?
+    // P4-1: DeltaNet on Metal with GPU-resident conv/recurrent state, for
+    // Qwen3.6's 30 linear layers (P3-4 ran the same chain in plain Swift
+    // fp32 on the CPU; `DeltaNetCPUBlock` remains as the parity oracle).
+    // nil for topologies with no DeltaNet layers (e.g. Gemma).
+    private let deltaNet: DeltaNetMetalBlock?
+    private let deltaNetWeights: DeltaNetMetalBlock.WeightsCache?
+    private let deltaNetState: DeltaNetMetalBlock.GPUStateStore?
 
     /// Qwen3.6's per-token sigmoid gate on the shared expert. nil for Gemma,
     /// which has no `mlp.shared_expert_gate`.
@@ -465,13 +467,15 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             let dims = DeltaNetDimensions.qwen36_35B_A3B
             let layerKindMask = cfg.layerKindMask
             let isLinearLayer = (0..<cfg.numLayers).map { layerKindMask[$0] == 2 }
-            self.deltaNetDims = dims
-            self.deltaNetWeights = DeltaNetCPUBlock.WeightsCache(model: model, hiddenSize: D, dims: dims)
-            self.deltaNetState = DeltaNetStateStore(numLayers: cfg.numLayers, dims: dims,
-                                                     isLinearLayer: isLinearLayer)
+            self.deltaNet = try DeltaNetMetalBlock(context: context, hiddenSize: D, dims: dims)
+            self.deltaNetWeights = DeltaNetMetalBlock.WeightsCache(
+                device: device, model: model, hiddenSize: D, dims: dims)
+            self.deltaNetState = try DeltaNetMetalBlock.GPUStateStore(
+                device: device, numLayers: cfg.numLayers, dims: dims,
+                isLinearLayer: isLinearLayer)
             self.sharedExpertGate = SharedExpertGateWeights(model: model, hiddenSize: Int(D))
         } else {
-            self.deltaNetDims = nil
+            self.deltaNet = nil
             self.deltaNetWeights = nil
             self.deltaNetState = nil
             self.sharedExpertGate = nil
@@ -1722,39 +1726,42 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             }
 
             if isLinear {
-                // P3-4: real plain-Swift-fp32 DeltaNet (ADR-0001), replacing
-                // the P3-3b identity passthrough. `hidden` is FP16-backed
-                // shared-storage Metal memory; safe to read/write directly
-                // from the CPU here ONLY once any still-in-flight routed-MoE
-                // tail from the PREVIOUS layer (which writes `hidden`
-                // asynchronously via `pendingRoutedCommand`, deliberately
-                // left un-waited for pipelining) has actually completed —
-                // the ordinary per-layer `waitUntilCompleted(cb)` below is
-                // NOT sufficient by itself, since that only covers the
-                // current layer's own norm/attention/router command buffer,
-                // not the previous layer's deferred MoE combine.
+                // P4-1 (was P3-4's CPU block): the DeltaNet chain runs on the
+                // GPU with its conv/recurrent state resident in Metal buffers.
+                // The previous layer's routed-MoE tail writes `hidden`
+                // asynchronously via `pendingRoutedCommand` and is deliberately
+                // left un-waited for pipelining; DeltaNet reads `hidden`, so it
+                // must be drained first. The ordinary per-layer
+                // `waitUntilCompleted(cb)` below is NOT sufficient by itself —
+                // it only covers the current layer's own command buffer, not
+                // the previous layer's deferred MoE combine. Kept exactly as
+                // the CPU call site had it: Metal orders work within a command
+                // buffer, but makes no such promise across separate command
+                // buffers on the same queue.
                 if let pending = pendingRoutedCommand {
                     try finishPendingRoutedCommand(pending, waitIfNeeded: true)
                     pendingRoutedCommand = nil
                 }
-                guard let dims = deltaNetDims, let weightsCache = deltaNetWeights,
-                      let stateStore = deltaNetState else {
-                    preconditionFailure("qwen36 topology requires DeltaNet state/weights")
-                }
-                let ptr = hidden.contents().assumingMemoryBound(to: Float16.self)
-                var x = [Float](repeating: 0, count: Int(D))
-                for i in 0..<Int(D) { x[i] = Float(ptr[i]) }
-
-                let layerWeights = try weightsCache.weights(layer: L)
-                let deltaOut = DeltaNetCPUBlock.forward(
-                    x: x, weights: layerWeights, dims: dims,
-                    convState: &stateStore.convState[L],
-                    recurrentState: &stateStore.recurrentState[L])
-
-                for i in 0..<Int(D) { ptr[i] = Float16(x[i] + deltaOut[i]) }
             }
 
             var cb = ctx.queue.makeCommandBuffer()!
+            if isLinear {
+                guard let deltaNet, let weightsCache = deltaNetWeights,
+                      let stateStore = deltaNetState,
+                      let convState = stateStore.convState[L],
+                      let recurrentState = stateStore.recurrentState[L] else {
+                    preconditionFailure("qwen36 topology requires DeltaNet state/weights")
+                }
+                // Encoded into the SAME command buffer as the post-attention
+                // norm / router below, so `hidden = hidden + deltaOut` is
+                // ordered before anything reads it, with no extra sync point.
+                deltaNet.encode(commandBuffer: cb,
+                                hidden: hidden,
+                                weights: try weightsCache.weights(layer: L),
+                                convState: convState,
+                                recurrentState: recurrentState,
+                                eps: eps)
+            }
             if !isLinear {
                 gInputNorm(cb)
                 gQKV(cb)
