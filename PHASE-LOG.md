@@ -88,7 +88,7 @@ smaller tasks in `plan.md`, add them to the board with new IDs, and stop with
 | P2-4 | KV for the 10 full-attn layers only | DONE | skip linear layers, fix fullStride for Qwen36 |
 | P2-5 | Full attention path | DONE | fixed numFullKVHeads=0 fallback; rest already cfg-driven |
 | P2-6 | Layer-3 isolation test | DONE | 8 shape tests pass; full Metal forward pass deferred (needs kernel orchestration) |
-| P6b-1 | Expert LRU cache with pinning | TODO | kimi-k3 inspired |
+| P6b-1 | Expert LRU cache with pinning | DONE | kimi-k3 inspired · LRU + slot pinning + per-layer eviction counters; LRU hit rate 53.29% vs LFU baseline 54.31% (near-parity, LFU slightly ahead) — see History |
 | P6b-2 | Batch expert prefetch disk-offset order | TODO | kimi-k3 inspired |
 | P6b-3 | Prefill expert dedup | TODO | kimi-k3 inspired |
 | P6b-4 | Speculative decoding | TODO | kimi-k3 inspired · frontier |
@@ -1310,3 +1310,73 @@ Next:     None in Phase 6 — P6-3 is the last task, and it did not pass, so
           enough (>2.5h for 8K tokens under contention) that any future
           long-context measurement needs a progress indicator on the prefill
           loop, and the machine must be verified idle first.
+
+### 2026-08-09 — P6b-1 — TODO -> DONE (LRU + pinning added; LRU vs LFU near-parity)
+Did:      Investigated the existing cache (`PreadExpertStreamer.swift`) and
+          found `.lru` policy already existed end-to-end (enum case, CLI
+          flag `--expert-cache-policy lru`, recency-ordered victim
+          selection) from earlier work — so the genuinely missing pieces
+          per plan.md were pinning and eviction visibility, which is what
+          got built. Added per-slot pin depth (`pinSlots`/`unpinSlots`/
+          `pinnedSlotCount`); pinned slots are excluded from eviction
+          candidates, and if a plan can't be placed without evicting a
+          pinned slot the pin is overridden rather than the fetch failing
+          (counted, not silent). Wired into the real decode loop:
+          `RealForwardRunner` pins each layer's routed-plan slots and
+          releases them in `finishPendingRoutedCommand`, matching the
+          command buffers' actual read lifetime. Extended `ExpertCacheStats`
+          (from P6-1) with `evictions`/`pinnedProtections`/`pinOverrides`,
+          counted per layer; an eviction only counts when a resident expert
+          is displaced (a cold miss onto a never-used slot is not one).
+          `TFF_EXPERT_CACHE_STATS=1` footer now reports evictions globally
+          and per layer (`L<n>:hits/lookups/e<evictions>`).
+Ran:      `swift test --filter PreadExpertStreamer` -> **18/18 pass**,
+          including 6 new tests: LRU-vs-LFU divergent victims on an
+          identical access trace, LRU recency retention, a pinned slot
+          surviving an eviction round that would otherwise take it, pin-
+          override accounting, eviction-vs-cold-miss counting, stats
+          summation. Wider `Streaming|ExpertIO|CachePlanning` filter also
+          green (18 tests, 6 suites). Real-model re-measurement (orchestrator
+          took over this step after the implementing subagent's run got
+          stuck behind a concurrent P6-3 measurement process and it stopped
+          without finishing): same P6-1/P5-2 136-token Amazon-rainforest
+          prompt, `--max-new 60 --prefill off --temperature 0
+          --expert-cache-policy lru --expert-cache-slots 16`, machine
+          verified idle first (`ps aux` clean of prior TurboFieldfareCLI
+          processes) ->
+          `[expert-cache slots=16 policy=lru lookups=62400 hits=33254
+          misses=29146 plans=7800 hitRate=0.5329 evictions=28506
+          pinProtect=0 pinOverride=0]`. Generated answer correct and
+          unchanged from every prior run of this prompt (Brazil + cattle
+          ranching/soy cultivation/road building).
+Learned:  **LRU hit rate (53.29%) is very close to but slightly below the
+          LFU baseline (54.31%, P6-1)** — a ~1 point gap, not the
+          improvement one might hope for. This is a real, useful negative
+          result: for Qwen3.6's actual routing pattern on this prompt, pure
+          recency is not a better eviction signal than pure frequency.
+          `pinProtect=0 pinOverride=0` on this run means pinning was never
+          actually load-bearing for this trace — expected, since a single-
+          token-at-a-time decode loop mostly finishes consuming a slot
+          before the next lookup, so contention that would force an
+          eviction-of-the-in-flight-expert is rare in practice; pinning is
+          correctness insurance for a scenario that didn't occur here, not
+          dead code (the unit tests do exercise the case directly). Per-
+          layer detail under LRU shows the same shape P6-1 found under LFU
+          (early layers churn hardest — L0 has 1351/1560 evictions, 86.6%,
+          vs a mid-network trough around L8's 490/1560, 31.4%) — the skew
+          is a property of Qwen3.6's routing distribution, not the cache
+          policy.
+Unproven: only one prompt/decode-length was measured for LRU, matching
+          P6-1's single-sample caveat; a broader sweep (multiple prompts,
+          multiple slot counts) would sharpen the LRU-vs-LFU comparison but
+          is out of scope here. Whether LFU's small edge holds at other
+          slot counts (8/24/32) or on different prompts is unknown.
+Next:     P6b-2 (batch expert prefetch in disk-offset order) — the next
+          Phase 6b task and, per P6-3's finding that decode is ~8% CPU /
+          I/O-bound, a more promising lever for the failed decode-speed
+          gate than cache-policy choice was. LFU remains the shipping
+          default (not changed here, per plan.md's "add" not "replace").
+          Carried forward, still open: Qwen chat-template Gemma marker
+          leakage, unreachable chunked-prefill `isFull ? attnK` v_proj bug,
+          P6-1 counters' missing prefill/decode phase split, and
+          `AppContextLengthOption`'s stale 32K/64K choices.
