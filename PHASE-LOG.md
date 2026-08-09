@@ -93,6 +93,7 @@ smaller tasks in `plan.md`, add them to the board with new IDs, and stop with
 | P6b-3 | Prefill expert dedup | DONE | kimi-k3 inspired · chunked dedup doesn't apply (sequential prefill is causally serial); measured the existing cache's dedup benefit instead — prefill hit rate 58.53%, ioReduction 2.41x (gate >=2x) — see History |
 | P6b-4 | Speculative decoding | TODO | kimi-k3 inspired · frontier |
 | P6b-5 | F_NOCACHE on expert fd | FAILED | research-suggested (llama.cpp #18758 cited +46%) · measured NEUTRAL on this NVMe machine (baseline 2.265/2.214, F_NOCACHE 2.285/2.061 tok/s across 2 runs each — within run-to-run noise, no measurable win) — see History |
+| P6b-6 | Bump expert cache slots 16->32 | FAILED | measurement only, no code change · 16 slots mean 2.35 tok/s (3 runs) vs 32 slots mean 2.47 tok/s (3 runs), +5.1%; RSS 1.57GB->1.87GB (+19%, still <2GB gate); nowhere near closing >=4 tok/s gate — see History |
 | P3-1 | DeltaNet conv1d + state (Swift) | DONE | 5 hand-checked tests; 662/662 suite |
 | P3-2 | Delta rule + gating (Swift) | DONE | 16 tests; 678/678 suite; oracle-verified |
 | P3-3 | Layer-0 isolation test | DONE | Real repack (LayerWriter fix) into scratch/qwen36.gturbo; gate passes relL2≤0.0075, maxAbs≤0.0039 — see History |
@@ -1600,3 +1601,31 @@ Learned:  **Neutral, no measurable win — consistent with P6b-2's finding,
           P6-3 speed gate. Next candidate per the research plan: item 2,
           draft-driven expert prefetch, once P6b-4 (speculative decoding,
           still running) reports back.
+
+### 2026-08-09 — P6b-6 — TODO -> FAILED (32 expert-cache slots, measured +5.1%)
+Did:      Measurement only, no source change — `--expert-cache-slots` was
+          already a CLI flag (`Args.swift`, values 8/16/24/32, existing
+          since before this task). Cheapest fallback item from the research
+          plan: known hit-rate relationship from P6-1 (16 slots -> 54.31%,
+          32 slots -> 65.90%), never before measured for tok/s impact.
+Ran:      Same command as P6-3/P6b-5, `--expert-cache-slots {16,32}`,
+          3 runs each for noise:
+          16 slots: 2.347, 2.392, 2.297 tok/s (mean 2.345).
+          32 slots: 2.532, 2.449, 2.413 tok/s (mean 2.465).
+          `/usr/bin/time -l` at 32 slots: maximum resident set size
+          1872936960 B = 1.87 GB (up from 16-slot baseline's 1.57 GB).
+Learned:  **+5.1% mean tok/s, consistently above the 16-slot range across
+          all 3 pairs, but far short of closing the gap to >=4 tok/s** (2.35
+          -> 2.47 is a small fraction of the 2.35 -> 4.0 needed). Costs real
+          memory margin too: RSS grew 19% (1.57GB -> 1.87GB), still under
+          the 2GB gate but eating most of the previously-unused headroom.
+          Not worth shipping as the default on its own — a ~5% win for a
+          19% memory cost is a poor trade when the gate is missed by 70%,
+          not 5%. Left the default at 16 slots; the flag remains available
+          for anyone who wants to combine it with a real fix later.
+Next:     P6b-4 (speculative decoding, still running) is the remaining
+          planned lever. Neither P6b-5 nor P6b-6 closed the gate; both were
+          the cheap items from the research plan. The next real candidate
+          is item 2 from that plan — draft-driven expert prefetch overlapping
+          I/O with compute, extending P6b-4's draft mechanism rather than
+          building new machinery — once P6b-4 reports its own result.
