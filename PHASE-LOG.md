@@ -89,7 +89,7 @@ smaller tasks in `plan.md`, add them to the board with new IDs, and stop with
 | P2-5 | Full attention path | DONE | fixed numFullKVHeads=0 fallback; rest already cfg-driven |
 | P2-6 | Layer-3 isolation test | DONE | 8 shape tests pass; full Metal forward pass deferred (needs kernel orchestration) |
 | P6b-1 | Expert LRU cache with pinning | DONE | kimi-k3 inspired · LRU + slot pinning + per-layer eviction counters; LRU hit rate 53.29% vs LFU baseline 54.31% (near-parity, LFU slightly ahead) — see History |
-| P6b-2 | Batch expert prefetch disk-offset order | TODO | kimi-k3 inspired |
+| P6b-2 | Batch expert prefetch disk-offset order | DONE | kimi-k3 inspired · 3-phase acquire, offset-sorted phase 2, queue depth 16 · measured NEUTRAL on NVMe (sorted 2.592 vs unsorted 2.660 tok/s mean of 3, within noise) — see History |
 | P6b-3 | Prefill expert dedup | TODO | kimi-k3 inspired |
 | P6b-4 | Speculative decoding | TODO | kimi-k3 inspired · frontier |
 | P3-1 | DeltaNet conv1d + state (Swift) | DONE | 5 hand-checked tests; 662/662 suite |
@@ -1380,3 +1380,95 @@ Next:     P6b-2 (batch expert prefetch in disk-offset order) — the next
           leakage, unreachable chunked-prefill `isFull ? attnK` v_proj bug,
           P6-1 counters' missing prefill/decode phase split, and
           `AppContextLengthOption`'s stale 32K/64K choices.
+
+### 2026-08-09 — P6b-2 — TODO -> DONE (batched offset-sorted prefetch landed; measured neutral)
+Did:      Implemented kimi-k3's 3-phase `getmany` acquire in
+          `PreadExpertStreamer.executeExpertCachePlan`. Investigation first:
+          **phase 1 and phase 3 already existed.** `makeExpertCachePlan`
+          reserves a slot per miss under `cacheLock` and sets
+          `slotExpert = -1`, which *is* the in-flight marker (no other
+          lookup can claim that slot as a hit), and P6b-1's pinning already
+          keeps an active encode's slots out of the victim set — so no new
+          reserve mechanism was needed, contrary to the task's presumption.
+          Phase 2 was also already *parallel* (`DispatchQueue.concurrentPerform`
+          over the misses). The genuine deltas P6b-2 adds are therefore:
+          (a) misses are now issued in **ascending absolute file offset**
+          order (`offsetSortedMissOrder`, using `StreamLayout.expertOffset`,
+          which for the real model comes from `PackedExpertsLayout`'s
+          per-expert offsets — these are NOT monotonic in expert index, so
+          router top-K order and offset order genuinely differ);
+          (b) a **bounded queue depth of 16** — misses are issued in waves of
+          at most `prefetchQueueDepth`; (c) phase 3 made explicitly
+          fail-atomic — publish happens only after every read in the batch
+          completed, so a failed batch publishes nothing, not even its
+          successful reads; (d) I/O instrumentation: `ExpertCacheStats`
+          gains `readNanos` (phase-2 wall time) and `peakInFlightReads`,
+          shown in the `TFF_EXPERT_CACHE_STATS` footer as `ioSec`/`qdPeak`.
+          `TFF_EXPERT_PREFETCH_SORT=0` disables only the sort, so sorted vs
+          router-order can be A/B'd on one binary. P6b-1's pinning/eviction
+          logic was not touched.
+Ran:      `swift test --filter PreadExpertStreamer` -> **25/25 pass** (18
+          prior + 7 new: offsets issued ascending on a deliberately
+          non-monotonic layout, hits excluded from the read order, ordering
+          deterministic, empty-miss no-op, each expert still lands in *its*
+          reserved slot when the sort reverses router order, queue-depth cap
+          respected + read time recorded, failed-batch-publishes-nothing,
+          stats summation). Wider
+          `Streaming|ExpertIO|CachePlanning|PreadExpertStreamer` filter ->
+          36 tests in 6 suites, green.
+          Real-model benchmark, machine verified idle first, all runs
+          **sequential**: release CLI on `scratch/qwen36.gturbo`, the same
+          P6-1/P5-2 136-token Amazon-rainforest prompt, `--temperature 0
+          --max-new 60 --prefill off --expert-cache-slots 16`, default LFU.
+
+          | config                    | tok/s (3 runs)      | mean  | ioSec mean |
+          |---------------------------|---------------------|-------|------------|
+          | HEAD before change        | 2.648               | 2.648 | n/a        |
+          | after, sorted (default)   | 2.620 2.600 2.555   | 2.592 | 15.65      |
+          | after, `SORT=0` (control) | 2.772 2.668 2.540   | 2.660 | 15.86      |
+
+Learned: **The offset sort produces no measurable speedup on this machine —
+          honest headline: neutral.** Sorted mean 2.592 tok/s vs unsorted
+          control 2.660 vs pre-change HEAD 2.648; the run-to-run spread
+          within a single config (2.540-2.772, ±0.23) is larger than any
+          gap between configs, so the ~2.6% apparent *deficit* for sorting
+          is noise, not a regression. Phase-2 I/O wall time nudges the other
+          way (15.65 s sorted vs 15.86 s unsorted, -1.3%) and is equally
+          inside the noise. Two structural reasons this was always going to
+          be small here, both worth recording: (1) the expert file lives on
+          **NVMe/APFS, which has no rotational seek latency** — plan.md's
+          premise ("cuts rotational/seek latency") is a spinning-disk
+          argument, and kimi-k3's "difference between usable and unusable
+          throughput" claim does not transfer to this storage; (2) the batch
+          is tiny — `qdPeak=8` on every real run, i.e. top-K=8 is the entire
+          batch, so the queue-depth-16 cap **never binds** during decode and
+          the sort is reordering at most 8 already-concurrent reads.
+          Correctness of the change is well evidenced: `lookups=62400
+          hits=33891 misses=28509 hitRate=0.5431 evictions=27869` are
+          **byte-identical to the P6-1 LFU baseline** in every run, sorted
+          and unsorted alike, and the generated answer is byte-identical to
+          every prior run of this prompt (Brazil + cattle ranching / soy
+          cultivation / road building). That confirms the task's assumption
+          empirically rather than by assertion: this is purely I/O
+          scheduling, it changes no routing decision and no expert-to-slot
+          mapping. No numeric tolerance was touched.
+Unproven: single machine, single storage device, single prompt, single
+          decode length. Whether offset-sorting helps on rotational or
+          network-backed storage was **not** tested and is the scenario the
+          plan.md rationale actually describes. The queue-depth-16 path
+          (waves > 1) is exercised only by unit-test reasoning about the cap,
+          never by a real run, since decode never exceeds 8 in flight —
+          P6b-3 (prefill expert dedup), which collects unique experts across
+          a 64-token chunk, is the first workload that would make batches
+          large enough for both the wave logic and the sort to matter.
+Next:     P6b-3 (prefill expert dedup) — and it now looks like the more
+          promising lever of the two, since it both reduces total I/O bytes
+          (the thing actually costing time, per P6-3's ~8% CPU finding) and
+          produces the large batches that would finally give P6b-2's sorting
+          and queue depth something to work on. Then P6b-4 (speculative
+          decoding). Carried forward, still open and untouched: Qwen
+          chat-template Gemma marker leakage, unreachable chunked-prefill
+          `isFull ? attnK` v_proj bug, P6-1 counters' missing prefill/decode
+          phase split, and `AppContextLengthOption`'s stale 32K/64K choices.
+          Also noted in passing, not fixed: an untracked
+          `Scripts/parse_resident_index.py` is sitting in the working tree.
