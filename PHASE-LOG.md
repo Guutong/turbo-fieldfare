@@ -103,7 +103,7 @@ smaller tasks in `plan.md`, add them to the board with new IDs, and stop with
 | P5-2 | Multi-token prompt coherence | DONE | ⚠️ frontier only · 136-token paragraph prompt answered correctly and coherently; 3/3 criterion-C still pass (incl. "4"); prefill on/off byte-identical at 136 tok; no code changes — see History |
 | P6-1 | Measure expert cache hit rate | DONE | ⚠️ frontier only · baseline 54.31% at the default 16 slots (33891 hits / 62400 lookups) on the P5-2 136-tok prompt + 60 new tokens; slot sweep 8/16/24/32 → 41.54/54.31/60.72/65.90%; measurement only, nothing tuned — see History |
 | P6-2 | Enforce context cap | DONE | ⚠️ frontier only · shared ContextCap authority, max 16384, CLI/server unified, validated before tokenizer/weight load — see History |
-| P6-3 | ≤2GB resident, ≥4 tok/s | TODO | final |
+| P6-3 | ≤2GB resident, ≥4 tok/s | FAILED | memory PASS (1.57 GB peak RSS); speed FAIL (2.298 tok/s vs ≥4) — mission NOT complete |
 
 ---
 
@@ -1212,3 +1212,101 @@ Next:     P6-3 (final numbers — resident memory and decode speed). Carried
           P6-1 expert-cache counters' missing prefill/decode phase split,
           the per-layer cache-slot skew, and now `AppContextLengthOption`'s
           stale 32K/64K choices.
+
+### 2026-08-09 — P6-3 — TODO -> FAILED (memory gate met, speed gate missed: 2.298 tok/s vs ≥4)
+Did:      Measurement only. **No source code was changed** — not one line, in
+          Sources/ or Tests/. Per the task's explicit framing this run was
+          measure-and-report, with optimization, hotspot profiling and any
+          performance-relevant edit ruled out of scope up front. Because
+          there are no code changes, `swift test` was NOT run and is not
+          applicable here (same precedent as P5-2). Everything below came
+          from external `/usr/bin/time -l` and `ps -o rss=` sampling of the
+          already-built release CLI; no production instrumentation was
+          added (unlike P6-1, which genuinely needed counters).
+Ran:      **(1) Decode speed — clean, isolated run:**
+          `/usr/bin/time -l ./.build/release/TurboFieldfareCLI --model
+          scratch/qwen36.gturbo --prompt "The capital of France is"
+          --temperature 0 --max-new 48 --prefill off`
+          Output was correct and coherent (" Paris, a city renowned for its
+          iconic landmarks such as the Eiffel Tower, the Louvre Museum, and
+          Notre-Dame Cathedral. ..."). Footer, verbatim:
+          `[stop=maxTokens prefill=5tok new=48tok decode=20.89s tok/s=2.298]`
+          `/usr/bin/time -l` on the same process: `39.13 real  11.05 user
+          9.78 sys`, `1640988672  maximum resident set size`,
+          `6016882760  peak memory footprint`, 777875 page reclaims.
+          **Measured decode speed: 2.298 tok/s.**
+          **(2) Resident memory:** max RSS from the run above = 1640988672 B
+          = **1.565 GB**. Then a long-context run: an 8,200-token synthetic
+          prompt (33,220 chars of real repo prose from plan.md + PHASE-LOG.md,
+          concatenated) driven with `--max-new 4 --max-context 16384
+          --prefill on`, launched detached with a `ps -o rss=` sampler taking
+          a reading every 5 s. 2,957 samples over 8,867 s (2h28m). Peak RSS
+          **1534 MB at t=5 s** — i.e. the peak is the weight-load spike, not
+          context growth; during the long prefill itself RSS sat at
+          **~700-1200 MB** and never rose above the load-time peak.
+Learned:  **The speed gate fails and it is not close: 2.298 tok/s against a
+          ≥4 tok/s bar, ~57% of target.** This is the honest, expected
+          outcome, consistent with every generation run since P3-4 (2.4-3.15
+          tok/s across P3-4/P4-x/P5-x/P6-1). It is the direct, documented
+          consequence of ADR-0001's deliberate "obviously-correct-over-fast"
+          choice for the DeltaNet block; P4-1 moved the recurrence itself to
+          Metal but the surrounding per-token decode loop is still largely
+          scalar and serial. That tradeoff is recorded and was not
+          relitigated here, and nothing was "fixed" to chase the number.
+          **The memory gate is met with real headroom.** The right reading of
+          "≤2 GB resident" is process RSS, and it is a meaningful number
+          precisely *because* the 35B weights are not all resident: only
+          `model_weights.bin` (1325 MB of shared/dense tensors) is loaded,
+          while `packed_experts/` (18 GB on disk, the bulk of the model) is
+          pread-streamed through the 16-slot expert cache. plan.md's own
+          budget line predicts this exactly — "~1.45 GB resident before the
+          expert cache" — and 1.565 GB measured against a 1.45 GB prediction
+          plus cache slots is a clean confirmation. KV is small by
+          construction: only the 10 full-attention layers carry one
+          (~20 KB/token, so ~164 MB even at 8K), and DeltaNet state is a
+          fixed ~63 MB that does not grow with context. So context length is
+          simply not the driver of RSS here — the weight load is, which is
+          why peak RSS landed at t=5 s.
+          Worth recording for whoever reads `/usr/bin/time -l` output next:
+          `peak memory footprint` was 6.0 GB while `maximum resident set
+          size` was 1.57 GB. The 6 GB figure counts pages touched across the
+          streamed expert file and is NOT resident memory; using it as the
+          gate number would produce a false failure.
+Unproven: **The 8-16K-context RSS figure is a partial measurement and should
+          not be reported as a completed run.** The 8,200-token prefill never
+          finished: after 2h28m wall (30m52s CPU, ~8% CPU — the process is
+          disk-I/O-bound on expert streaming, not compute-bound) it had still
+          not emitted a footer, and it was killed rather than waited out. Two
+          things made it worse and both are worth knowing: prefill throughput
+          on a long prompt is far below the short-prompt rate, and — the same
+          contamination trap that bit P6-2 — a *second* `TurboFieldfareCLI`
+          process from a different session (PID 6404, then 15617, both
+          `--max-new 60 --expert-cache-slots 16`) ran concurrently for much
+          of the window, halving available disk I/O and driving RSS down to
+          ~83 MB at one point through pure memory pressure. The RSS numbers
+          are therefore a *lower* bound during that stretch, not an inflated
+          one, so the ≤2 GB conclusion is safe in direction; but "RSS
+          measured while genuinely holding a settled 8-16K context" was NOT
+          obtained. The 2.298 tok/s decode figure is clean — it was taken
+          before any competing process started.
+          Also unproven: whether decode speed differs materially at 8-16K
+          context versus the 5-token context measured (no long-context
+          generation completed to report a footer).
+Next:     None in Phase 6 — P6-3 is the last task, and it did not pass, so
+          **the mission is NOT complete**: criterion "≥4 tok/s" is unmet.
+          Phase 6b exists precisely for this and is the honest continuation:
+          P6b-1 (expert LRU + pinning), P6b-2 (batched offset-sorted expert
+          prefetch), P6b-3 (prefill expert dedup), P6b-4 (speculative
+          decoding). P6-1's finding that hit rate climbs monotonically 8->32
+          slots, and the strong per-layer skew it found, both point at P6b-1/
+          P6b-2 as the highest-value next moves; this run's observation that
+          the process sits at ~8% CPU while I/O-bound is independent evidence
+          that the bottleneck is expert streaming, not arithmetic. Carried
+          forward, still open and untouched: Qwen chat-template Gemma marker
+          leakage, the unreachable chunked-prefill `isFull ? attnK` v_proj
+          bug, the P6-1 counters' missing prefill/decode phase split, the
+          per-layer cache-slot skew, and `AppContextLengthOption`'s stale
+          32K/64K choices. New from this task: long-prompt prefill is slow
+          enough (>2.5h for 8K tokens under contention) that any future
+          long-context measurement needs a progress indicator on the prefill
+          loop, and the machine must be verified idle first.
