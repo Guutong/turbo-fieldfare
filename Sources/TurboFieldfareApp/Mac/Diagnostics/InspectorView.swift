@@ -30,7 +30,7 @@ struct InspectorView: View {
         panel.allowsMultipleSelection = false
         panel.prompt = "Open"
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        model.setModelURL(url)
+        model.setModelURL(url, verifyInstallation: false)
     }
 
     private var modelSection: some View {

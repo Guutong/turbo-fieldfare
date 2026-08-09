@@ -353,6 +353,20 @@ import Testing
     }
 
     @MainActor
+    @Test func settingModelURLWithoutVerificationTrustsTheDirectory() {
+        let model = AppModel(client: MockInferenceClient(),
+                             installer: MockModelInstallerClient())
+        let localURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("app-model-local-\(UUID().uuidString).gturbo",
+                                    isDirectory: true)
+
+        model.setModelURL(localURL, verifyInstallation: false)
+
+        #expect(model.installationStatus == .complete)
+        #expect(!model.requiresModelInstallation)
+    }
+
+    @MainActor
     private func readyModel(client: MockInferenceClient) -> AppModel {
         let model = AppModel(client: client)
         model.modelPathText = FileManager.default.temporaryDirectory.path

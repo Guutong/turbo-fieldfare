@@ -272,7 +272,18 @@ public final class AppModel {
         temperature != 0
     }
 
-    public func setModelURL(_ url: URL) {
+    /// - Parameter verifyInstallation: When true (the default, used for
+    ///   catalog entries), `installationStatus` comes from
+    ///   `AppModelInstallationProbe`, which checks the directory against
+    ///   `AppModelInstallDescriptor.default`'s pinned checksum/receipt —
+    ///   correct for models the app itself downloaded. Pass false for a
+    ///   directory the user picked directly (e.g. via an Open panel for a
+    ///   locally-repacked model with no catalog entry and no install
+    ///   receipt): the probe would otherwise always report it as
+    ///   missing/partial, since it can never match a pinned descriptor it
+    ///   wasn't installed against. The CLI trusts an explicit `--model`
+    ///   path the same way, with no install-verification step at all.
+    public func setModelURL(_ url: URL, verifyInstallation: Bool = true) {
         guard !isRunning else { return }
         let path = url.standardizedFileURL.path
         guard path != modelPathText else { return }
@@ -296,8 +307,12 @@ public final class AppModel {
         diagnostics = nil
         error = nil
         phase = .idle
-        installationStatus = AppModelInstallationProbe.status(at: URL(fileURLWithPath: path))
-        refreshInstallReadiness()
+        if verifyInstallation {
+            installationStatus = AppModelInstallationProbe.status(at: URL(fileURLWithPath: path))
+            refreshInstallReadiness()
+        } else {
+            installationStatus = .complete
+        }
 
         if let lifecycle = client as? AppModelLifecycleClient {
             unloadGeneration &+= 1
