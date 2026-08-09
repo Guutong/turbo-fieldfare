@@ -92,6 +92,7 @@ smaller tasks in `plan.md`, add them to the board with new IDs, and stop with
 | P6b-2 | Batch expert prefetch disk-offset order | DONE | kimi-k3 inspired · 3-phase acquire, offset-sorted phase 2, queue depth 16 · measured NEUTRAL on NVMe (sorted 2.592 vs unsorted 2.660 tok/s mean of 3, within noise) — see History |
 | P6b-3 | Prefill expert dedup | DONE | kimi-k3 inspired · chunked dedup doesn't apply (sequential prefill is causally serial); measured the existing cache's dedup benefit instead — prefill hit rate 58.53%, ioReduction 2.41x (gate >=2x) — see History |
 | P6b-4 | Speculative decoding | TODO | kimi-k3 inspired · frontier |
+| P6b-5 | F_NOCACHE on expert fd | FAILED | research-suggested (llama.cpp #18758 cited +46%) · measured NEUTRAL on this NVMe machine (baseline 2.265/2.214, F_NOCACHE 2.285/2.061 tok/s across 2 runs each — within run-to-run noise, no measurable win) — see History |
 | P3-1 | DeltaNet conv1d + state (Swift) | DONE | 5 hand-checked tests; 662/662 suite |
 | P3-2 | Delta rule + gating (Swift) | DONE | 16 tests; 678/678 suite; oracle-verified |
 | P3-3 | Layer-0 isolation test | DONE | Real repack (LayerWriter fix) into scratch/qwen36.gturbo; gate passes relL2≤0.0075, maxAbs≤0.0039 — see History |
@@ -1561,3 +1562,41 @@ Next:     P6b-4 (speculative decoding) — the last Phase 6b task. Given this
           chunked-prefill `isFull ? attnK` v_proj bug, and
           `AppContextLengthOption`'s stale 32K/64K choices (now also
           directly relevant to the in-progress Mac-app settings-UI work).
+
+### 2026-08-09 — P6b-5 — TODO -> FAILED (F_NOCACHE on expert fd, measured neutral)
+Did:      Added `fcntl(fd, F_NOCACHE, 1)` on the expert-weight file descriptor
+          in `PreadExpertStreamer.swift`'s init, gated behind a new
+          `TFF_EXPERT_NOCACHE` env toggle (default on), following the same
+          A/B-escape-hatch pattern as `TFF_EXPERT_PREFETCH_SORT` (P6b-2).
+          Motivated by external research (llama.cpp discussion #18758)
+          citing +46% throughput from F_NOCACHE on a comparable
+          expert-streaming workload, reasoning that bypassing the OS page
+          cache for these transient, never-reused expert reads should stop
+          them evicting resident backbone-weight pages. Grepped first to
+          confirm the flag was not already set anywhere in the file — it
+          was not.
+Ran:      Same command as P6-3's speed measurement, run twice per config for
+          noise:
+          `TFF_EXPERT_NOCACHE={0,1} ./.build/release/TurboFieldfareCLI
+          --model scratch/qwen36.gturbo --prompt "The capital of France is"
+          --temperature 0 --max-new 48 --prefill off`
+          Baseline (off): 2.265 tok/s, 2.214 tok/s.
+          F_NOCACHE (on): 2.285 tok/s, 2.061 tok/s.
+          `swift test --filter PreadExpertStreamer` — 31/31 pass, unaffected.
+Learned:  **Neutral, no measurable win — consistent with P6b-2's finding,
+          not the external citation.** The four numbers (2.06-2.29 tok/s)
+          overlap entirely within run-to-run noise; F_NOCACHE's on-run mean
+          (2.173) is actually slightly *below* the off-run mean (2.240).
+          Same root cause as P6b-2's neutral result: this machine's storage
+          is NVMe/APFS, not the rotational or memory-pressured storage the
+          cited case was likely running against, so there's no page-cache
+          contention this flag actually relieves here — the backbone
+          weights and the expert cache slots are both small enough
+          (1.5-1.6GB total resident, well under this machine's real RAM)
+          that page-cache eviction pressure was never the bottleneck.
+          Left the code in place (default-on, zero measured harm) with the
+          toggle available for future re-measurement on a different machine
+          shape, rather than reverting it — but this does **not** close the
+          P6-3 speed gate. Next candidate per the research plan: item 2,
+          draft-driven expert prefetch, once P6b-4 (speculative decoding,
+          still running) reports back.

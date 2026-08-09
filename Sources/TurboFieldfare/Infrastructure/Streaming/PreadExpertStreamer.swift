@@ -179,6 +179,12 @@ public final class PreadExpertStreamer: @unchecked Sendable {
     /// sorted vs router-order issue. Default on.
     static let prefetchSortEnabled =
         ProcessInfo.processInfo.environment["TFF_EXPERT_PREFETCH_SORT"] != "0"
+    /// P6b-5: A/B escape hatch for F_NOCACHE on the expert weight file
+    /// descriptor. Bypassing the OS page cache for these transient,
+    /// never-reused expert reads keeps it from evicting the resident
+    /// backbone weights' pages. Default on; measure sorted-off to confirm.
+    static let noCacheEnabled =
+        ProcessInfo.processInfo.environment["TFF_EXPERT_NOCACHE"] != "0"
 
     public let layout: StreamLayout
     public let slotCount: Int
@@ -260,6 +266,10 @@ public final class PreadExpertStreamer: @unchecked Sendable {
         self.fd = openedFD
         var closeFDOnFailure = true
         defer { if closeFDOnFailure { close(openedFD) } }
+
+        if Self.noCacheEnabled {
+            _ = fcntl(openedFD, F_NOCACHE, 1)
+        }
 
         var fileStats = stat()
         guard fstat(openedFD, &fileStats) == 0,
