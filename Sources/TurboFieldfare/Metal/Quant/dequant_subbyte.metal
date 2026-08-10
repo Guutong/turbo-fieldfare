@@ -311,5 +311,5 @@ kernel void dequant_int8_gemv_generic(
 ) {
     constexpr uint rows_per_tg = 8;
     dequant_subbyte_gemv_body<8>(W, scales, biases, x, y, M, N, groupSize,
-                                  rows_per_tg, tg_idx, sg_idx, lane);
+                                  rows_per_tg, tg_idx, sg_idx, lane, 1u);
 }
