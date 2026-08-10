@@ -22,6 +22,12 @@ Generation controls apply to the next request and do not require a model
 reload. They are interactive product settings, not the fixed community
 benchmark protocol.
 
+## Required arguments
+
+| Argument | CLI flag | Required | Effect |
+| --- | --- | --- | --- |
+| Model directory | `--model <dir>` | Yes | Points the CLI at a `.gturbo` model directory on disk. The directory must contain a valid `manifest.json` and `model_weights.bin`. |
+
 ## Runtime settings
 
 | Control | Mac values | CLI flag | Production default | Effect |

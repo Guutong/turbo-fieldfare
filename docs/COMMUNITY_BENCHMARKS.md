@@ -133,6 +133,18 @@ for reference, not as a controlled hardware comparison.
 Prompt length, generated tokens, storage, cache state, and the number of runs
 all affect decode speed.
 
+### Submit a result
+
+To submit a new measurement, run the benchmark protocol above and open an issue
+with the results file. The issue title must follow the format:
+
+```
+Benchmark: <chip>, <memory>, <macOS version>
+```
+
+Include the system info, summary footer, and any notes about power mode or
+workload. The community results table below lists all submitted runs.
+
 | Source | Mac | Memory | Storage | Prompt / generated tokens | Decode | Measurement |
 | --- | --- | ---: | --- | ---: | ---: | --- |
 | [bangddong](https://github.com/bangddong) · [issue #80](https://github.com/drumih/turbo-fieldfare/issues/80) | A18 Pro MacBook Neo | 8 GB | Internal SSD | 61 / 516 | 4.134 tok/s | One submitted run |
