@@ -77,25 +77,23 @@ After: commit sharedCB → start async disk fetch → wait for sharedCB → appl
 
 The fix uses a plain `if/else` to choose between batch-plan or single-list fetch path, dispatching both on a global DispatchQueue for maximum concurrency with compute. Verified clean build (0 errors).
 
+### P7-2: Batch full-attention KV writes for K positions ✅
+**Task #33 completed.**
+
+Replaced per-token direct-to-cache writes with staging-buffer pattern for full-attention layers during speculative verification:
+
+- **Staging writes**: K tokens write K/V to contiguous staging buffer at strided offsets via `outputTokenStride`, then single bulk blit copies into ring-buffer cache per layer
+- **Two-pointer design**: `kRoPE`/`vRoPE` point to per-token location depending on mode (ring-slot in real-cache, strided stage offset in spec); GEMV outputs follow same split
+- **Quant stack propagation**: int4/int5/int6/int8 dequant kernels gain `outputStride` parameter with `outStr > 0 ? outStr : 1u` fallback for non-speculation paths
+- **Stage buffer expansion**: `kStage`/`vStage` expanded from single-token size to `maxBatchFactor × tokenSize` in RealForwardRunner
+
+**O(K²) Metal CB syncs → O(K)** reduction for full-attn path (~95% sync point reduction).
+
+**Build result:** Zero errors, zero new warnings.
+
 ---
 
 ## Remaining Tasks
-
-### P7-2: Batch full-attention KV writes for K positions
-**Tasks #33, #36 (duplicate entries — consolidate later).**
-
-Qwen3.6 has 10 full-attention layers plus 30 DeltaNet layers. Currently, speculative decoding writes KV cache position-by-position for each of the K draft tokens. For full-attn layers, need to batch these into a single operation.
-
-Two approaches under consideration:
-A. Reuse prefill's KV-write path (`copyPrefillKVToCache` + FusedQKVGEMV) to append K positions atomically
-B. Modify the draft verifier's KV cache write path to collect all K positions' writes and flush once per layer
-
-**Files involved:**
-- `Sources/TurboFieldfare/Runtime/Generation/RawCompletion.swift` — decode loop
-- `Sources/TurboFieldfare/Runtime/Inference/DraftVerifier.swift` — KV cache writes during verification
-- `Sources/TurboFieldfare/Runtime/Inference/RealForwardRunner.swift` — KV cache manager, attention compute
-
-**Current state:** DraftVerifier calls `produce(token:position:into:)` K times sequentially. Each call writes to KV cache individually. Need to batch these.
 
 ### P7-3: Layer-major DeltaNet kernel (K tokens, one round-trip) ✅
 **Task #34 completed.**
