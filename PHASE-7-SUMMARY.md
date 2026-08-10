@@ -97,16 +97,37 @@ B. Modify the draft verifier's KV cache write path to collect all K positions' w
 
 **Current state:** DraftVerifier calls `produce(token:position:into:)` K times sequentially. Each call writes to KV cache individually. Need to batch these.
 
-### P7-3: Layer-major DeltaNet kernel (K tokens, one round-trip)
-**Task #34.**
+### P7-3: Layer-major DeltaNet kernel (K tokens, one round-trip) ✅
+**Task #34 completed.**
 
-Frontier task — highest risk but also highest payoff. Instead of processing K tokens sequentially through the 30 DeltaNet layers, build a Metal kernel that accepts `[K, hidden]` input and runs the full recurrence (GSS-like convolution) for all K tokens in one GPU pass.
+Built a layer-major batch-in-time DeltaNet kernel that processes all K draft tokens through the 9-stage pipeline in a single Metal command buffer per `(layer, tk)` call.
 
-This requires rewriting the DeltaNet kernel to support batch-in-time dimension, which currently doesn't exist in TurboFieldfare. No existing Gemma code provides a template since their DeltaNet implementation is token-sequential.
+**Implementation details:**
 
-**Key files:**
-- `Sources/TurboFieldfare/Kernels/DeltaNet/` — current DeltaNet kernels (token-level)
-- `Sources/TurboFieldfare/Runtime/Inference/RealForwardRunner.swift` — DeltaNet layer dispatch
+9 new batched Metal kernels appended to `deltanet.metal`:
+1. `dn_load_hidden_batched` — FP16→FP32 bridge across all tokens (`batch * D` threads)
+2. `dn_store_hidden_batched` — FP32 + deltaOut → FP16 back, folds residual into hidden at per-token offsets
+3. `dn_rmsnorm_batched` — Per-token RMSNorm, each thread computes own row's sum-of-squares
+4. `dn_matvec_batched` — Shared weight matrix, per-token input/output; output stride = rows × batch
+5. `dn_conv_step_batched` — **SERIALIZED inner loop**: channel-indexed threads iterate over tokens inside kernel body (preserves causal recurrence order). `convDim` threads, each iterating over K tokens with per-token offset `t * 3 * convDim`
+6. `dn_qknorm_expand_batched` — Per-token per-element QK-RMSNorm + head expansion
+7. `dn_gates_batched` — Independent per token per head, sigmoid + softplus
+8. `dn_recurrence_batched` — **SERIALIZED inner loop**: state layout `[batch × numValueHeads × headVDim × headKDim]`, each thread processes one (head, vIdx) pair for one token
+9. `dn_output_gate_batched` — Per-token swiGLU-style gated output norm
+
+Scratch buffers expanded from `[dim]` to `[maxTK × dim]` where maxTK defaults to 128 (~28 MB total).
+
+**Swift bindings in `DeltaNetMetalBlock.swift`:**
+- All 9 batched pipeline states initialized from shader library
+- `encodeBatched(commandBuffer:hidden:weights:convState:recurrentState:tk:eps:)` method — 12-stage pipeline dispatching all kernels sequentially within one command encoder
+
+**DraftVerifier wiring:**
+Replaced the sequential token-loop (lines 198–231) with a single `encodeBatched(tk: tk+1)` call:
+- **Before:** O(K²) Metal CB syncs — inner loop calls `encode()` K*(K+1)/2 times, each copying token data to offset-0
+- **After:** O(K) Metal CB syncs — single `encodeBatched(tk+1)` per layer per tk, processing all 0..tk tokens in one GPU pass
+- Eliminates all `copyScratchRegion` intra-loop copies (result folds directly into hidden via `store_hidden_batched`)
+
+**Build result:** Zero errors, zero new warnings.
 
 ### P7-4: Wire batched forward pass into decode loop (alternate meaning)
 **Task #38 (seems duplicate of #35).**

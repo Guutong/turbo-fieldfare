@@ -180,7 +180,7 @@ enum DraftVerifier {
                     layerPlans.removeAll()
                 }
 
-                // ── DeltaNet branch ────────────────────────────────────
+                // ── DeltaNet branch — batch-in-time via encodeBatched ────
                 if isLinear {
                     guard let deltaNet = runner.deltaNet,
                           let weightsCache = runner.deltaNetWeights,
@@ -191,42 +191,22 @@ enum DraftVerifier {
                         preconditionFailure(
                             "qwen36 topology requires DeltaNet state/weights")
                     }
-                    // DeltaNetMetalBlock.encode has NO hiddenOffset param.
-                    // Copy token tk into offset-0 tile, run encode(),
-                    // accumulate. Each encode() reads+modifies the same
-                    // recurrent/conv state.
+                    // encodeBatched(tk+1) processes tokens 0..tk in a single
+                    // Metal command buffer per tk.  Each call recomputes all
+                    // previously seen tokens from their original inputs (same
+                    // semantic as the sequential encode()-loop above) but
+                    // collapses O(K²) Metal CB syncs down to O(K).
+                    // Result folds into hidden at per-token offsets via
+                    // store_hidden_batched, so no post-copy is needed.
                     let cb = queue.makeCommandBuffer()!
-                    for k in 0..<tk + 1 {
-                        // Copy token k's hidden from its slot to offset 0.
-                        let srcOffset = k * Int(D)
-                                   * MemoryLayout<Float16>.stride
-                        let dstOffset = 0
-                        copyScratchRegion(from: hidden,
-                                          srcStart: srcOffset,
-                                          dstStart: dstOffset,
-                                          byteCount: Int(D)
-                                                  * MemoryLayout<Float16>
-                                                          .stride)
-                        deltaNet.encode(commandBuffer: cb,
-                                        hidden: hidden,
-                                        weights: try weightsCache.weights(
-                                            layer: L),
-                                        convState: convState,
-                                        recurrentState: recurrentState,
-                                        eps: eps)
-                    }
-                    // Copy accumulated result back to token tk's slot.
-                    if tk > 0 {
-                        let srcOffset = 0
-                        let dstOffset = tk * Int(D)
-                               * MemoryLayout<Float16>.stride
-                        copyScratchRegion(from: hidden,
-                                          srcStart: srcOffset,
-                                          dstStart: dstOffset,
-                                          byteCount: Int(D)
-                                                  * MemoryLayout<Float16>
-                                                          .stride)
-                    }
+                    deltaNet.encodeBatched(commandBuffer: cb,
+                                           hidden: hidden,
+                                           weights: try weightsCache.weights(
+                                               layer: L),
+                                           convState: convState,
+                                           recurrentState: recurrentState,
+                                           tk: tk + 1,
+                                           eps: eps)
                     cb.commit()
                     waitForCommandBuffer(cb)
                     try checkCmdError(cb.error)

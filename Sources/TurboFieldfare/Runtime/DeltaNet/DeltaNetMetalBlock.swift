@@ -174,27 +174,46 @@ final class DeltaNetMetalBlock {
     private let psoRecurrence: MTLComputePipelineState
     private let psoOutputGate: MTLComputePipelineState
 
-    // Per-token scratch, allocated once and reused across layers. About
-    // 220 KB total at Qwen3.6 shape.
-    private let xBuf: MTLBuffer          // [D]
-    private let normedBuf: MTLBuffer     // [D]
-    private let qkvBuf: MTLBuffer        // [convDim]
-    private let convOutBuf: MTLBuffer    // [convDim]
-    private let zBuf: MTLBuffer          // [valueDim]
-    private let aRawBuf: MTLBuffer       // [numValueHeads]
-    private let bRawBuf: MTLBuffer       // [numValueHeads]
-    private let qExpBuf: MTLBuffer       // [numValueHeads * headKDim]
-    private let kExpBuf: MTLBuffer       // [numValueHeads * headKDim]
-    private let betaBuf: MTLBuffer       // [numValueHeads]
-    private let gBuf: MTLBuffer          // [numValueHeads]
-    private let yBuf: MTLBuffer          // [valueDim]
-    private let gatedBuf: MTLBuffer      // [valueDim]
-    private let deltaOutBuf: MTLBuffer   // [D]
+    // MARK: - Batched pipelines.
 
-    init(context: MetalContext, hiddenSize: Int, dims: DeltaNetDimensions) throws {
+    private let psoLoadHiddenB: MTLComputePipelineState
+    private let psoStoreHiddenB: MTLComputePipelineState
+    private let psoRMSNormB: MTLComputePipelineState
+    private let psoMatVecB: MTLComputePipelineState
+    private let psoConvStepB: MTLComputePipelineState
+    private let psoQKNormExpandB: MTLComputePipelineState
+    private let psoGatesB: MTLComputePipelineState
+    private let psoRecurrenceB: MTLComputePipelineState
+    private let psoOutputGateB: MTLComputePipelineState
+
+    /// Conservative max draft count for scratch-buffer sizing. Actual tk at
+    /// encoding time must never exceed this. 128 covers typical Mac hardware.
+    static let defaultMaxTK = 128
+
+    // Per-token scratch, allocated once and reused across layers. About
+    // 220 KB total at Qwen3.6 shape. Batched paths require [maxTK × dim].
+    private let maxTK: Int
+    private let xBuf: MTLBuffer          // [maxTK × D]
+    private let normedBuf: MTLBuffer     // [maxTK × D]
+    private let qkvBuf: MTLBuffer        // [maxTK × convDim]
+    private let convOutBuf: MTLBuffer    // [maxTK × convDim]
+    private let zBuf: MTLBuffer          // [maxTK × valueDim]
+    private let aRawBuf: MTLBuffer       // [maxTK × numValueHeads]
+    private let bRawBuf: MTLBuffer       // [maxTK × numValueHeads]
+    private let qExpBuf: MTLBuffer       // [maxTK × expandedKeyDim]
+    private let kExpBuf: MTLBuffer       // [maxTK × expandedKeyDim]
+    private let betaBuf: MTLBuffer       // [maxTK × numValueHeads]
+    private let gBuf: MTLBuffer          // [maxTK × numValueHeads]
+    private let yBuf: MTLBuffer          // [maxTK × valueDim]
+    private let gatedBuf: MTLBuffer      // [maxTK × valueDim]
+    private let deltaOutBuf: MTLBuffer   // [maxTK × D]
+
+    init(context: MetalContext, hiddenSize: Int, dims: DeltaNetDimensions,
+         maxTK: Int = DeltaNetMetalBlock.defaultMaxTK) throws {
         self.ctx = context
         self.dims = dims
         self.D = hiddenSize
+        self.maxTK = maxTK
 
         psoLoadHidden = try context.pipeline("dn_load_hidden")
         psoStoreHidden = try context.pipeline("dn_store_hidden")
@@ -205,6 +224,17 @@ final class DeltaNetMetalBlock {
         psoGates = try context.pipeline("dn_gates")
         psoRecurrence = try context.pipeline("dn_recurrence")
         psoOutputGate = try context.pipeline("dn_output_gate")
+
+        // Batched pipelines.
+        psoLoadHiddenB  = try context.pipeline("dn_load_hidden_batched")
+        psoStoreHiddenB = try context.pipeline("dn_store_hidden_batched")
+        psoRMSNormB     = try context.pipeline("dn_rmsnorm_batched")
+        psoMatVecB      = try context.pipeline("dn_matvec_batched")
+        psoConvStepB    = try context.pipeline("dn_conv_step_batched")
+        psoQKNormExpandB = try context.pipeline("dn_qknorm_expand_batched")
+        psoGatesB       = try context.pipeline("dn_gates_batched")
+        psoRecurrenceB  = try context.pipeline("dn_recurrence_batched")
+        psoOutputGateB  = try context.pipeline("dn_output_gate_batched")
 
         let valueDim = dims.numValueHeads * dims.headVDim
         let expandedKeyDim = dims.numValueHeads * dims.headKDim
@@ -217,20 +247,20 @@ final class DeltaNetMetalBlock {
             b.label = "deltanet.\(label)"
             return b
         }
-        xBuf = try buf(hiddenSize, "x")
-        normedBuf = try buf(hiddenSize, "normed")
-        qkvBuf = try buf(dims.convDim, "qkv")
-        convOutBuf = try buf(dims.convDim, "conv_out")
-        zBuf = try buf(valueDim, "z")
-        aRawBuf = try buf(dims.numValueHeads, "a_raw")
-        bRawBuf = try buf(dims.numValueHeads, "b_raw")
-        qExpBuf = try buf(expandedKeyDim, "q_expanded")
-        kExpBuf = try buf(expandedKeyDim, "k_expanded")
-        betaBuf = try buf(dims.numValueHeads, "beta")
-        gBuf = try buf(dims.numValueHeads, "g")
-        yBuf = try buf(valueDim, "y")
-        gatedBuf = try buf(valueDim, "gated")
-        deltaOutBuf = try buf(hiddenSize, "gated_out")
+        xBuf = try buf(maxTK * hiddenSize, "x")
+        normedBuf = try buf(maxTK * hiddenSize, "normed")
+        qkvBuf = try buf(maxTK * dims.convDim, "qkv")
+        convOutBuf = try buf(maxTK * dims.convDim, "conv_out")
+        zBuf = try buf(maxTK * valueDim, "z")
+        aRawBuf = try buf(maxTK * dims.numValueHeads, "a_raw")
+        bRawBuf = try buf(maxTK * dims.numValueHeads, "b_raw")
+        qExpBuf = try buf(maxTK * expandedKeyDim, "q_expanded")
+        kExpBuf = try buf(maxTK * expandedKeyDim, "k_expanded")
+        betaBuf = try buf(maxTK * dims.numValueHeads, "beta")
+        gBuf = try buf(maxTK * dims.numValueHeads, "g")
+        yBuf = try buf(maxTK * valueDim, "y")
+        gatedBuf = try buf(maxTK * valueDim, "gated")
+        deltaOutBuf = try buf(maxTK * hiddenSize, "gated_out")
     }
 
     // MARK: - Encoding.
@@ -373,6 +403,143 @@ final class DeltaNetMetalBlock {
         enc.setBuffer(deltaOutBuf, offset: 0, index: 2)
         enc.setBytes(&d, length: MemoryLayout<UInt32>.size, index: 3)
         dispatch(enc, psoStoreHidden, threads: D)
+
+        enc.endEncoding()
+    }
+
+    // MARK: - Batched encoding.
+
+    /// Encodes `tk` tokens' DeltaNet layer in one pass: hidden[tokens 0..tk-1].
+    ///
+    /// Reads from and writes back into `hidden` at offsets `[t*D .. (t+1)*D]`
+    /// for each token t. All scratch buffers must therefore have capacity
+    /// >= tk × D. State buffers expand to per-token layout as well.
+    func encodeBatched(commandBuffer cb: MTLCommandBuffer,
+                       hidden: MTLBuffer,
+                       weights: LayerWeights,
+                       convState: MTLBuffer,
+                       recurrentState: MTLBuffer,
+                       tk: Int,
+                       eps: Float = 1e-6) {
+        guard let enc = cb.makeComputeCommandEncoder() else { return }
+        enc.label = "deltanet.batched"
+        let keyDim = dims.numKeyHeads * dims.headKDim
+        let valueDim = dims.numValueHeads * dims.headVDim
+        let expandedKeyDim = dims.numValueHeads * dims.headKDim
+        let floatSize = MemoryLayout<Float>.size
+        var k32 = UInt32(tk), d32 = UInt32(D)
+        var epsValue = eps
+
+        // hidden (FP16) -> x (fp32).
+        enc.setBuffer(hidden, offset: 0, index: 0)
+        enc.setBuffer(xBuf, offset: 0, index: 1)
+        enc.setBytes(&k32, length: MemoryLayout<UInt32>.size, index: 2)
+        enc.setBytes(&d32, length: MemoryLayout<UInt32>.size, index: 3)
+        dispatch(enc, psoLoadHiddenB, threads: tk * D)
+
+        // Input RMSNorm.
+        enc.setBuffer(xBuf, offset: 0, index: 0)
+        enc.setBuffer(weights.inputNorm, offset: 0, index: 1)
+        enc.setBuffer(normedBuf, offset: 0, index: 2)
+        enc.setBytes(&k32, length: MemoryLayout<UInt32>.size, index: 3)
+        enc.setBytes(&d32, length: MemoryLayout<UInt32>.size, index: 4)
+        enc.setBytes(&epsValue, length: MemoryLayout<Float>.size, index: 5)
+        dispatch(enc, psoRMSNormB, threads: tk * D)
+
+        // Projections — batched mat-vec on all tk tokens at once.
+        matVec(enc, w: weights.qkv, x: normedBuf, y: qkvBuf,
+               rows: dims.convDim * tk, cols: D)
+        matVec(enc, w: weights.z, x: normedBuf, y: zBuf,
+               rows: valueDim * tk, cols: D)
+        matVec(enc, w: weights.a, x: normedBuf, y: aRawBuf,
+               rows: dims.numValueHeads * tk, cols: D)
+        matVec(enc, w: weights.b, x: normedBuf, y: bRawBuf,
+               rows: dims.numValueHeads * tk, cols: D)
+
+        // Causal conv1d + silu, per-token state in convState.
+        enc.setBuffer(qkvBuf, offset: 0, index: 0)
+        enc.setBuffer(weights.conv, offset: 0, index: 1)
+        enc.setBuffer(convState, offset: 0, index: 2)
+        enc.setBuffer(convOutBuf, offset: 0, index: 3)
+        var convDim = UInt32(dims.convDim)
+        enc.setBytes(&k32, length: MemoryLayout<UInt32>.size, index: 4)
+        enc.setBytes(&convDim, length: MemoryLayout<UInt32>.size, index: 5)
+        dispatch(enc, psoConvStepB, threads: dims.convDim)
+
+        // QK-RMSNorm fused with head expansion. q occupies first keyDim lanes,
+        // k occupies next keyDim. Both outputs go to separate per-token buffers.
+        var numKeyHeads = UInt32(dims.numKeyHeads)
+        var numValueHeads = UInt32(dims.numValueHeads)
+        var headKDim = UInt32(dims.headKDim)
+        func qkNorm(sourceBuf: MTLBuffer, sourceOffset: Int,
+                    outBuf: MTLBuffer, scale: Float) {
+            enc.setBuffer(sourceBuf, offset: sourceOffset, index: 0)
+            enc.setBuffer(outBuf, offset: 0, index: 1)
+            enc.setBytes(&numKeyHeads, length: MemoryLayout<UInt32>.size, index: 2)
+            enc.setBytes(&numValueHeads, length: MemoryLayout<UInt32>.size, index: 3)
+            enc.setBytes(&headKDim, length: MemoryLayout<UInt32>.size, index: 4)
+            var s = scale
+            enc.setBytes(&s, length: MemoryLayout<Float>.size, index: 5)
+            var e = DeltaNetQKNorm.eps
+            enc.setBytes(&e, length: MemoryLayout<Float>.size, index: 6)
+            dispatch(enc, psoQKNormExpandB, threads: expandedKeyDim * tk)
+        }
+        qkNorm(sourceBuf: convOutBuf, sourceOffset: 0,
+               outBuf: qExpBuf,
+               scale: DeltaNetQKNorm.qScale(headKDim: dims.headKDim))
+        qkNorm(sourceBuf: convOutBuf,
+               sourceOffset: keyDim * MemoryLayout<Float>.size * tk,
+               outBuf: kExpBuf,
+               scale: DeltaNetQKNorm.kScale(headKDim: dims.headKDim))
+
+        // beta / g gates.
+        enc.setBuffer(aRawBuf, offset: 0, index: 0)
+        enc.setBuffer(bRawBuf, offset: 0, index: 1)
+        enc.setBuffer(weights.aLog, offset: 0, index: 2)
+        enc.setBuffer(weights.dtBias, offset: 0, index: 3)
+        enc.setBuffer(betaBuf, offset: 0, index: 4)
+        enc.setBuffer(gBuf, offset: 0, index: 5)
+        enc.setBytes(&numValueHeads, length: MemoryLayout<UInt32>.size, index: 6)
+        enc.setBytes(&k32, length: MemoryLayout<UInt32>.size, index: 7)
+        dispatch(enc, psoGatesB, threads: dims.numValueHeads * tk)
+
+        // Gated delta-rule recurrence; v is the tail of the conv output.
+        enc.setBuffer(qExpBuf, offset: 0, index: 0)
+        enc.setBuffer(kExpBuf, offset: 0, index: 1)
+        enc.setBuffer(convOutBuf, offset: 2 * keyDim * floatSize * tk, index: 2)
+        enc.setBuffer(betaBuf, offset: 0, index: 3)
+        enc.setBuffer(gBuf, offset: 0, index: 4)
+        enc.setBuffer(recurrentState, offset: 0, index: 5)
+        enc.setBuffer(yBuf, offset: 0, index: 6)
+        var headVDim = UInt32(dims.headVDim)
+        enc.setBytes(&numValueHeads, length: MemoryLayout<UInt32>.size, index: 7)
+        enc.setBytes(&headVDim, length: MemoryLayout<UInt32>.size, index: 8)
+        enc.setBytes(&headKDim, length: MemoryLayout<UInt32>.size, index: 9)
+        enc.setBytes(&k32, length: MemoryLayout<UInt32>.size, index: 10)
+        dispatch(enc, psoRecurrenceB, threads: valueDim * tk)
+
+        // Gated RMSNorm / swiglu output gate.
+        enc.setBuffer(yBuf, offset: 0, index: 0)
+        enc.setBuffer(zBuf, offset: 0, index: 1)
+        enc.setBuffer(weights.deltaNorm, offset: 0, index: 2)
+        enc.setBuffer(gatedBuf, offset: 0, index: 3)
+        var count = UInt32(valueDim)
+        enc.setBytes(&count, length: MemoryLayout<UInt32>.size, index: 4)
+        enc.setBytes(&headVDim, length: MemoryLayout<UInt32>.size, index: 5)
+        enc.setBytes(&epsValue, length: MemoryLayout<Float>.size, index: 6)
+        enc.setBytes(&k32, length: MemoryLayout<UInt32>.size, index: 7)
+        dispatch(enc, psoOutputGateB, threads: valueDim * tk)
+
+        // out_proj, then fold back into FP16 residual stream.
+        matVec(enc, w: weights.out, x: gatedBuf, y: deltaOutBuf,
+               rows: D * tk, cols: valueDim)
+
+        enc.setBuffer(hidden, offset: 0, index: 0)
+        enc.setBuffer(xBuf, offset: 0, index: 1)
+        enc.setBuffer(deltaOutBuf, offset: 0, index: 2)
+        enc.setBytes(&k32, length: MemoryLayout<UInt32>.size, index: 3)
+        enc.setBytes(&d32, length: MemoryLayout<UInt32>.size, index: 4)
+        dispatch(enc, psoStoreHiddenB, threads: tk * D)
 
         enc.endEncoding()
     }
