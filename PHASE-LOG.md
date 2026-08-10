@@ -1799,3 +1799,52 @@ overlap that `produceToken` already has. Clean build, zero errors.
 - **#34 — Layer-major DeltaNet kernel**: K-token batch-in-time convolution kernel to
   eliminate O(K²) sequential round-trips through 30 DeltaNet layers. Highest risk/benefit.
 - **Measure throughput**: Verify ≥4 tok/s gate is met with current batched impl on real hardware.
+
+### Router scoring bug found and fixed (2026-08-10)
+
+**Blocker:** repacking `qwen36.gturbo` from the local `mlx-community/Qwen3.6-35B-A3B-4bit`
+checkpoint left the model unloadable — `Model.routerSelectionBias` threw looking for
+`e_score_correction_bias`, which the checkpoint's `model.safetensors.index.json` never
+contains (checked directly: 2090 tensors, zero named `correction`/`e_score`). Neither
+local checkpoint (4-bit or 5-bit under `~/.exo/models/`) has it either — it isn't a
+partial/corrupt download.
+
+**Root cause:** `ArchConfig.qwen36_35B_A3B` (`ModelTypes.swift`) had
+`routerScoring: .sigmoidTopK`, apparently copied from the `lagunaS2_1` config
+immediately above it rather than read from source, despite `HANDOFF.md`'s own Risk R2
+warning to do exactly that. Read mlx_lm's actual `qwen3_next.py` (present in this repo's
+`.venv`) end to end: `Qwen3NextSparseMoeBlock` is plain softmax-over-all-experts top-K
+with **no** scale, gain, or bias tensor at all — not DeepSeek/Laguna-style
+sigmoid+`e_score_correction_bias`. The checkpoint was correct all along; the arch config
+was wrong.
+
+**Fix:** added `RouterScoring.softmaxTopKPlain` (`ModelTypes.swift`), reusing the
+existing Gemma4 kernel path (`encodeGemma4Block`/`encodeRouterGemma4`) with the
+identity (all-ones) scale/gain buffers that already existed for the dense-MLP case,
+instead of throwing when `router.scale`/`router.per_expert_scale` are absent. Only the
+prefill dispatch site (`RealForwardRunner.swift`) needed restructuring into a 3-way
+switch — decode and `DraftVerifier` were already keyed off `isQwen36`/topology booleans
+and needed no change. Fixed the repacker's `model_type → routerScoring` mapping in
+`ArchInfo.swift` (`qwen3_5_moe`/`qwen3_5_moe_text`/`qwen3_next` now map to
+`softmaxTopKPlain`; `laguna` still correctly maps to `sigmoidTopK`, which is genuine
+DeepSeek-V3-style routing). Commit `e7f5f78`.
+
+**Verified:** `swift test` — 42/42 relevant tests pass (2 pre-existing `ArchInfoTests`
+failures are unrelated, confirmed by diff scope: neither touches `model_type` or
+`routerScoring`). Repacked `qwen36.gturbo` from the existing local checkpoint (no
+re-download needed) and `--verify-install` passed (47 files, 19.5 GB). Two greedy
+raw-completion generations came back fluent and correct (capital-of-France, a haiku).
+
+**Benchmark (draft, not yet a valid published number):** ran the frozen
+`short-explanation` prompt from `docs/benchmark-prompts/real-generation-v1/` through
+the `--messages-file` path: `prefill=78tok new=1024tok decode=281.85s tok/s=3.633`.
+Content was coherent and on-topic, but the run ended on `stop=maxTokens`, not
+`stop=endOfTurn` as `COMMUNITY_BENCHMARKS.md` requires for a countable result — the
+model kept generating past a natural stopping point and started emitting literal
+`<|turn>`/`<channel|>` control-token text. This is the already-tracked **"Qwen
+chat-template Gemma marker leakage"** item from the Phase 6b carry-forward list above,
+not a new bug: `Tokenizer.swift` resolves `endOfTurnID` from the Gemma-specific
+`<turn|>` token, which doesn't exist in Qwen3.6's ChatML-style vocabulary, so it
+silently resolves to id 0 and never fires. Still open; `3.633 tok/s` should be treated
+as a rough draft number until that's fixed and the run re-measured with a clean
+`stop=endOfTurn`.

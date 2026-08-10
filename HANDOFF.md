@@ -55,11 +55,24 @@ MoE (all 40 layers — mlp_only_layers is ABSENT, so there are no dense layers)
   moe_intermediate_size 512    shared_expert_intermediate_size 512
 ```
 
-**Unverified — must be read out of mlx-lm before writing the router:** `scoring_func`,
-`norm_topk_prob`, and `moe_routed_scaling_factor` are all ABSENT from config.json, so
-they fall back to defaults in the modeling code. Qwen3-MoE historically uses
-softmax + `norm_topk_prob`, but the Qwen3-Next/DeltaNet family may differ. **Getting
-this wrong produces exactly the Laguna failure mode: fluent words, incoherent text.**
+**Verified 2026-08-10, read out of mlx_lm's actual `qwen3_next.py`
+(`Qwen3NextSparseMoeBlock`, which `qwen3_5_moe.py` reuses verbatim):** plain
+`nn.Linear(D, numExperts, bias=false)` → softmax over *all* experts → top-K →
+renormalize to sum to 1 (`norm_topk_prob` defaults `True` in `qwen3_5.ModelArgs`,
+matching the absent config key). No `router.scale` input scaling, no
+`router.per_expert_scale` output gain, no selection bias, and — contrary to the
+guess below — **not** sigmoid/`e_score_correction_bias`. This codebase had it
+wrong: `ArchConfig.qwen36_35B_A3B` was set to `.sigmoidTopK` (copied from
+Laguna), which is exactly the R2 failure mode this section warned about. Fixed
+by adding `RouterScoring.softmaxTopKPlain`; see commit
+`e7f5f78` and Risk R2 below.
+
+~~**Unverified — must be read out of mlx-lm before writing the router:**
+`scoring_func`, `norm_topk_prob`, and `moe_routed_scaling_factor` are all ABSENT
+from config.json, so they fall back to defaults in the modeling code. Qwen3-MoE
+historically uses softmax + `norm_topk_prob`, but the Qwen3-Next/DeltaNet family
+may differ. **Getting this wrong produces exactly the Laguna failure mode:
+fluent words, incoherent text.**~~
 
 ## Memory budget (4-bit, estimated)
 
@@ -216,6 +229,13 @@ Tune the hot-expert cache for 256-way granularity, enforce the context cap, meas
   exercises all three against a real oracle, which Laguna never had.
 - **R2 — Wrong router scoring.** Silently produces fluent-but-incoherent text — the exact
   Laguna symptom. *Mitigation:* Phase 0 reads it from source; Phase 2 asserts on expert ids.
+  **This actually happened** (2026-08-10): `qwen36_35B_A3B` shipped with `.sigmoidTopK`,
+  copied from Laguna without reading mlx_lm's `qwen3_next.py`. Surfaced as a load-time
+  crash (missing `e_score_correction_bias`, which real Qwen3.6 checkpoints never carry)
+  rather than silent incoherence, so this instance was easier to catch than the mitigation
+  assumed. Fixed by adding `RouterScoring.softmaxTopKPlain`; repack + verify-install pass
+  and two greedy generations (capital-of-France, a haiku) came back coherent. Commit
+  `e7f5f78`. See PHASE-LOG.md for the full trace.
 - **R3 — Expert cache thrash.** 256 fine-grained experts reuse worse across tokens than
   Gemma's fatter ones, and 320 reads/token of 1.77 MB is a fragmented I/O pattern.
   *Mitigation:* measure hit rate in Phase 6 before optimizing.
