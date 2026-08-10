@@ -166,6 +166,42 @@ public enum ExpertCachePolicy: String, Sendable {
     case lfu
 }
 
+/// A batched expert-cache plan for K tokens' worth of router selections.
+///
+/// Unlike `ExpertCachePlan` which serves one token's top-K experts, this struct
+/// represents one planning call that accepts K × topK candidate expert IDs,
+/// deduplicates them across all K tokens, and returns a single fetch plan plus
+/// a per-[token][expert] slot-index lookup so the MoE kernel can drive from the
+/// right slot per position without CPU-GPU sync.
+public struct BatchedExpertCachePlan: Sendable {
+    /// The unified fetch plan — deduplicated experts + their slots.
+    public let plan: ExpertCachePlan
+
+    /// `slotIndices[tokenIndex][expertInTopK]` → the deduped slot index into
+    /// `slotPointers` / `slotBuffers`, or -1 when the deduped plan found no
+    /// slot yet (should not happen after execution). Kept parallel to the
+    /// original `[token][expert]` topology so the MoE kernel doesn't need
+    /// to reshape anything on the CPU side before encoding.
+    public let slotIndices: [[Int]]
+
+    /// How many unique experts were fetched across all K tokens.
+    public var uniqueFetchCount: Int { plan.misses.count }
+
+    /// Total lookups performed (K × topK per layer).
+    public var totalLookups: Int { plan.experts.count }
+
+    /// Hit rate across all tokens.
+    public var hitRate: Double {
+        guard totalLookups > 0 else { return 0 }
+        return Double(plan.hits) / Double(totalLookups)
+    }
+
+    public init(plan: ExpertCachePlan, slotIndices: [[Int]]) {
+        self.plan = plan
+        self.slotIndices = slotIndices
+    }
+}
+
 /// `pread`-based routed-expert streamer with a fixed per-layer slot cache.
 public final class PreadExpertStreamer: @unchecked Sendable {
     public static let scratchAlignment = 2 * 1024 * 1024
@@ -405,6 +441,69 @@ public final class PreadExpertStreamer: @unchecked Sendable {
     public func planExpertsCachedIfPossible(experts: [Int],
                                             avoidingSlots: Set<Int> = []) -> ExpertCachePlan? {
         makeExpertCachePlan(experts: experts, avoidingSlots: avoidingSlots)
+    }
+
+    // MARK: - Batched multi-token planning (P7-1)
+
+    /// Plan a cached expert fetch for K tokens' router selections in ONE call.
+    ///
+    /// Accepts `tokens` where each element is an array of `topK` expert IDs
+    /// selected by the layer's router for that token. All K × topK candidate
+    /// IDs are flattened, deduplicated, and fed to the existing cache planner;
+    /// the result is a combined `BatchedExpertCachePlan` with:
+    ///  - `plan`: standard `ExpertCachePlan` over the deduplicated set
+    ///  - `slotIndices[K][topK]`: maps every [token][expert] back to its
+    ///    assigned slot so the MoE kernel can drive from the right blob
+    ///
+    /// This collapses what would be K separate cache plans (and thus K round
+    /// trips to disk for distinct misses) into one — enabling the layer-major
+    /// execution path Phase 7 targets.
+    public func planExpertsCached(tokens: [[Int]],
+                                  avoidingSlots: Set<Int> = []) -> BatchedExpertCachePlan {
+        // Collect all unique expert IDs in stable order (first occurrence wins).
+        let topK = tokens.first?.count ?? 0
+        precondition(!tokens.isEmpty && topK > 0, "tokens must be non-empty with topK > 0")
+        precondition(tokens.allSatisfy { $0.count == topK },
+                     "all tokens must have the same topK count")
+
+        var seenExperts = [Int: Int]() // expertID → flat index
+        var flatExperts = [Int]()     // flat index → expertID
+        for tokExperts in tokens {
+            for eid in tokExperts {
+                if seenExperts[eid] == nil {
+                    seenExperts[eid] = flatExperts.count
+                    flatExperts.append(eid)
+                }
+            }
+        }
+
+        // Build the [flatIndex] → [(tokenIdx, expertInTopK)] lookup.
+        var flatToPositions = [Int: [(t: Int, e: Int)]]()
+        for (tIdx, tokExperts) in tokens.enumerated() {
+            for (eIdx, eid) in tokExperts.enumerated() {
+                let fi = seenExperts[eid]!
+                flatToPositions[fi, default: []].append((tIdx, eIdx))
+            }
+        }
+
+        // Plan across ALL unique experts at once — cache hits and misses merged.
+        let plan = planExpertsCached(experts: flatExperts, avoidingSlots: avoidingSlots)
+
+        // Look up the slot for each flat expert via plan's assignment map.
+        let flatSlotFor = { (flatIdx: Int) -> Int in
+            plan.assignedSlots[flatIdx]
+        }
+
+        // Wire up per-token slot indices.
+        var slotIndices = tokens.map { _ in [Int](repeating: -1, count: topK) }
+        for (fi, positions) in flatToPositions {
+            let slot = flatSlotFor(fi)
+            for (tIdx, eIdx) in positions {
+                slotIndices[tIdx][eIdx] = slot
+            }
+        }
+
+        return BatchedExpertCachePlan(plan: plan, slotIndices: slotIndices)
     }
 
     private func makeExpertCachePlan(experts: [Int],

@@ -17,6 +17,32 @@ public struct RoutedExpertFetchPlan: Sendable {
     }
 }
 
+/// Batched wrapper around a per-layer `BatchedExpertCachePlan`.
+/// Carries the unified plan plus a `[K][topK]` slot-index table so the
+/// MoE kernel can drive from (tokenIdx, expertTopKIdx) → blob via lookup.
+public struct RoutedExpertBatchFetchPlan: Sendable {
+    public let layer: Int
+    public let batchPlan: BatchedExpertCachePlan
+
+    /// Number of tokens in the batch.
+    public var tokenCount: Int { batchPlan.slotIndices.count }
+    /// Top-K per token.
+    public var topK: Int { batchPlan.slotIndices.first?.count ?? 0 }
+    /// Unique experts in the combined resident set (= flat plan size).
+    public var experts: [Int] { batchPlan.plan.experts }
+    /// Experts that miss in cache (need disk fetch).
+    public var misses: [Int] { batchPlan.plan.misses }
+    /// Total expert selections across all tokens (= K * topK).
+    public var totalLookups: Int { batchPlan.totalLookups }
+    /// Distinct expert selections that resolved to a hit.
+    public var hits: Int { batchPlan.plan.hits }
+
+    public init(layer: Int, batchPlan: BatchedExpertCachePlan) {
+        self.layer = layer
+        self.batchPlan = batchPlan
+    }
+}
+
 extension Model {
     public func routedExpertOffsets(layer: Int) -> MoEExpertOffsets {
         let expert = packedExpertsLayout.expert(layer: layer, expert: 0)
@@ -83,6 +109,77 @@ extension Model {
             return nil
         }
         return RoutedExpertFetchPlan(layer: layer, cachePlan: cachePlan)
+    }
+
+    // MARK: - Batched multi-token expert planning (P7-1)
+
+    /// Plan cached-expert fetch for K tokens' router selections across one layer.
+    /// Collapses K×topK candidate experts into a single deduplicated plan.
+    public func planRoutedExperts(layer: Int,
+                                  tokens: [[Int]],
+                                  avoidingSlots: Set<Int> = []) throws -> RoutedExpertBatchFetchPlan? {
+        try ensureLayerOpened(layer)
+        let streamer = streamersQueue.sync { streamersBox.streamers[layer]! }
+        let validSlots = Set(avoidingSlots.filter { $0 >= 0 && $0 < streamer.slotCount })
+        let batchPlan = streamer.planExpertsCached(tokens: tokens, avoidingSlots: validSlots)
+        return RoutedExpertBatchFetchPlan(layer: layer, batchPlan: batchPlan)
+    }
+
+    /// Execute a batched plan and return tensor views keyed by token-index then
+    /// expert-topK-index. Returns `[TensorView][tokenIdx][topKIdx]`.
+    public func fetchRoutedExperts(plan: RoutedExpertBatchFetchPlan) async throws
+        -> [[TensorView]] {
+        try ensureLayerOpened(plan.layer)
+        let streamer = streamersQueue.sync { streamersBox.streamers[plan.layer]! }
+        // Execute once on the unified plan — all tokens share the resident set.
+        let buffers = try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    let raw = try streamer.executeExpertCachePlan(plan.batchPlan.plan)
+                    continuation.resume(returning: Self.makeBatchedExpertViews(raw, plan: plan))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+        return buffers
+    }
+
+    private static func makeBatchedExpertViews(
+        _ flatBuffers: [(buffer: MTLBuffer, offset: UInt64, size: UInt64)],
+        plan: RoutedExpertBatchFetchPlan
+    ) -> [[TensorView]] {
+        // flatBuffers[i] ↔ plan.batchPlan.plan.experts[i] ↔ plan.experts[i].
+        let viewsPerFlat = flatBuffers.enumerated().map { fi, entry -> TensorView in
+            TensorView(
+                buffer: entry.buffer,
+                offset: entry.offset,
+                length: entry.size,
+                scaleOffset: 0,
+                scaleLength: 0,
+                biasOffset: 0,
+                biasLength: 0,
+                shape: (UInt32(plan.layer), UInt32(plan.experts[fi]), 0, 0),
+                dtype: GTurboFormatV1.DType.u32.rawValue)
+        }
+
+        // assignedSlots[flatIdx] = slotIdx. Invert for reverse lookup.
+        let assignedSlots = plan.batchPlan.plan.assignedSlots
+        var slotToFlat = [Int: Int](minimumCapacity: assignedSlots.count)
+        for (flatIdx, slotIdx) in assignedSlots.enumerated() {
+            slotToFlat[slotIdx] = flatIdx
+        }
+
+        // Per-token: each slotIndex → TensorView via slot→flat lookup.
+        return plan.batchPlan.slotIndices.map { slotRow -> [TensorView] in
+            slotRow.map { slotIdx -> TensorView in
+                guard slotIdx >= 0, let fi = slotToFlat[slotIdx] else {
+                    // Invalid/unallocated slot — shouldn't happen if planning is correct.
+                    preconditionFailure("invalid slot \(slotIdx) for layer \(plan.layer)")
+                }
+                return viewsPerFlat[fi]
+            }
+        }
     }
 
     /// P6b-1: pin the slots a committed encode is reading so a later plan for

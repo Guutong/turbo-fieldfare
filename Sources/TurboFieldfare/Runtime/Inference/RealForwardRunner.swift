@@ -130,43 +130,47 @@ internal enum PrefillProjectionDispatchPolicy {
     }
 }
 
-public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporting, ContinuableLogitProducer, @unchecked Sendable {
-    private struct LayerSharedExpertProjections {
-        let gate: SharedExpertInt8Proj
-        let up: SharedExpertInt8Proj
-        let down: SharedExpertInt8Proj
-        /// nil under `.preNorm`, which does not norm the shared/dense branch
-        /// output on its way to the residual.
-        let postF1: TensorView?
-    }
+/// Per-layer shared (dense) expert projections for Qwen3.6 / Gemma-style
+/// shared-expert MLP branches. Placed here at module scope so DraftVerifier
+/// can index into ``sharedExpertProjections`` without tripping Swift's access
+/// rule that blocks internal properties whose element type is private.
+internal struct LayerSharedExpertProjections {
+    let gate: SharedExpertInt8Proj
+    let up: SharedExpertInt8Proj
+    let down: SharedExpertInt8Proj
+    /// nil under `.preNorm`, which does not norm the shared/dense branch
+    /// output on its way to the residual.
+    let postF1: TensorView?
+}
 
-    private let model: Model
-    private let ctx: MetalContext
-    private let kv: KVCacheManager?
-    private let cfg: ArchConfig
+public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporting, ContinuableLogitProducer, @unchecked Sendable {
+    internal let model: Model
+    internal let ctx: MetalContext
+    internal let kv: KVCacheManager?
+    internal let cfg: ArchConfig
 
     // Kernels
-    private let embedInt4: EmbedLookupInt4
-    private let rms: RMSNorm
-    private let int4: DequantInt4GEMV
-    private let attention: Attention
-    private let shared: SharedExpertRuntime
-    private let moe: MoE
-    private let fusionHead: LMHeadChainInt4
-    private let fusedQKVGEMV: FusedQKVGEMV
+    internal let embedInt4: EmbedLookupInt4
+    internal let rms: RMSNorm
+    internal let int4: DequantInt4GEMV
+    internal let attention: Attention
+    internal let shared: SharedExpertRuntime
+    internal let moe: MoE
+    internal let fusionHead: LMHeadChainInt4
+    internal let fusedQKVGEMV: FusedQKVGEMV
     /// Wider-than-4-bit QKV projections, keyed by width. Empty for every
     /// checkpoint whose attention is uniformly 4-bit — which is every
     /// checkpoint that runs today — so this costs nothing to carry and the
     /// 4-bit dispatch below is reached by exactly the same path it always was.
-    private let fusedQKVGEMVWide: [Int: FusedQKVGEMVGeneric]
+    internal let fusedQKVGEMVWide: [Int: FusedQKVGEMVGeneric]
     /// Attention `(weightBits, groupSize)` per layer, resolved once at init.
     /// Looking it up per token would re-walk the manifest's override table
     /// inside the decode loop for no benefit.
-    private let attentionQuantByLayer: [(weightBits: Int, groupSize: Int)]
-    private let fusedQKVEpilogue: FusedQKVEpilogue
-    private let fusedPostAttentionSetup: FusedPostAttentionSetup
-    private let fusedTail: FusedLayerTail
-    private let elementwiseAdd: ElementwiseAdd
+    internal let attentionQuantByLayer: [(weightBits: Int, groupSize: Int)]
+    internal let fusedQKVEpilogue: FusedQKVEpilogue
+    internal let fusedPostAttentionSetup: FusedPostAttentionSetup
+    internal let fusedTail: FusedLayerTail
+    internal let elementwiseAdd: ElementwiseAdd
 
     // Prefill kernels. These are initialized once per runner so the chunk path
     // cannot accidentally rebuild PSOs inside a per-layer loop.
@@ -187,35 +191,35 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     private let prefillFinalRowHead: PrefillFinalRowHeadInt4
 
     // Scratch — preallocated per spec'd D / F / vocab.
-    private let hidden: MTLBuffer        // [D] FP16
+    internal let hidden: MTLBuffer        // [D] FP16
     private let normed: MTLBuffer        // [D] FP16
-    private let attnOut: MTLBuffer       // [N_HEADS * head_dim] FP16
-    private let qScratch: MTLBuffer      // [N_HEADS * head_dim] FP16
+    internal let attnOut: MTLBuffer       // [N_HEADS * head_dim] FP16
+    internal let qScratch: MTLBuffer      // [N_HEADS * head_dim] FP16
     /// Qwen3.6 gated attention: `q_proj` emits `[N_HEADS, 2 * head_dim]` —
     /// per head the first `head_dim` lanes are the query and the second are the
     /// output gate. `qRawScratch` takes the full 2x projection, which is then
     /// de-interleaved into `qScratch` (query) and `qGateScratch` (gate).
     /// Unused (and zero-length) for topologies without gated attention.
-    private let qRawScratch: MTLBuffer
+    internal let qRawScratch: MTLBuffer
     private let qGateScratch: MTLBuffer
-    private let kStage: MTLBuffer        // [max KV heads * head_dim] FP16, current token
-    private let vStage: MTLBuffer        // [max KV heads * head_dim] FP16, current token
+    internal let kStage: MTLBuffer        // [max KV heads * head_dim] FP16, current token
+    internal let vStage: MTLBuffer        // [max KV heads * head_dim] FP16, current token
     private let oOut: MTLBuffer          // [D] FP16
-    private let h1Buf: MTLBuffer         // [D] FP16 (dense MLP output)
-    private let h2Buf: MTLBuffer         // [D] FP16 (routed output)
-    private let routedX: MTLBuffer       // [D] FP16 (pre_feedforward_layernorm_2 output)
-    private let denseX: MTLBuffer        // [D] FP16 (pre_feedforward_layernorm output)
-    private let denseScratchGate: MTLBuffer // [F=2112] FP16
-    private let denseScratchUp: MTLBuffer   // [F=2112] FP16
-    private let denseScratchAct: MTLBuffer  // [F=2112] FP16
-    private let routerInput: MTLBuffer   // [D] FP16 (rmsnorm_no_scale(h))
-    private let zeroResidual: MTLBuffer  // [D] FP16 zeros — for routed branch base
-    private let outIndices: MTLBuffer    // [topK] UInt32
-    private let outWeights: MTLBuffer    // [topK] FP16
+    internal let h1Buf: MTLBuffer         // [D] FP16 (dense MLP output)
+    internal let h2Buf: MTLBuffer         // [D] FP16 (routed output)
+    internal let routedX: MTLBuffer       // [D] FP16 (pre_feedforward_layernorm_2 output)
+    internal let denseX: MTLBuffer        // [D] FP16 (pre_feedforward_layernorm output)
+    internal let denseScratchGate: MTLBuffer // [F=2112] FP16
+    internal let denseScratchUp: MTLBuffer   // [F=2112] FP16
+    internal let denseScratchAct: MTLBuffer  // [F=2112] FP16
+    internal let routerInput: MTLBuffer   // [D] FP16 (rmsnorm_no_scale(h))
+    internal let zeroResidual: MTLBuffer  // [D] FP16 zeros — for routed branch base
+    internal let outIndices: MTLBuffer    // [topK] UInt32
+    internal let outWeights: MTLBuffer    // [topK] FP16
     // Persistent MoE scratch, allocated once; about 56 KiB at production shape.
-    private let moeActs: MTLBuffer       // [topK * FmoE] FP16
-    private let moeHitActiveSlots: MTLBuffer // [topK] UInt32
-    private let moeMissActiveSlots: MTLBuffer // [topK] UInt32
+    internal let moeActs: MTLBuffer       // [topK * FmoE] FP16
+    internal let moeHitActiveSlots: MTLBuffer // [topK] UInt32
+    internal let moeMissActiveSlots: MTLBuffer // [topK] UInt32
     private let greedyTokenBuf: MTLBuffer // 4 B UInt32 fused-head output
     private var prefillChunkState = PrefillChunkCommitState()
     private var prefillScratch: PrefillChunkScratchBuffers?
@@ -227,10 +231,21 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     private static let rdadviseAdaptiveSlowCallNanos: UInt64 = 1_000_000
     private static let prefillRoutedTileSchedulerConfig = PrefillRoutedTileSchedulerConfig()
 
+    /// Max draft tokens for batched forward pass. Matches NGramSpeculatorConfig.maxDraft.
+    private static let maxBatchFactor: Int = 8
+
+    /// Returns `count * maxBatchFactor` when `enabled` is true, else `count`.
+    /// Only scratch/work buffers use this; KV-cache, weights, and per-position
+    /// staging buffers stay at their base size.
+    @inline(__always)
+    private static func scratchSize(_ count: Int, enabled speculationEnabled: Bool) -> Int {
+        speculationEnabled ? count * Self.maxBatchFactor : count
+    }
+
     /// Per-layer `router.scale * D^-0.5` pre-folded into one BF16 buffer
     /// allocation per layer. ~168 KB total at 30 layers × 2816 BF16 — bounded
     /// host work done once at init. For Qwen3.6 (no router.scale), all-ones.
-    private let effectiveScaleBuffers: [MTLBuffer]
+    internal let effectiveScaleBuffers: [MTLBuffer]
     /// Dummy all-ones per_expert_scale for Qwen3.6 (Gemma uses real tensor).
     private let dummyPerExpertScale: MTLBuffer?
     /// BF16 all-ones `[numExperts]` buffer. `.sigmoidTopK` models have no
@@ -239,20 +254,20 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     /// weight by 1.0 is exact, so this is a no-op numerically. Used by the
     /// generalized (prefill) sigmoid-router path; `dummyPerExpertScale` above
     /// remains the decode-loop's Qwen3.6-specific counterpart.
-    private let routerOnesPerExpert: MTLBuffer
-    private let sharedExpertProjections: [LayerSharedExpertProjections]
+    internal let routerOnesPerExpert: MTLBuffer
+    internal let sharedExpertProjections: [LayerSharedExpertProjections]
 
     // P4-1: DeltaNet on Metal with GPU-resident conv/recurrent state, for
     // Qwen3.6's 30 linear layers (P3-4 ran the same chain in plain Swift
     // fp32 on the CPU; `DeltaNetCPUBlock` remains as the parity oracle).
     // nil for topologies with no DeltaNet layers (e.g. Gemma).
-    private let deltaNet: DeltaNetMetalBlock?
-    private let deltaNetWeights: DeltaNetMetalBlock.WeightsCache?
-    private let deltaNetState: DeltaNetMetalBlock.GPUStateStore?
+    internal let deltaNet: DeltaNetMetalBlock?
+    internal let deltaNetWeights: DeltaNetMetalBlock.WeightsCache?
+    internal let deltaNetState: DeltaNetMetalBlock.GPUStateStore?
 
     /// Qwen3.6's per-token sigmoid gate on the shared expert. nil for Gemma,
     /// which has no `mlp.shared_expert_gate`.
-    private var sharedExpertGate: SharedExpertGateWeights?
+    internal var sharedExpertGate: SharedExpertGateWeights?
 
     public let maxContext: Int
 
@@ -365,40 +380,52 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             }
             return b
         }
-        self.hidden        = try buf(D)
-        self.normed        = try buf(D)
-        self.attnOut       = try buf(maxQ)
-        self.qScratch      = try buf(maxQ)
-        self.qRawScratch   = try buf(cfg.topology == .qwen36 ? 2 * maxQ : 0)
-        self.qGateScratch  = try buf(cfg.topology == .qwen36 ? maxQ : 0)
-        self.kStage        = try buf(max(cfg.numKVHeads * cfg.headDim,
-                                         cfg.numFullKVHeads * cfg.fullHeadDim))
-        self.vStage        = try buf(max(cfg.numKVHeads * cfg.headDim,
-                                         cfg.numFullKVHeads * cfg.fullHeadDim))
-        self.oOut          = try buf(D)
-        self.h1Buf         = try buf(D)
-        self.h2Buf         = try buf(D)
-        self.routedX       = try buf(D)
-        self.denseX        = try buf(D)
-        self.denseScratchGate = try buf(F)
-        self.denseScratchUp   = try buf(F)
-        self.denseScratchAct  = try buf(F)
-        self.routerInput   = try buf(D)
-        self.zeroResidual  = try buf(D)
+
+        // When speculation is enabled, scratch buffers hold data for up to
+        // K = maxBatchFactor concurrent draft tokens.  Slot 0 is the primary
+        // decode position; slots 1..K-1 are reserved for the DraftVerifier.
+        let specEnabled = runtimeConfiguration.enableSpeculation
+        let batchSize  = Self.scratchSize(D, enabled: specEnabled)
+        let qBatchSize = Self.scratchSize(maxQ, enabled: specEnabled)
+        let fBatch     = Self.scratchSize(F, enabled: specEnabled)
+        let moeBatch   = Self.scratchSize(cfg.moeIntermediateSize, enabled: specEnabled)
+
+        self.hidden          = try buf(batchSize)
+        self.normed          = try buf(batchSize)
+        self.attnOut         = try buf(qBatchSize)
+        self.qScratch        = try buf(qBatchSize)
+        self.qRawScratch     = try buf(cfg.topology == .qwen36 ? 2 * qBatchSize : 0)
+        self.qGateScratch    = try buf(cfg.topology == .qwen36 ? qBatchSize : 0)
+        // kStage / vStage map to one KV-cache slot each — DO NOT SCALE.
+        self.kStage          = try buf(max(cfg.numKVHeads * cfg.headDim,
+                                           cfg.numFullKVHeads * cfg.fullHeadDim))
+        self.vStage          = try buf(max(cfg.numKVHeads * cfg.headDim,
+                                           cfg.numFullKVHeads * cfg.fullHeadDim))
+        self.oOut            = try buf(batchSize)
+        self.h1Buf           = try buf(batchSize)
+        self.h2Buf           = try buf(batchSize)
+        self.routedX         = try buf(batchSize)
+        self.denseX          = try buf(batchSize)
+        self.denseScratchGate = try buf(fBatch)
+        self.denseScratchUp   = try buf(fBatch)
+        self.denseScratchAct  = try buf(fBatch)
+        self.routerInput     = try buf(batchSize)
+        self.zeroResidual    = try buf(batchSize)
         // The routed MoE kernel seeds y[d] = residual[d]; pinning this buffer
         // to zero once at init makes the routed branch's residual contribution
         // exactly zero (it's combined with the dense MLP downstream).
         memset(self.zeroResidual.contents(), 0, self.zeroResidual.length)
-        self.outIndices    = try buf(cfg.topKExperts, MemoryLayout<UInt32>.size)
-        self.outWeights    = try buf(cfg.topKExperts)
-        self.moeActs       = try buf(cfg.topKExperts * cfg.moeIntermediateSize)
+        // Control arrays do not scale with K — they track topK experts only.
+        self.outIndices      = try buf(cfg.topKExperts, MemoryLayout<UInt32>.size)
+        self.outWeights      = try buf(cfg.topKExperts)
+        self.moeActs         = try buf(cfg.topKExperts * moeBatch)
         self.moeHitActiveSlots = try buf(cfg.topKExperts, MemoryLayout<UInt32>.size)
         self.moeMissActiveSlots = try buf(cfg.topKExperts, MemoryLayout<UInt32>.size)
         guard let tok = device.makeBuffer(length: MemoryLayout<UInt32>.size,
                                           options: .storageModeShared) else {
             throw ModelError.residentBufferWrapFailed
         }
-        self.greedyTokenBuf = tok
+        self.greedyTokenBuf  = tok
 
         func sharedProj(_ view: TensorView, rows: UInt32, cols: UInt32) -> SharedExpertProjection {
             SharedExpertProjection(weights: view.buffer,
@@ -525,7 +552,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     /// `qScratch` (query, first half of each head) and `qGateScratch` (output
     /// gate, second half) — the layout `mx.split(..., 2, axis=-1)` produces in
     /// `Qwen3NextAttention`.
-    private func splitGatedQProjection(qDim: Int, headDim: Int) {
+    internal func splitGatedQProjection(qDim: Int, headDim: Int) {
         let raw = qRawScratch.contents().assumingMemoryBound(to: Float16.self)
         let q = qScratch.contents().assumingMemoryBound(to: Float16.self)
         let gate = qGateScratch.contents().assumingMemoryBound(to: Float16.self)
@@ -541,7 +568,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     }
 
     /// `attnOut *= sigmoid(gate)`, applied before o_proj.
-    private func applyAttentionOutputGate(qDim: Int) {
+    internal func applyAttentionOutputGate(qDim: Int) {
         let out = attnOut.contents().assumingMemoryBound(to: Float16.self)
         let gate = qGateScratch.contents().assumingMemoryBound(to: Float16.self)
         for i in 0..<qDim {
@@ -578,10 +605,10 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     ///
     /// `postF2`/`postF` are nil and `layerScalar` is 1.0 under `.preNorm`; the
     /// pre-norm kernel takes neither.
-    private func encodeDecodeLayerTail(_ cb: MTLCommandBuffer,
-                                       postF2: TensorView?,
-                                       postF: TensorView?,
-                                       layerScalar: Float) {
+    public func encodeDecodeLayerTail(_ cb: MTLCommandBuffer,
+                                      postF2: TensorView?,
+                                      postF: TensorView?,
+                                      layerScalar: Float) {
         let D = UInt32(model.config.hiddenSize)
         switch model.config.normTopology {
         case .preNorm:

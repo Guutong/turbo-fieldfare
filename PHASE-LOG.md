@@ -1765,3 +1765,37 @@ Next:     **Phase 6b is now complete — P6b-1, P6b-2, P6b-3, P6b-4 all DONE**
           leakage, unreachable chunked-prefill `isFull ? attnK` v_proj bug,
           `AppContextLengthOption`'s stale 32K/64K choices, and the untracked
           `Scripts/parse_resident_index.py` still sitting in the working tree.
+
+## Phase 7: Batched speculative decoding for Qwen3.6 (qwen3_5_moe)
+
+**Status:** In progress. Core scaffolding built and wired in.
+
+### Completed
+
+#### P7-1: Batched routed-expert cache plan across K tokens (#32)
+`planRoutedExperts(layer:tokens:avoidingSlots:)` in `ModelExpertIO.swift` collapses
+K×topK candidate experts into a single deduplicated `RoutedExpertBatchFetchPlan`,
+reducing per-layer disk seeks from K separate calls to one unified fetch.
+
+#### P7-4: Wire batched forward pass into decode loop (#35)
+The decode loop in `RawCompletion.swift` now calls `DraftVerifier.run()` for
+speculative verification. Acceptance logic handles partial matches (bonus token),
+full acceptance (continue serial path), and error fallback (reset speculator).
+
+#### finishPendingMoE implementation (#39)
+Replaced the stub that threw `ModelError.unsupportedArchFeature("BatchedMoE")` with
+a full layer-major MoE execution pipeline covering expert planning, shared FFN + gate,
+async disk fetch, phase-1 U16 load + activation, phase-2 reduce/scatter + down-project,
+and tail residual combine. Per-layer drain before emitting compute. All bug fixes applied:
+queue/moe references, gate scalar via SharedExpertGateWeights, checkCmdError, dead code removal.
+
+#### finishPendingMoE I/O-compute overlap fix
+Re-ordered Steps D (async fetch) and C (sharedCB wait + gate apply) so disk I/O
+starts **before** waiting for sharedFFN GPU completion. Restores the same I/O-compute
+overlap that `produceToken` already has. Clean build, zero errors.
+
+### Remaining
+
+- **#34 — Layer-major DeltaNet kernel**: K-token batch-in-time convolution kernel to
+  eliminate O(K²) sequential round-trips through 30 DeltaNet layers. Highest risk/benefit.
+- **Measure throughput**: Verify ≥4 tok/s gate is met with current batched impl on real hardware.
