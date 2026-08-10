@@ -66,7 +66,8 @@ final class FusedQKVGEMVGeneric {
                 qRows: UInt32,
                 kvRows: UInt32,
                 n: UInt32,
-                groupSize: UInt32) {
+                groupSize: UInt32,
+                outputTokenStride: Int = 1) {
         precondition(n % groupSize == 0, "N must be a multiple of groupSize")
         precondition(groupSize % 32 == 0,
                      "the strided-lane loop needs a groupSize that is a multiple of 32")
@@ -96,10 +97,12 @@ final class FusedQKVGEMVGeneric {
         var kvVar = kvRows
         var nVar = n
         var gVar = groupSize
+        var strideVar = UInt32(outputTokenStride > 0 ? outputTokenStride : 1)
         enc.setBytes(&qVar, length: MemoryLayout<UInt32>.size, index: 13)
         enc.setBytes(&kvVar, length: MemoryLayout<UInt32>.size, index: 14)
         enc.setBytes(&nVar, length: MemoryLayout<UInt32>.size, index: 15)
         enc.setBytes(&gVar, length: MemoryLayout<UInt32>.size, index: 16)
+        enc.setBytes(&strideVar, length: MemoryLayout<UInt32>.size, index: 17)
 
         let totalRows = Int(qRows) + 2 * Int(kvRows)
         let tgCount = (totalRows + Self.rowsPerThreadgroup - 1) / Self.rowsPerThreadgroup

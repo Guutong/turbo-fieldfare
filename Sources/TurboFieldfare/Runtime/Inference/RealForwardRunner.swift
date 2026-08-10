@@ -396,11 +396,17 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         self.qScratch        = try buf(qBatchSize)
         self.qRawScratch     = try buf(cfg.topology == .qwen36 ? 2 * qBatchSize : 0)
         self.qGateScratch    = try buf(cfg.topology == .qwen36 ? qBatchSize : 0)
-        // kStage / vStage map to one KV-cache slot each — DO NOT SCALE.
+        // kStage / vStage are sized for one KV-cache slot per token position.
+        // When speculation is enabled the DraftVerifier writes K tokens'
+        // worth of QKV data into these buffers before batch-copying into the
+        // ring-buffer cache.
+        let kvScale = specEnabled ? Self.maxBatchFactor : 1
         self.kStage          = try buf(max(cfg.numKVHeads * cfg.headDim,
-                                           cfg.numFullKVHeads * cfg.fullHeadDim))
+                                           cfg.numFullKVHeads * cfg.fullHeadDim)
+                                       * kvScale)
         self.vStage          = try buf(max(cfg.numKVHeads * cfg.headDim,
-                                           cfg.numFullKVHeads * cfg.fullHeadDim))
+                                           cfg.numFullKVHeads * cfg.fullHeadDim)
+                                       * kvScale)
         self.oOut            = try buf(batchSize)
         self.h1Buf           = try buf(batchSize)
         self.h2Buf           = try buf(batchSize)

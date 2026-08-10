@@ -225,17 +225,63 @@ enum DraftVerifier {
                         outOffset: tokenOff,
                         d: D, eps: eps)
 
-                    // B) Fused QKV GEMV — data buffers hardcoded at offset 0
-                    // Copy token tk from its slot to offset-0 region first.
+                    // ── B) Fused QKV GEMV — batched write via staging buffers ───
+                    //
+                    // For spec decoding (runner.kv == nil): each token's K/V
+                    // goes to consecutive offsets in kStage/vStage using
+                    // outputTokenStride, and after all K tokens are written,
+                    // a single blit batch-copies them into the ring-buffer
+                    // cache.  When runner.kv != nil we use the real cache
+                    // slot path unchanged.
+                    //
+                    // In real-cache mode kRoPE/vRoPE resolve to the per-token
+                    // ring-slot.  In spec mode they resolve to per-token strided
+                    // stage offsets (tk * bytesPerKVToken) so each token's own
+                    // K/V data is visible to RoPE/attention — offset-0 would
+                    // always read token 0's stale data instead.
+                    let bytesPerKVToken = max(cfg.numFullKVHeads
+                                                    * cfg.fullHeadDim,
+                                              cfg.numKVHeads
+                                                    * cfg.headDim)
+                            * MemoryLayout<Float16>.stride
+                    let kvDimElements = max(cfg.numFullKVHeads
+                                            * cfg.fullHeadDim,
+                                            cfg.numKVHeads
+                                                    * cfg.headDim)
                     let attnQuant = runner.attentionQuantByLayer[L]
-                    let kSlot = runner.kv?.kSlot(
-                                    layer: L,
-                                    position: startKVPosition + tk)
-                                ?? (buffer: runner.kStage, offset: 0)
-                    let vSlot = runner.kv?.vSlot(
-                                    layer: L,
-                                    position: startKVPosition + tk)
-                                ?? (buffer: runner.vStage, offset: 0)
+
+                    // Pointers used by RoPE/attention/o_proj.
+                    // In spec mode, RoPE reads from the strided stage offset
+                    // (matching where GEMV wrote) so attention operates on the
+                    // correct per-token K/V.  In real-cache mode kRoPE=vSlot
+                    // resolve to the per-token ring-slot (autoregressive path).
+                    let kRoPE: (buffer: MTLBuffer, offset: Int) = runner.kv != nil
+                        ? runner.kv!.kSlot(layer: L, position: startKVPosition + tk)
+                        : (buffer: runner.kStage, offset: tk * bytesPerKVToken)
+                    let vRoPE: (buffer: MTLBuffer, offset: Int) = runner.kv != nil
+                        ? runner.kv!.vSlot(layer: L, position: startKVPosition + tk)
+                        : (buffer: runner.vStage, offset: tk * bytesPerKVToken)
+
+                    // GEMV write targets.  During speculation into the stage
+                    // buffer we write to strided offsets so K tokens batch
+                    // into one copy; during real-cache mode we go straight to
+                    // the per-token ring-slot.
+                    let kCache: (buffer: MTLBuffer, offset: Int) = runner.kv!
+                        .kSlot(layer: L, position: startKVPosition + tk)
+                    let vCache: (buffer: MTLBuffer, offset: Int) = runner.kv!
+                        .vSlot(layer: L, position: startKVPosition + tk)
+                    let kOutGEMV: (buffer: MTLBuffer, offset: Int) = runner.kv != nil
+                        ? (buffer: kCache.buffer, offset: kCache.offset)
+                        : (buffer: runner.kStage, offset: tk * bytesPerKVToken)
+                    let vOutGEMV: (buffer: MTLBuffer, offset: Int) = runner.kv != nil
+                        ? (buffer: vCache.buffer, offset: vCache.offset)
+                        : (buffer: runner.vStage, offset: tk * bytesPerKVToken)
+                    // Output stride controls row spacing inside the GEMV
+                    // output buffers.  In real-cache mode everything is
+                    // contiguous (stride = 1).  In speculation staging mode
+                    // each token's K/V lands at a different offset so the
+                    // batch copy later doesn't overwrite earlier ones.
+                    let outputTokenStride: Int = runner.kv != nil ? 1 : kvDimElements
 
                     // Copy token tk's hidden to offset 0 for kernel call.
                     copyScratchRegion(from: hidden,
@@ -275,15 +321,16 @@ enum DraftVerifier {
                             // NOTE: No xOffset — kernel hardcodes 0
                             x: hidden,
                             qOut: qScratch,
-                            kOut: kSlot.buffer,
-                            kOutOffset: kSlot.offset,
-                            vOut: vSlot.buffer,
-                            vOutOffset: vSlot.offset,
+                            kOut: kOutGEMV.buffer,
+                            kOutOffset: kOutGEMV.offset,
+                            vOut: vOutGEMV.buffer,
+                            vOutOffset: vOutGEMV.offset,
                             qRows: qDim,
                             kvRows: kvDim,
                             n: UInt32(D),
                             groupSize: UInt32(
-                                attnQuant.groupSize))
+                                attnQuant.groupSize),
+                            outputTokenStride: outputTokenStride)
                     } else {
                         runner.fusedQKVGEMV.encode(
                             commandBuffer: cb,
@@ -309,13 +356,14 @@ enum DraftVerifier {
                             x: hidden,
                             qOut: isGatedAttn
                                 ? qRawScratch : qScratch,
-                            kOut: kSlot.buffer,
-                            kOutOffset: kSlot.offset,
-                            vOut: vSlot.buffer,
-                            vOutOffset: vSlot.offset,
+                            kOut: kOutGEMV.buffer,
+                            kOutOffset: kOutGEMV.offset,
+                            vOut: vOutGEMV.buffer,
+                            vOutOffset: vOutGEMV.offset,
                             qRows: isGatedAttn ? 2 * qDim : qDim,
                             kvRows: kvDim,
-                            n: D)
+                            n: D,
+                            outputTokenStride: outputTokenStride)
                     }
                     cb.commit()
 
@@ -329,7 +377,9 @@ enum DraftVerifier {
 
                         cb = queue.makeCommandBuffer()!
 
-                        // RoPE + norm on Q; K/V stay at their cache slots.
+                        // RoPE + norm on Q. In spec mode kRoPE/vRoPE resolve to
+                        // the per-token strided stage offset so RoPE sees token tk's
+                        // own K/V. In real-cache mode they point to the ring-slot.
                         let rotated: UInt32 = isFull
                             ? UInt32(
                                 Double(cfg.fullHeadDim)
@@ -340,8 +390,8 @@ enum DraftVerifier {
                         runner.fusedQKVEpilogue.encode(
                             commandBuffer: cb,
                             q: qScratch, qOffset: 0,
-                            k: kSlot.buffer, kOffset: kSlot.offset,
-                            v: vSlot.buffer, vOffset: vSlot.offset,
+                            k: kRoPE.buffer, kOffset: kRoPE.offset,
+                            v: vRoPE.buffer, vOffset: vRoPE.offset,
                             qWeight: qNormT.buffer,
                             qWeightOffset: Int(qNormT.offset),
                             kWeight: kNormT.buffer,
@@ -370,7 +420,9 @@ enum DraftVerifier {
                         cb = queue.makeCommandBuffer()!
                     }
 
-                    // D) Attention kernel — data at offset 0 (already copied)
+                    // D) Attention kernel. kRoPE/vRoPE resolve to per-token
+                    // locations (ring-slot in autoregressive mode, strided
+                    // stage offset during speculation).
                     let attnScale: Float = isFull
                         ? Float(cfg.ropeScaling(atLayer: L)?
                                 .attentionFactor ?? 1.0)
@@ -381,8 +433,8 @@ enum DraftVerifier {
                             commandBuffer: cb,
                             q: isGatedAttn ? qScratch : qRawScratch,
                             qOffset: 0,
-                            k: kSlot.buffer, kOffset: 0,
-                            v: vSlot.buffer, vOffset: 0,
+                            k: kRoPE.buffer, kOffset: kRoPE.offset,
+                            v: vRoPE.buffer, vOffset: vRoPE.offset,
                             out: attnOut, outOffset: 0,
                             headDim: UInt32(headDimL),
                             numQHeads: UInt32(cfg.numHeads),
@@ -401,8 +453,8 @@ enum DraftVerifier {
                             commandBuffer: cb,
                             q: isGatedAttn ? qScratch : qScratch,
                             qOffset: 0,
-                            k: kSlot.buffer, kOffset: 0,
-                            v: vSlot.buffer, vOffset: 0,
+                            k: kRoPE.buffer, kOffset: kRoPE.offset,
+                            v: vRoPE.buffer, vOffset: vRoPE.offset,
                             out: attnOut, outOffset: 0,
                             headDim: UInt32(headDimL),
                             numQHeads: UInt32(cfg.numHeads),

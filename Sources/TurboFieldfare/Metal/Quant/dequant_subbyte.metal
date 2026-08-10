@@ -70,7 +70,8 @@ static inline void dequant_subbyte_gemv_body(
     uint                  rows_per_tg,
     uint                  tg_idx,
     uint                  sg_idx,
-    uint                  lane
+    uint                  lane,
+    uint                  outputStride
 ) {
     const uint row = tg_idx * rows_per_tg + sg_idx;
     if (row >= M) return;
@@ -100,9 +101,10 @@ static inline void dequant_subbyte_gemv_body(
     }
     acc = simd_sum(acc);
     if (lane == 0) {
-        y[row] = half(acc);
+        y[row * outputStride] = half(acc);
     }
 }
+
 
 kernel void dequant_int5_gemv_simd(
     device const uint8_t* W         [[buffer(0)]],
@@ -119,7 +121,7 @@ kernel void dequant_int5_gemv_simd(
 ) {
     constexpr uint rows_per_tg = 8;
     dequant_subbyte_gemv_body<5>(W, scales, biases, x, y, M, N, groupSize,
-                                  rows_per_tg, tg_idx, sg_idx, lane);
+                                  rows_per_tg, tg_idx, sg_idx, lane, 1u);
 }
 
 kernel void dequant_int6_gemv_simd(
@@ -137,7 +139,7 @@ kernel void dequant_int6_gemv_simd(
 ) {
     constexpr uint rows_per_tg = 8;
     dequant_subbyte_gemv_body<6>(W, scales, biases, x, y, M, N, groupSize,
-                                  rows_per_tg, tg_idx, sg_idx, lane);
+                                  rows_per_tg, tg_idx, sg_idx, lane, 1u);
 }
 
 // ============================================================================
@@ -173,6 +175,7 @@ static inline void subbyte_qkv_gemv_body(
     device half*          kY,
     device half*          vY,
     uint Mq, uint Mkv, uint N, uint groupSize,
+    uint outputStride,
     uint tg_idx, uint sg_idx, uint lane
 ) {
     constexpr uint rows_per_tg = 8;
@@ -202,7 +205,7 @@ static inline void subbyte_qkv_gemv_body(
     // rows_per_tg=1 with sg_idx=0 makes the body treat `local_row` as its row
     // directly — the same reuse the int4 fused kernel relies on.
     dequant_subbyte_gemv_body<BITS>(W, scales, biases, x, y, M, N, groupSize,
-                                    1u, local_row, 0u, lane);
+                                    1u, local_row, 0u, lane, outputStride);
 }
 
 kernel void dequant_int5_qkv_gemv_simd(
@@ -223,15 +226,18 @@ kernel void dequant_int5_qkv_gemv_simd(
     constant uint&        Mkv       [[buffer(14)]],
     constant uint&        N         [[buffer(15)]],
     constant uint&        groupSize [[buffer(16)]],
+    constant uint&        outStr    [[buffer(17)]],
     uint                  tg_idx    [[threadgroup_position_in_grid]],
     uint                  sg_idx    [[simdgroup_index_in_threadgroup]],
     uint                  lane      [[thread_index_in_simdgroup]]
 ) {
+    const uint outStride = outStr > 0 ? outStr : 1u;
     subbyte_qkv_gemv_body<5>(qW, qScales, qBiases,
                              kW, kScales, kBiases,
                              vW, vScales, vBiases,
                              x, qY, kY, vY,
                              Mq, Mkv, N, groupSize,
+                             outStride,
                              tg_idx, sg_idx, lane);
 }
 
@@ -275,15 +281,18 @@ kernel void dequant_int8_qkv_gemv_simd(
     constant uint&        Mkv       [[buffer(14)]],
     constant uint&        N         [[buffer(15)]],
     constant uint&        groupSize [[buffer(16)]],
+    constant uint&        outStr    [[buffer(17)]],
     uint                  tg_idx    [[threadgroup_position_in_grid]],
     uint                  sg_idx    [[simdgroup_index_in_threadgroup]],
     uint                  lane      [[thread_index_in_simdgroup]]
 ) {
+    const uint outStride = outStr > 0 ? outStr : 1u;
     subbyte_qkv_gemv_body<8>(qW, qScales, qBiases,
                              kW, kScales, kBiases,
                              vW, vScales, vBiases,
                              x, qY, kY, vY,
                              Mq, Mkv, N, groupSize,
+                             outStride,
                              tg_idx, sg_idx, lane);
 }
 

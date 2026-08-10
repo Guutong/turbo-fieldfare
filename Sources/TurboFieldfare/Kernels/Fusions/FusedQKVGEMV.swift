@@ -51,7 +51,8 @@ final class FusedQKVGEMV {
                        vOut: MTLBuffer, vOutOffset: Int = 0,
                        qRows: UInt32,
                        kvRows: UInt32,
-                       n: UInt32) {
+                       n: UInt32,
+                       outputTokenStride: Int = 1) {
         precondition(n % UInt32(Quantization.groupSize) == 0,
                      "N must be a multiple of \(Quantization.groupSize)")
         precondition(qWeightsOffset % 2 == 0 &&
@@ -77,9 +78,11 @@ final class FusedQKVGEMV {
         var qVar = qRows
         var kvVar = kvRows
         var nVar = n
+        var strideVar = UInt32(outputTokenStride > 0 ? outputTokenStride : 1)
         enc.setBytes(&qVar, length: MemoryLayout<UInt32>.size, index: 13)
         enc.setBytes(&kvVar, length: MemoryLayout<UInt32>.size, index: 14)
         enc.setBytes(&nVar, length: MemoryLayout<UInt32>.size, index: 15)
+        enc.setBytes(&strideVar, length: MemoryLayout<UInt32>.size, index: 16)
         let totalRows = Int(qRows + 2 * kvRows)
         enc.dispatchThreadgroups(MTLSize(width: (totalRows + 7) / 8,
                                          height: 1,

@@ -101,8 +101,12 @@ static inline void dequant_int4_gemv_simd_body(
     uint                  rows_per_tg,
     uint                  tg_idx,
     uint                  sg_idx,
-    uint                  lane
+    uint                  lane,
+    uint                  outputStride
 ) {
+    // When outputStride > 1 the caller (draft verifier) has expanded the
+    // staging buffer and wants k consecutive QKV writes to land at offsets
+    // 0, stride, 2*stride … rather than always colliding at offset 0.
     const uint row = tg_idx * rows_per_tg + sg_idx;
     if (row >= M) return;
     const uint n_groups  = N / kGroupSize;
@@ -167,7 +171,7 @@ static inline void dequant_int4_gemv_simd_body(
     }
     acc = simd_sum(acc);
     if (lane == 0) {
-        y[row] = half(acc);
+        y[row * outputStride] = half(acc);
     }
 }
 
@@ -187,7 +191,7 @@ kernel void dequant_int4_gemv_simd(
     const uint MM = int4_fc_m(M);
     const uint NN = int4_fc_n(N);
     dequant_int4_gemv_simd_body(W, scales, biases, x, y, MM, NN,
-                                rows_per_tg, tg_idx, sg_idx, lane);
+                                rows_per_tg, tg_idx, sg_idx, lane, 1u);
 }
 
 
@@ -285,6 +289,7 @@ kernel void dequant_int4_qkv_gemv_simd(
     constant uint&        Mq      [[buffer(13)]],
     constant uint&        Mkv     [[buffer(14)]],
     constant uint&        N       [[buffer(15)]],
+    constant uint&        outStr  [[buffer(16)]],
     uint                  tg_idx  [[threadgroup_position_in_grid]],
     uint                  sg_idx  [[simdgroup_index_in_threadgroup]],
     uint                  lane    [[thread_index_in_simdgroup]]
@@ -303,6 +308,7 @@ kernel void dequant_int4_qkv_gemv_simd(
     device half* y;
     uint local_row;
     uint M;
+    const uint outStride = outStr > 0 ? outStr : 1u;
     if (global_row < QQ) {
         W = qW; scales = qScales; biases = qBiases; y = qY;
         local_row = global_row;
@@ -317,5 +323,5 @@ kernel void dequant_int4_qkv_gemv_simd(
         M = KK;
     }
     dequant_int4_gemv_simd_body(W, scales, biases, x, y, M, NN,
-                                1u, local_row, 0u, lane);
+                                1u, local_row, 0u, lane, outStride);
 }
