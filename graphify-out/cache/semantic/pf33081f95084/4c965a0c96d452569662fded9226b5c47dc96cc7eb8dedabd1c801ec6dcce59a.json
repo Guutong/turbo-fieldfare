@@ -1,0 +1,1 @@
+{"nodes": [{"id": "agents_skills_ask_matt_agents_openai", "label": "Ask Matt Agent", "file_type": "code", "source_file": ".agents/skills/ask-matt/agents/openai.yaml"}], "edges": [], "hyperedges": []}

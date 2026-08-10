@@ -1,0 +1,1 @@
+{"nodes": [{"id": "agents_skills_to_spec_agents_openai", "label": "To Spec Agent", "file_type": "code", "source_file": ".agents/skills/to-spec/agents/openai.yaml"}], "edges": [], "hyperedges": []}

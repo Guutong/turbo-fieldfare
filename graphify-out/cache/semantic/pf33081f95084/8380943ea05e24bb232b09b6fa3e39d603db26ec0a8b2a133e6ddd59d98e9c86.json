@@ -1,0 +1,1 @@
+{"nodes": [{"id": "agents_skills_improve_codebase_architecture_agents_openai", "label": "Improve Codebase Architecture Agent", "file_type": "code", "source_file": ".agents/skills/improve-codebase-architecture/agents/openai.yaml"}], "edges": [], "hyperedges": []}

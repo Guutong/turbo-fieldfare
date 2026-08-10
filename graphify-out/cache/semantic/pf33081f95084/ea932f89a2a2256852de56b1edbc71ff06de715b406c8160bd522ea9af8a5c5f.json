@@ -1,0 +1,1 @@
+{"nodes": [{"id": "agents_skills_to_tickets_agents_openai", "label": "To Tickets Agent", "file_type": "code", "source_file": ".agents/skills/to-tickets/agents/openai.yaml"}], "edges": [], "hyperedges": []}

@@ -1,0 +1,1 @@
+{"nodes": [{"id": "agents_skills_handoff_agents_openai", "label": "Handoff Agent", "file_type": "code", "source_file": ".agents/skills/handoff/agents/openai.yaml"}], "edges": [], "hyperedges": []}

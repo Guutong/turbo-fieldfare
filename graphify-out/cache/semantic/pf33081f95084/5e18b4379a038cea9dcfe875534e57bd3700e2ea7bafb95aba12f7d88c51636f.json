@@ -1,0 +1,1 @@
+{"nodes": [{"id": "agents_skills_to_questionnaire_agents_openai", "label": "To Questionnaire Agent", "file_type": "code", "source_file": ".agents/skills/to-questionnaire/agents/openai.yaml"}], "edges": [], "hyperedges": []}
