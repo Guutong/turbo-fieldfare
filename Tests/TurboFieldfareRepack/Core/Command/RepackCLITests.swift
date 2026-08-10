@@ -43,17 +43,20 @@ struct RepackCLITests {
         #expect(result.stderr.contains("gemma4-26b-a4b"))
     }
 
-    @Test func notYetInstallableModelIDIsRejectedWithItsBlockedReason() throws {
-        let output = temporaryOutput("blocked-model")
+    @Test func knownInstallableModelIDIsAccepted() throws {
+        let output = temporaryOutput("laguna-model")
         defer { clean(output) }
         let result = try run([
             "--output", output,
             "--model", "laguna-s-2-1",
         ])
 
+        // laguna-s-2-1 is now installable; the CLI accepts it and proceeds
+        // to the install phase (which fails here because of disk space, but
+        // that is a different error path than the "not installable" guard).
         #expect(result.status == 1)
         #expect(result.stderr.contains("laguna-s-2-1"))
-        #expect(result.stderr.contains("not installable"))
+        #expect(!result.stderr.contains("not installable"))
     }
 
     @Test func modelFlagIsRejectedOutsideInstallMode() throws {
