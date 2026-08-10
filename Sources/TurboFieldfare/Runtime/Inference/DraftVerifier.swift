@@ -176,7 +176,7 @@ enum DraftVerifier {
 
                 // ── Drain pending MoE BEFORE emitting layer compute ────
                 if !layerPlans.isEmpty {
-                    try finishPendingMoE(runner, layerPlans, L, waitIfNeeded: true)
+                    try await finishPendingMoE(runner, layerPlans, L, waitIfNeeded: true)
                     layerPlans.removeAll()
                 }
 
@@ -604,7 +604,7 @@ enum DraftVerifier {
 
             // ── Drain remaining pending MoE ───────────────────────────────
             if !layerPlans.isEmpty {
-                try finishPendingMoE(runner, layerPlans, 0, waitIfNeeded: true)
+                try await finishPendingMoE(runner, layerPlans, 0, waitIfNeeded: true)
                 layerPlans.removeAll()
             }
 
@@ -727,7 +727,7 @@ enum DraftVerifier {
         _ plans: [(layer: Int, experts: [Int])],
         _ currentLayer: Int,
         waitIfNeeded: Bool
-    ) throws {
+    ) async throws {
         guard !plans.isEmpty else { return }
 
         let queue = runner.ctx.queue
@@ -756,7 +756,7 @@ enum DraftVerifier {
 
             // ── Step B — Shared expert FFN → h1Buf ────────────────
             let sharedCB = queue.makeCommandBuffer()!
-            runner.shared.encode(commandBuffer: sharedCB,
+            try runner.shared.encode(commandBuffer: sharedCB,
                                  x: denseX, xOffset: 0,
                                  gate: sharedProj.gate,
                                  up: sharedProj.up,
@@ -849,7 +849,7 @@ enum DraftVerifier {
             try checkCmdError(routedCB.error)
             waitForCommandBuffer(tailCB)
             try checkCmdError(tailCB.error)
-            if let plan = plannedFetch {
+            if plannedFetch != nil {
                 runner.model.unpinRoutedExpertSlots(layer: L, slots: pinnedSlots)
             }
         }
