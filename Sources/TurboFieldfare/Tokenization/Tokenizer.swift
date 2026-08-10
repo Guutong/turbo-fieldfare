@@ -130,7 +130,10 @@ public struct GFTokenizer: @unchecked Sendable {
         }
 
         // Tool/channel markers are Gemma-specific; default to 0 for non-Gemma.
-        let eot = tokenizer.convertTokenToId("<turn|>") ?? 0
+        // Qwen's ChatML vocab has no `<turn|>` token — `<|im_end|>` (already
+        // resolved as `eos` above) marks end-of-turn there, so reuse it
+        // instead of silently falling back to id 0.
+        let eot = isQwenVocab ? eos : (tokenizer.convertTokenToId("<turn|>") ?? 0)
         let toolResponse = tokenizer.convertTokenToId("<|tool_response>") ?? 0
         let toolCallStart = tokenizer.convertTokenToId("<|tool_call>") ?? 0
         let toolCallEnd = tokenizer.convertTokenToId("<tool_call|>") ?? 0
