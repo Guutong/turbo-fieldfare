@@ -496,8 +496,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                               options: .storageModeShared) else {
                 throw ModelError.residentBufferWrapFailed
             }
-            // A `.sigmoidTopK` router (Qwen3.6, or any dense-MLP layer) has no
-            // input scale and no 1/sqrt(D) factor — `F.linear(u, W)` on the
+            // A non-`.softmaxTopK` router (Qwen3.6's `.softmaxTopKPlain`,
+            // Laguna's `.sigmoidTopK`, or any dense-MLP layer) has no input
+            // scale and no 1/sqrt(D) factor — `F.linear(u, W)` on the
             // already-normed MLP input — so its effective scale is all ones.
             if !cfg.isDenseMLP(atLayer: L) {
                 let dst = buf.contents().assumingMemoryBound(to: UInt16.self)
@@ -944,9 +945,10 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 qNorm: isLinear ? postAttnV : (try model.qNorm(layer: L)),
                 kNorm: isLinear ? postAttnV : (try model.kNorm(layer: L)),
                 router: isDense ? nil : (try model.router(layer: L)),
-                // Unused when `.sigmoidTopK` (Qwen3.6 routes through
-                // `encodeSigmoidBlock`, which reads `routerOnesPerExpert`
-                // instead), so no Qwen3.6-specific alias is needed here.
+                // nil for both `.sigmoidTopK` (Laguna, reads `routerOnesPerExpert`
+                // via `encodeSigmoidBlock`) and `.softmaxTopKPlain` (Qwen3.6,
+                // reads `routerOnesPerExpert` directly at the dispatch site) —
+                // only `.softmaxTopK` (Gemma4) has a real tensor here.
                 routerPerExpertScale: isDense ? nil : (try model.routerPerExpertScale(layer: L)),
                 routerSelectionBias: isDense ? nil : (try model.routerSelectionBias(layer: L)))
         }
@@ -1453,7 +1455,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             guard let router = views.router else {
                 throw ModelError.tensorNotFound(name: "language_model.model.layers.\(L).router.proj.weight")
             }
-            if cfg.routerScoring == .sigmoidTopK {
+            switch cfg.routerScoring {
+            case .sigmoidTopK:
                 guard let selectionBias = views.routerSelectionBias else {
                     throw ModelError.tensorNotFound(
                         name: "language_model.model.layers.\(L).mlp.gate.e_score_correction_bias")
@@ -1480,7 +1483,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                             hiddenStrideElements: UInt32(D),
                             groupSize: UInt32(model.routerGroupSize),
                             useBF16: router.scaleLength == 0)
-            } else {
+            case .softmaxTopK:
                 guard let routerPerExpertScale = views.routerPerExpertScale else {
                     throw ModelError.tensorNotFound(
                         name: "language_model.model.layers.\(L).router.per_expert_scale")
@@ -1497,6 +1500,30 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                             effectiveScale: effectiveScaleBuffers[L],
                             perExpertScale: routerPerExpertScale.buffer,
                             perExpertScaleOffset: Int(routerPerExpertScale.offset),
+                            outIndices: scratch.routeIDs,
+                            outWeights: scratch.routeWeights,
+                            queryCount: UInt32(t),
+                            numExperts: UInt32(cfg.numExperts),
+                            d: UInt32(D),
+                            topK: UInt32(cfg.topKExperts),
+                            hiddenStrideElements: UInt32(D),
+                            groupSize: UInt32(model.routerGroupSize))
+            case .softmaxTopKPlain:
+                // Qwen3.6: same kernel as `.softmaxTopK`, but there is no
+                // `router.per_expert_scale` tensor to read — use the identity
+                // (all-ones) buffer instead of throwing.
+                prefillRouter.encodeGemma4Block(
+                            commandBuffer: cb,
+                            weights: router.buffer,
+                            weightsOffset: Int(router.offset),
+                            scales: router.buffer,
+                            scalesOffset: Int(router.scaleOffset),
+                            biases: router.buffer,
+                            biasesOffset: Int(router.biasOffset),
+                            hidden: scratch.routerX,
+                            effectiveScale: effectiveScaleBuffers[L],
+                            perExpertScale: routerOnesPerExpert,
+                            perExpertScaleOffset: 0,
                             outIndices: scratch.routeIDs,
                             outWeights: scratch.routeWeights,
                             queryCount: UInt32(t),
@@ -1919,9 +1946,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             let preFFN2  = isQwen36 ? postAttn : (try model.preFFN2(layer: L))
             let postF2   = isQwen36 ? postAttn : (try model.postFFN2(layer: L))
             let postF    = isQwen36 ? postAttn : (try model.postFFN(layer: L))
-            // Qwen3.6's sigmoidTopK router has no `per_expert_scale` tensor —
-            // multiply gathered weights by an all-ones dummy buffer instead
-            // (`dummyPerExpertScale`, allocated once at init).
+            // Qwen3.6's softmaxTopKPlain router has no `per_expert_scale`
+            // tensor — multiply gathered weights by an all-ones dummy buffer
+            // instead (`dummyPerExpertScale`, allocated once at init).
             let perExpertScale: TensorView?
             if isDense {
                 perExpertScale = nil
@@ -1935,10 +1962,10 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             } else {
                 perExpertScale = try model.routerPerExpertScale(layer: L)
             }
-            // nil under `.softmaxTopK`, which has no selection bias; non-nil
-            // for Qwen3.6, whose sigmoidTopK router applies an
-            // auxiliary-loss-free selection bias to the routing scores
-            // (arXiv:2408.15664) — same tensor the prefill path already reads.
+            // Non-nil only under `.sigmoidTopK` (Laguna), whose router applies
+            // an auxiliary-loss-free selection bias to the routing scores
+            // (arXiv:2408.15664). Qwen3.6's softmaxTopKPlain router has no
+            // such tensor, so this is nil there too.
             let selectionBias = isDense ? nil : (try model.routerSelectionBias(layer: L))
             // 1.0 under `.preNorm` (Qwen3.6), which has no per-layer residual gain.
             let layerScalar: Float = try model.layerScalar(layer: L).map {

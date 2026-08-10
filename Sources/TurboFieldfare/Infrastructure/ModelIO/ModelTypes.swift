@@ -133,9 +133,21 @@ public enum NormTopology: String, Sendable, Equatable {
 /// scores at the selected indices, and renormalize them to sum to 1. The bias
 /// deliberately does not survive into the weights — it is load-balancing
 /// pressure on *which* experts win, not on how much they contribute.
+///
+/// `softmaxTopKPlain` is Qwen3.6 (`Qwen3NextSparseMoeBlock` in mlx_lm's
+/// `qwen3_next.py`, which `qwen3_5_moe.py` reuses verbatim): plain
+/// `nn.Linear(D, numExperts, bias=false)` -> softmax over *all* experts ->
+/// top-K -> renormalize to sum to 1. No `router.scale` input scaling, no
+/// `router.per_expert_scale` output gain, and — despite earlier docs in this
+/// codebase claiming otherwise — no `e_score_correction_bias` selection bias;
+/// the checkpoint genuinely has none. Numerically this is identical to
+/// `softmaxTopK`'s "softmax over just the top-K logits" once the scale and
+/// gain are both identity, since dividing a shared softmax denominator out of
+/// a ratio cancels it either way.
 public enum RouterScoring: String, Sendable, Equatable {
     case softmaxTopK
     case sigmoidTopK
+    case softmaxTopKPlain
 }
 
 /// Architecture description for the loaded model. `manifest.json -> arch` must
@@ -394,7 +406,7 @@ public struct ArchConfig: Sendable, Equatable {
         layerKindMask: Self.qwen36LayerKindMask(),
         hiddenActivation: "silu",
         normTopology: .preNorm,
-        routerScoring: .sigmoidTopK
+        routerScoring: .softmaxTopKPlain
     )
 
     private static func gemma4LayerMask() -> [UInt8] {

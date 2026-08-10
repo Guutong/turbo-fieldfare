@@ -297,8 +297,9 @@ public struct Model {
     // (post-RMSNorm), fused with 1/sqrt(hidden_size). `per_expert_scale` is
     // applied to the top-k routing weights after softmax over top-k.
 
-    /// Both are Gemma-only: a `.sigmoidTopK` router scales neither its input
-    /// nor its output, so these return nil there rather than throwing.
+    /// Both are Gemma-only: `.sigmoidTopK` (Laguna) and `.softmaxTopKPlain`
+    /// (Qwen3.6) routers scale neither their input nor their output, so these
+    /// return nil there rather than throwing.
     public func routerScale(layer L: Int) throws -> TensorView? {
         guard config.routerScoring == .softmaxTopK else { return nil }
         return try resident(name: "language_model.model.layers.\(L).router.scale")

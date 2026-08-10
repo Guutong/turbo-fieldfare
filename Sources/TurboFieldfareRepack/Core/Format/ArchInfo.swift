@@ -183,14 +183,28 @@ struct ArchInfo: Sendable, Equatable {
         // so falling back to Gemma's gelu would silently use the wrong
         // activation. Qwen3.6's checkpoint reports `model_type: "qwen3_5_moe"`
         // (not the superficially-similar "qwen3_next").
+        //
+        // Router scoring differs between the two `preNorm` families even
+        // though both were once assumed to share Laguna's sigmoid+bias
+        // scheme: Laguna is genuine DeepSeek-V3-style aux-loss-free routing
+        // (sigmoid, `e_score_correction_bias`, `routedScalingFactor`), but
+        // Qwen3.6/Qwen3-Next (`qwen3_5_moe`/`qwen3_5_moe_text`/`qwen3_next`)
+        // routes through mlx_lm's `Qwen3NextSparseMoeBlock`, which is plain
+        // softmax-over-all-experts top-K with no bias tensor at all — see
+        // `RouterScoring.softmaxTopKPlain`. Its checkpoints never carry
+        // `e_score_correction_bias`, `router.scale`, or `router.per_expert_scale`.
         let modelType = (tc["model_type"] as? String) ?? (root["model_type"] as? String) ?? ""
         let normTopology: String
         let routerScoring: String
         let defaultActivation: String
         switch modelType {
-        case "laguna", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next":
+        case "laguna":
             normTopology = "preNorm"
             routerScoring = "sigmoidTopK"
+            defaultActivation = "silu"
+        case "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next":
+            normTopology = "preNorm"
+            routerScoring = "softmaxTopKPlain"
             defaultActivation = "silu"
         default:
             normTopology = "sandwich"

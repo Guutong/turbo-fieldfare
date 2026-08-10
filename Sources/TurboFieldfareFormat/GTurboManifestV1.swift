@@ -37,8 +37,9 @@ package struct GTurboManifestArchV1: Codable, Equatable, Sendable {
     /// Optional so pre-existing manifests (written before this field existed)
     /// decode as nil, which the reader maps to the Gemma-compatible default.
     package let normTopology: String?
-    /// Router formula: "softmaxTopK" (Gemma) or "sigmoidTopK" (Qwen3.6/Laguna).
-    /// Optional for the same backward-compatibility reason as `normTopology`.
+    /// Router formula: "softmaxTopK" (Gemma), "sigmoidTopK" (Laguna), or
+    /// "softmaxTopKPlain" (Qwen3.6 — plain softmax top-K, no scale/bias/gain
+    /// tensors). Optional for the same backward-compatibility reason as `normTopology`.
     package let routerScoring: String?
 
     package init(hiddenSize: Int, ffnIntermediate: Int, moeIntermediateSize: Int,

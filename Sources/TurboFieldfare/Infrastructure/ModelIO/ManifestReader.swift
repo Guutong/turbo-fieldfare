@@ -440,7 +440,7 @@ private extension ManifestArch {
                   // matching the `ArchConfig` defaults. A future format bump
                   // can wire the rest through once a checkpoint needs them.
                   // `normTopology`/`routerScoring` ARE carried (added to
-                  // unblock Qwen3.6, which needs preNorm/sigmoidTopK to
+                  // unblock Qwen3.6, which needs preNorm/softmaxTopKPlain to
                   // decode correctly rather than silently defaulting to
                   // Gemma's sandwich/softmaxTopK).
                   headsPerLayer: nil,
