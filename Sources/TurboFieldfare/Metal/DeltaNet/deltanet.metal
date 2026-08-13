@@ -375,12 +375,11 @@ void dn_matvec_batched(
 }
 
 // ---------------------------------------------------------------------------
-// Batched causal depthwise conv1d (width 4) + silu, then slide the conv
-// state per-token. Uses uint tid for the channel dimension and iterates
-// tokens inside — with convDim=8192 that's 8192 threads each looping over K.
-//
-// State layout: [batch × 3 × convDim]. Token t occupies regions starting
-// at offset t × 3 × convDim. Region r (0–2) starts at (t × 3 + r) × convDim.
+// Batched causal depthwise conv1d (width 4) + silu. One thread per channel;
+// each thread owns a single running 3-tap window and slides it sequentially
+// across the batch, so token t's window reflects tokens 0..t-1's updates —
+// state is NOT reindexed by token (state layout: [3 × convDim], same size as
+// the non-batched dn_conv_step).
 // ---------------------------------------------------------------------------
 
 [[kernel, max_total_threads_per_threadgroup(256)]]
@@ -395,23 +394,26 @@ void dn_conv_step_batched(
 ) {
     if (tid >= convDim) return;
 
+    // Single running window per lane, chained sequentially across the batch —
+    // token t's window must reflect tokens 0..t-1's updates, so state is NOT
+    // reindexed by t. Buffer stays sized for one token (3 * convDim), matching
+    // the non-batched dn_conv_step.
     const uint tap = tid * 4;
     for (uint t = 0; t < batch; ++t) {
-        const uint sOff = t * 3 * convDim;
         const float x = input[t * convDim + tid];
 
         const float acc =
-              weight[tap + 0] * state[sOff + tid]
-            + weight[tap + 1] * state[sOff + convDim + tid]
-            + weight[tap + 2] * state[sOff + 2 * convDim + tid]
+              weight[tap + 0] * state[tid]
+            + weight[tap + 1] * state[convDim + tid]
+            + weight[tap + 2] * state[2 * convDim + tid]
             + weight[tap + 3] * x;
 
         out[t * convDim + tid] = dn_silu(acc);
 
-        // Slide the window — safe because state is per-token (no race).
-        state[sOff + tid]                   = state[sOff + convDim + tid];
-        state[sOff + convDim + tid]         = state[sOff + 2 * convDim + tid];
-        state[sOff + 2 * convDim + tid]     = x;
+        // Slide the window.
+        state[tid]               = state[convDim + tid];
+        state[convDim + tid]     = state[2 * convDim + tid];
+        state[2 * convDim + tid] = x;
     }
 }
 
@@ -430,6 +432,7 @@ void dn_qknorm_expand_batched(
     constant float&     scale         [[buffer(5)]],
     constant float&     eps           [[buffer(6)]],
     constant uint&      batch         [[buffer(7)]],
+    constant uint&      rowStride     [[buffer(8)]],
     uint                tid           [[thread_position_in_grid]]
 ) {
     if (tid >= batch * numValueHeads * headDim) return;
@@ -440,7 +443,10 @@ void dn_qknorm_expand_batched(
     const uint lane = elem % headDim;
     const uint repeatFactor = numValueHeads / numKeyHeads;
     const uint base = (valueHead / repeatFactor) * headDim;
-    const uint srcBase = token * numKeyHeads * headDim;
+    // `src` points at this call's field (q or k) within the token-major,
+    // interleaved [q,k,v] conv-out row; consecutive tokens are `rowStride`
+    // apart in the underlying buffer, not `numKeyHeads * headDim` apart.
+    const uint srcBase = token * rowStride;
     const uint outBase = token * numValueHeads * headDim;
 
     float sumSquares = 0.0f;
@@ -478,12 +484,11 @@ void dn_gates_batched(
 
 // ---------------------------------------------------------------------------
 // Batched gated delta-rule recurrence. One thread per (value head, value
-// index) pair per token. Each thread owns one headKDim-long slice of the
-// per-token state buffer.
-//
-// State layout: [batch × numValueHeads × headVDim × headKDim].
-// Thread tid maps to local idx = tid % (numValueHeads * headVDim),
-// which spans the flat (head, vIdx) plane.
+// index) pair, each owning a single running headKDim-long state slice that
+// it scans sequentially across the batch — token t's update must see token
+// t-1's result, so state is NOT reindexed by token (state layout stays
+// [numValueHeads × headVDim × headKDim], same size as the non-batched
+// dn_recurrence).
 // ---------------------------------------------------------------------------
 
 [[kernel, max_total_threads_per_threadgroup(256)]]
@@ -499,34 +504,45 @@ void dn_recurrence_batched(
     constant uint&      headVDim      [[buffer(8)]],
     constant uint&      headKDim      [[buffer(9)]],
     constant uint&      batch         [[buffer(10)]],
+    constant uint&      vRowStride    [[buffer(11)]],
     uint                tid           [[thread_position_in_grid]]
 ) {
-    if (tid >= batch * numValueHeads * headVDim) return;
-    const uint token  = tid / (numValueHeads * headVDim);
-    const uint local  = tid % (numValueHeads * headVDim);
-    const uint head   = local / headVDim;
-    const uint vIdx   = local % headVDim;
+    if (tid >= numValueHeads * headVDim) return;
+    const uint head   = tid / headVDim;
+    const uint vIdx   = tid % headVDim;
+    const uint ekDim  = numValueHeads * headKDim;  // expanded key dim
 
-    const float decay      = g[token * numValueHeads + head];
-    const float writeScale = beta[token * numValueHeads + head];
-    const uint ekDim       = numValueHeads * headKDim;  // expanded key dim
-    const uint kvBase      = token * ekDim + head * headKDim;
-    const uint qBase       = kvBase;
-    const uint vBase       = token * numValueHeads * headVDim + vIdx;
-    const uint stateBase   = token * numValueHeads * headVDim * headKDim + local * headKDim;
+    // Single running state slice per lane, chained sequentially across the
+    // batch — token t's recurrence must build on token t-1's updated state,
+    // so state is NOT reindexed by t. Buffer stays sized for one token
+    // (numValueHeads * headVDim * headKDim), matching dn_recurrence.
+    const uint stateBase = tid * headKDim;
 
-    float kvMemory = 0.0f;
-    for (uint i = 0; i < headKDim; ++i) {
-        state[stateBase + i] *= decay;
-        kvMemory += state[stateBase + i] * k[kvBase + i];
+    for (uint t = 0; t < batch; ++t) {
+        const float decay      = g[t * numValueHeads + head];
+        const float writeScale = beta[t * numValueHeads + head];
+        const uint kvBase      = t * ekDim + head * headKDim;
+        const uint qBase       = kvBase;
+        // v is read directly from the token-major conv-out buffer (stride
+        // vRowStride = convDim), unlike q/k which were repacked contiguous
+        // by dn_qknorm_expand_batched (stride ekDim). tid already encodes
+        // head * headVDim + vIdx (matches the non-batched dn_recurrence's
+        // `v[tid]`), so the head offset must not be dropped here.
+        const uint vBase       = t * vRowStride + tid;
+
+        float kvMemory = 0.0f;
+        for (uint i = 0; i < headKDim; ++i) {
+            state[stateBase + i] *= decay;
+            kvMemory += state[stateBase + i] * k[kvBase + i];
+        }
+        const float delta = (v[vBase] - kvMemory) * writeScale;
+        float acc = 0.0f;
+        for (uint i = 0; i < headKDim; ++i) {
+            state[stateBase + i] += k[kvBase + i] * delta;
+            acc += state[stateBase + i] * q[qBase + i];
+        }
+        y[t * numValueHeads * headVDim + tid] = acc;
     }
-    const float delta = (v[vBase] - kvMemory) * writeScale;
-    float acc = 0.0f;
-    for (uint i = 0; i < headKDim; ++i) {
-        state[stateBase + i] += k[kvBase + i] * delta;
-        acc += state[stateBase + i] * q[qBase + i];
-    }
-    y[token * numValueHeads * headVDim + vIdx] = acc;
 }
 
 // ---------------------------------------------------------------------------

@@ -255,6 +255,98 @@ import Testing
               "\(worstDelta), worst state relL2 \(worstState) (layer \(worstLayer))")
     }
 
+    /// #34: `encodeBatched(tk: K)` called ONCE must match K sequential
+    /// `encode()` calls (equivalently, K sequential `DeltaNetCPUBlock.forward`
+    /// calls chaining the same conv/recurrent state) — this is the actual
+    /// contract batched decode relies on. Catches the class of bug where a
+    /// batched kernel parallelizes across tokens instead of chaining the
+    /// recurrent state sequentially through them (see PHASE-LOG.md #34 entry:
+    /// `dn_recurrence_batched`/`dn_conv_step_batched` previously indexed state
+    /// per-token instead of looping internally over a single shared slice —
+    /// both an out-of-bounds write and a correctness bug, since real state
+    /// buffers are sized for exactly one token, and each token's update must
+    /// see the prior token's result to be a real recurrence).
+    @Test(.enabled(if: isModelAvailable))
+    func encodeBatchedMatchesKSequentialCPUCallsChainingState() throws {
+        let device = MTLCreateSystemDefaultDevice()!
+        let context = try MetalContext()
+        let model = try Model.load(directoryURL: URL(fileURLWithPath: Self.modelDir),
+                                   device: device, expecting: .qwen36_35B_A3B)
+        let dims = DeltaNetDimensions.qwen36_35B_A3B
+        let D = model.config.hiddenSize
+        let layer = 0
+        #expect(model.config.layerKindMask[layer] == 2,
+                "layer \(layer) must be a linear (DeltaNet) layer")
+
+        let cpuWeights = try DeltaNetCPUBlock.LayerWeights(
+            model: model, layer: layer, D: D, dims: dims)
+        var cpuConvState = [Float](repeating: 0, count: dims.convStateCount)
+        var cpuRecurrentState = [Float](repeating: 0, count: dims.recurrentStateCount)
+
+        let block = try DeltaNetMetalBlock(context: context, hiddenSize: D, dims: dims)
+        let gpuWeights = try DeltaNetMetalBlock.LayerWeights(
+            device: device, model: model, layer: layer, D: D, dims: dims)
+        let state = try DeltaNetMetalBlock.GPUStateStore(
+            device: device, numLayers: 1, dims: dims, isLinearLayer: [true])
+        let convState = try #require(state.convState[0])
+        let recurrentState = try #require(state.recurrentState[0])
+
+        let K = 6 // > conv width (4) so the conv window actually rotates.
+        let hidden = device.makeBuffer(length: K * D * MemoryLayout<Float16>.size,
+                                       options: .storageModeShared)!
+        let hiddenPtr = hidden.contents().assumingMemoryBound(to: Float16.self)
+
+        var rng = LCG(state: 0xA5A5A5A5DEADBEEF)
+        var xs: [[Float]] = []
+        for t in 0..<K {
+            var x = [Float](repeating: 0, count: D)
+            for i in 0..<D {
+                let half = Float16(rng.next() * 0.5)
+                hiddenPtr[t * D + i] = half
+                x[i] = Float(half)
+            }
+            xs.append(x)
+        }
+
+        // Reference: K sequential CPU calls, chaining state exactly like the
+        // decode loop's non-batched path.
+        var reference: [[Float]] = []
+        for t in 0..<K {
+            reference.append(DeltaNetCPUBlock.forward(
+                x: xs[t], weights: cpuWeights, dims: dims,
+                convState: &cpuConvState, recurrentState: &cpuRecurrentState))
+        }
+
+        // Ours: ONE encodeBatched call for all K tokens.
+        let cb = context.queue.makeCommandBuffer()!
+        block.encodeBatched(commandBuffer: cb, hidden: hidden, weights: gpuWeights,
+                            convState: convState, recurrentState: recurrentState,
+                            tk: K, eps: 1e-6)
+        cb.commit()
+        cb.waitUntilCompleted()
+        try checkCommandBufferError(cb.error)
+
+        for t in 0..<K {
+            let ours = block.batchedDeltaOut(token: t)
+            let relL2 = Self.relativeL2(ours, reference[t])
+            let maxAbs = Self.maxAbsolute(ours, reference[t])
+            #expect(relL2 <= 1e-5,
+                    "token \(t) deltaOut relL2 \(relL2) (maxAbs \(maxAbs))")
+            #expect(ours.allSatisfy { $0.isFinite })
+        }
+
+        let gpuConv = (0..<dims.convStateCount).map {
+            convState.contents().assumingMemoryBound(to: Float.self)[$0]
+        }
+        let gpuRecurrent = (0..<dims.recurrentStateCount).map {
+            recurrentState.contents().assumingMemoryBound(to: Float.self)[$0]
+        }
+        let convRelL2 = Self.relativeL2(gpuConv, cpuConvState)
+        let recurrentRelL2 = Self.relativeL2(gpuRecurrent, cpuRecurrentState)
+        #expect(convRelL2 <= 1e-5, "conv state relL2 \(convRelL2)")
+        #expect(recurrentRelL2 <= 1e-5, "recurrent state relL2 \(recurrentRelL2)")
+    }
+
     @Test(.enabled(if: isModelAvailable))
     func gpuStateStoreResetZeroesEveryLinearLayer() throws {
         let device = MTLCreateSystemDefaultDevice()!

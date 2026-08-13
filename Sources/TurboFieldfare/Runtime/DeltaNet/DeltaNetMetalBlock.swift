@@ -286,6 +286,19 @@ final class DeltaNetMetalBlock {
         dispatch(enc, psoMatVec, threads: rows)
     }
 
+    private func matVecBatched(_ enc: MTLComputeCommandEncoder,
+                               w: MTLBuffer, x: MTLBuffer, y: MTLBuffer,
+                               rows: Int, cols: Int, batch: Int) {
+        enc.setBuffer(w, offset: 0, index: 0)
+        enc.setBuffer(x, offset: 0, index: 1)
+        enc.setBuffer(y, offset: 0, index: 2)
+        var r = UInt32(rows), c = UInt32(cols), b = UInt32(batch)
+        enc.setBytes(&r, length: MemoryLayout<UInt32>.size, index: 3)
+        enc.setBytes(&c, length: MemoryLayout<UInt32>.size, index: 4)
+        enc.setBytes(&b, length: MemoryLayout<UInt32>.size, index: 5)
+        dispatch(enc, psoMatVecB, threads: rows * batch)
+    }
+
     /// Encodes one token's DeltaNet layer into `cb`: reads the FP16 residual
     /// stream `hidden`, and writes back `hidden = hidden + deltaOut` — the
     /// exact contract the CPU call site had in `RealForwardRunner`.
@@ -447,14 +460,14 @@ final class DeltaNetMetalBlock {
         dispatch(enc, psoRMSNormB, threads: tk * D)
 
         // Projections — batched mat-vec on all tk tokens at once.
-        matVec(enc, w: weights.qkv, x: normedBuf, y: qkvBuf,
-               rows: dims.convDim * tk, cols: D)
-        matVec(enc, w: weights.z, x: normedBuf, y: zBuf,
-               rows: valueDim * tk, cols: D)
-        matVec(enc, w: weights.a, x: normedBuf, y: aRawBuf,
-               rows: dims.numValueHeads * tk, cols: D)
-        matVec(enc, w: weights.b, x: normedBuf, y: bRawBuf,
-               rows: dims.numValueHeads * tk, cols: D)
+        matVecBatched(enc, w: weights.qkv, x: normedBuf, y: qkvBuf,
+                      rows: dims.convDim, cols: D, batch: tk)
+        matVecBatched(enc, w: weights.z, x: normedBuf, y: zBuf,
+                      rows: valueDim, cols: D, batch: tk)
+        matVecBatched(enc, w: weights.a, x: normedBuf, y: aRawBuf,
+                      rows: dims.numValueHeads, cols: D, batch: tk)
+        matVecBatched(enc, w: weights.b, x: normedBuf, y: bRawBuf,
+                      rows: dims.numValueHeads, cols: D, batch: tk)
 
         // Causal conv1d + silu, per-token state in convState.
         enc.setBuffer(qkvBuf, offset: 0, index: 0)
@@ -471,6 +484,7 @@ final class DeltaNetMetalBlock {
         var numKeyHeads = UInt32(dims.numKeyHeads)
         var numValueHeads = UInt32(dims.numValueHeads)
         var headKDim = UInt32(dims.headKDim)
+        var convDimU32 = UInt32(dims.convDim)
         func qkNorm(sourceBuf: MTLBuffer, sourceOffset: Int,
                     outBuf: MTLBuffer, scale: Float) {
             enc.setBuffer(sourceBuf, offset: sourceOffset, index: 0)
@@ -482,13 +496,18 @@ final class DeltaNetMetalBlock {
             enc.setBytes(&s, length: MemoryLayout<Float>.size, index: 5)
             var e = DeltaNetQKNorm.eps
             enc.setBytes(&e, length: MemoryLayout<Float>.size, index: 6)
+            enc.setBytes(&k32, length: MemoryLayout<UInt32>.size, index: 7)
+            enc.setBytes(&convDimU32, length: MemoryLayout<UInt32>.size, index: 8)
             dispatch(enc, psoQKNormExpandB, threads: expandedKeyDim * tk)
         }
+        // convOutBuf is token-major [q(keyDim), k(keyDim), v(valueDim)] with
+        // stride convDim; q starts at sub-offset 0, k at sub-offset keyDim —
+        // a per-call constant, not multiplied by the batch count.
         qkNorm(sourceBuf: convOutBuf, sourceOffset: 0,
                outBuf: qExpBuf,
                scale: DeltaNetQKNorm.qScale(headKDim: dims.headKDim))
         qkNorm(sourceBuf: convOutBuf,
-               sourceOffset: keyDim * MemoryLayout<Float>.size * tk,
+               sourceOffset: keyDim * MemoryLayout<Float>.size,
                outBuf: kExpBuf,
                scale: DeltaNetQKNorm.kScale(headKDim: dims.headKDim))
 
@@ -504,9 +523,12 @@ final class DeltaNetMetalBlock {
         dispatch(enc, psoGatesB, threads: dims.numValueHeads * tk)
 
         // Gated delta-rule recurrence; v is the tail of the conv output.
+        // convOutBuf is token-major [q,k,v] with stride convDim, so v's
+        // per-call start offset is a constant (skip q+k of token 0), and the
+        // kernel needs convDim as v's row stride between tokens.
         enc.setBuffer(qExpBuf, offset: 0, index: 0)
         enc.setBuffer(kExpBuf, offset: 0, index: 1)
-        enc.setBuffer(convOutBuf, offset: 2 * keyDim * floatSize * tk, index: 2)
+        enc.setBuffer(convOutBuf, offset: 2 * keyDim * floatSize, index: 2)
         enc.setBuffer(betaBuf, offset: 0, index: 3)
         enc.setBuffer(gBuf, offset: 0, index: 4)
         enc.setBuffer(recurrentState, offset: 0, index: 5)
@@ -516,7 +538,8 @@ final class DeltaNetMetalBlock {
         enc.setBytes(&headVDim, length: MemoryLayout<UInt32>.size, index: 8)
         enc.setBytes(&headKDim, length: MemoryLayout<UInt32>.size, index: 9)
         enc.setBytes(&k32, length: MemoryLayout<UInt32>.size, index: 10)
-        dispatch(enc, psoRecurrenceB, threads: valueDim * tk)
+        enc.setBytes(&convDimU32, length: MemoryLayout<UInt32>.size, index: 11)
+        dispatch(enc, psoRecurrenceB, threads: valueDim)
 
         // Gated RMSNorm / swiglu output gate.
         enc.setBuffer(yBuf, offset: 0, index: 0)
@@ -531,8 +554,8 @@ final class DeltaNetMetalBlock {
         dispatch(enc, psoOutputGateB, threads: valueDim * tk)
 
         // out_proj, then fold back into FP16 residual stream.
-        matVec(enc, w: weights.out, x: gatedBuf, y: deltaOutBuf,
-               rows: D * tk, cols: valueDim)
+        matVecBatched(enc, w: weights.out, x: gatedBuf, y: deltaOutBuf,
+                      rows: D, cols: valueDim, batch: tk)
 
         enc.setBuffer(hidden, offset: 0, index: 0)
         enc.setBuffer(xBuf, offset: 0, index: 1)
@@ -550,5 +573,14 @@ final class DeltaNetMetalBlock {
     var lastDeltaOut: [Float] {
         let ptr = deltaOutBuf.contents().assumingMemoryBound(to: Float.self)
         return (0..<D).map { ptr[$0] }
+    }
+
+    /// The `deltaOut` for one token of a completed `encodeBatched` call, for
+    /// tests that diff this path against K sequential `DeltaNetCPUBlock.forward`
+    /// calls. Valid only after the encoding command buffer has completed.
+    func batchedDeltaOut(token: Int) -> [Float] {
+        let ptr = deltaOutBuf.contents().assumingMemoryBound(to: Float.self)
+        let base = token * D
+        return (0..<D).map { ptr[base + $0] }
     }
 }
