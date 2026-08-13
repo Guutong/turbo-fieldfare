@@ -180,7 +180,7 @@ enum DraftVerifier {
                     layerPlans.removeAll()
                 }
 
-                // ── DeltaNet branch — batch-in-time via encodeBatched ────
+                // ── DeltaNet branch — single-token, real state carry ────
                 if isLinear {
                     guard let deltaNet = runner.deltaNet,
                           let weightsCache = runner.deltaNetWeights,
@@ -191,22 +191,27 @@ enum DraftVerifier {
                         preconditionFailure(
                             "qwen36 topology requires DeltaNet state/weights")
                     }
-                    // encodeBatched(tk+1) processes tokens 0..tk in a single
-                    // Metal command buffer per tk.  Each call recomputes all
-                    // previously seen tokens from their original inputs (same
-                    // semantic as the sequential encode()-loop above) but
-                    // collapses O(K²) Metal CB syncs down to O(K).
-                    // Result folds into hidden at per-token offsets via
-                    // store_hidden_batched, so no post-copy is needed.
+                    // convState/recurrentState are the real persistent
+                    // per-layer buffers, mutated in place — there is no
+                    // checkpoint/rollback for a later-rejected draft, so
+                    // each token's state update must happen exactly once,
+                    // in causal order. encode() does that at O(1) cost per
+                    // token, chaining correctly since it is called once per
+                    // tk in the same token-major order the attention/MoE
+                    // branches already use. (A prior version called
+                    // encodeBatched(tk+1) here — replaying tokens 0..tk from
+                    // scratch every tk, which is both O(K²) and corrupts
+                    // state across rounds since the buffer isn't reset
+                    // between calls; see PHASE-LOG.md #34 entry.)
                     let cb = queue.makeCommandBuffer()!
-                    deltaNet.encodeBatched(commandBuffer: cb,
-                                           hidden: hidden,
-                                           weights: try weightsCache.weights(
-                                               layer: L),
-                                           convState: convState,
-                                           recurrentState: recurrentState,
-                                           tk: tk + 1,
-                                           eps: eps)
+                    deltaNet.encode(commandBuffer: cb,
+                                    hidden: hidden,
+                                    hiddenOffset: tokenOff,
+                                    weights: try weightsCache.weights(
+                                        layer: L),
+                                    convState: convState,
+                                    recurrentState: recurrentState,
+                                    eps: eps)
                     cb.commit()
                     waitForCommandBuffer(cb)
                     try checkCmdError(cb.error)

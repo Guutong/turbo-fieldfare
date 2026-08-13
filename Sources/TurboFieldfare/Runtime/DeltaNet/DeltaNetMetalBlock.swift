@@ -309,6 +309,7 @@ final class DeltaNetMetalBlock {
     /// thread owns its own state row).
     func encode(commandBuffer cb: MTLCommandBuffer,
                 hidden: MTLBuffer,
+                hiddenOffset: Int = 0,
                 weights: LayerWeights,
                 convState: MTLBuffer,
                 recurrentState: MTLBuffer,
@@ -321,8 +322,10 @@ final class DeltaNetMetalBlock {
         let floatSize = MemoryLayout<Float>.size
         var epsValue = eps
 
-        // hidden (FP16) -> x (fp32).
-        enc.setBuffer(hidden, offset: 0, index: 0)
+        // hidden (FP16) -> x (fp32). hiddenOffset selects this token's slice
+        // when `hidden` is a shared multi-token buffer (e.g. DraftVerifier's
+        // K-token scratch), 0 for a single-token buffer.
+        enc.setBuffer(hidden, offset: hiddenOffset, index: 0)
         enc.setBuffer(xBuf, offset: 0, index: 1)
         var d = UInt32(D)
         enc.setBytes(&d, length: MemoryLayout<UInt32>.size, index: 2)
@@ -411,7 +414,7 @@ final class DeltaNetMetalBlock {
         // out_proj, then fold back into the FP16 residual stream.
         matVec(enc, w: weights.out, x: gatedBuf, y: deltaOutBuf, rows: D, cols: valueDim)
 
-        enc.setBuffer(hidden, offset: 0, index: 0)
+        enc.setBuffer(hidden, offset: hiddenOffset, index: 0)
         enc.setBuffer(xBuf, offset: 0, index: 1)
         enc.setBuffer(deltaOutBuf, offset: 0, index: 2)
         enc.setBytes(&d, length: MemoryLayout<UInt32>.size, index: 3)
