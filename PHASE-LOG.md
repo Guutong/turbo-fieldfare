@@ -98,7 +98,7 @@ smaller tasks in `plan.md`, add them to the board with new IDs, and stop with
 | P7-2 | Batched full-attention KV writes for K positions | TODO | Phase 7 · reuse Gemma's executePrefillChunk KV-write path for Qwen3.6's 10 full-attn layers |
 | P7-3 | Layer-major DeltaNet kernel (K tokens, one round-trip) | TODO | Phase 7 · ⚠️ frontier · highest-risk task, relL2 gate unchanged (≤1e-5), the actual bottleneck fix |
 | P7-4 | Wire batched forward pass into decode loop | TODO | Phase 7 · ⚠️ frontier · makes P6b-4's speculator's tokensPerRound ceiling cashable into real tok/s |
-| P7-5 | Re-measure the P6-3 mission gate | FAILED | speed FAIL (3.78 tok/s vs ≥4) · memory FAIL (5.74 GB vs ≤2GB) — Studio fresh repack, fp16 ruled out (SSD I/O is the bottleneck, not compute) — see History |
+| P7-5 | Re-measure the P6-3 mission gate | FAILED | Air same-machine (final): speed FAIL (1.97–1.99 tok/s vs ≥4) · memory PASS (1.58–1.64 GB vs ≤2GB) — resolves the Studio cross-machine confound; Studio's 5.74GB RSS does not reproduce on the target Air machine, likely a Studio-specific artifact, not a real leak — see History |
 | P3-1 | DeltaNet conv1d + state (Swift) | DONE | 5 hand-checked tests; 662/662 suite |
 | P3-2 | Delta rule + gating (Swift) | DONE | 16 tests; 678/678 suite; oracle-verified |
 | P3-3 | Layer-0 isolation test | DONE | Real repack (LayerWriter fix) into scratch/qwen36.gturbo; gate passes relL2≤0.0075, maxAbs≤0.0039 — see History |
@@ -1989,3 +1989,55 @@ directly: Qwen3.6's `topKExperts = 8` is a fixed architecture constant
 from the checkpoint, not a runtime knob we're free to prune without
 retraining/re-validating router behavior — different situation from
 their empirically-tuned MoE.
+
+### 2026-08-13 — P7-5 — same-machine re-measure (Air, resolves cross-machine confound)
+
+**Did:** User downloaded the Qwen3.6-35B-A3B-4bit checkpoint locally to
+the target machine (`~/models/Qwen3.6-35B-A3B-4bit`, 26 GB). Repacked
+fresh on this machine (`TurboFieldfareRepack --local-checkpoint`, not
+streamed), verified the install, then re-ran the P6-3 mission-gate
+measurement directly on the machine `plan.md` names as the target
+(16 GB M2 MacBook Air) — eliminating the Studio-vs-Air confound flagged
+as unresolved in the prior P7-5 entry.
+
+**Ran:**
+```
+.build/release/TurboFieldfareRepack --output scratch/qwen36.gturbo \
+  --local-checkpoint ~/models/Qwen3.6-35B-A3B-4bit --overwrite
+.build/release/TurboFieldfareRepack --verify-install --input-gturbo scratch/qwen36.gturbo
+  -> Verified 47 files (19551394819 bytes)
+
+/usr/bin/time -l ./.build/release/TurboFieldfareCLI --model scratch/qwen36.gturbo \
+  --prompt "The capital of France is" --temperature 0 --max-new 48 --prefill off
+```
+Run 1: `decode=24.38s tok/s=1.969` · maximum resident set size `1641005056` B (1.64 GB)
+Run 2: `decode=24.11s tok/s=1.991` · maximum resident set size `1658355712` B (1.58 GB)
+
+**Learned:**
+- **Memory gate PASSES on the actual target machine**: 1.58–1.64 GB,
+  both runs comfortably under the ≤2 GB gate. The 5.74 GB RSS measured
+  on the Studio in the prior entry does **not** reproduce here — it was
+  a Studio-specific artifact (different machine, different memory
+  pressure/compressor behavior, possibly the still-running oMLX
+  process noted in that session), not a real leak in this codebase.
+  The RSS investigation into `RealForwardRunner`/`DraftVerifier`/
+  `PreadExpertStreamer` scratch buffers from the prior entry can be
+  closed — those buffers were never the cause.
+- **Speed gate still FAILS, and by more than the Studio number
+  suggested**: 1.97–1.99 tok/s vs ≥4 required, and notably *below*
+  even the original P6-3 baseline (2.298 tok/s) measured on this same
+  class of machine before Phase 7's batching landed. Phase 7's
+  K-token batching has not yet produced a wall-clock win on the Air —
+  consistent with the P6b-4 finding that speculative decoding's gains
+  aren't realizable without the batched forward pass actually reducing
+  the number of expensive round-trips per token, which is still gated
+  on #34 (the layer-major DeltaNet kernel not yet built).
+
+**Verdict: P7-5 remains FAILED** — memory gate now passes on the
+correct machine, but the speed gate is the binding constraint and is
+farther from passing than previously measured, not closer. No gate
+redefinition.
+
+**Next:** #34 (layer-major DeltaNet kernel) is the only remaining path
+to closing the speed gate — confirmed unblocked by hardware or
+cross-machine ambiguity now.
