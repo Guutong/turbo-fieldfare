@@ -2,6 +2,9 @@
 using namespace metal;
 
 constant constexpr uint kMoEGroupSize = 64;
+// Max hidden size for the phase-1 threadgroup-staged activation (covers
+// realDecodeD's 2816; cooperative load is guarded for smaller D).
+constant constexpr uint kMoEXMaxD = 2816;
 constant constexpr uint kMoEMaxTopK = 16;
 constant constexpr float kGeluSqrt2OverPi = 0.7978845608028654f;
 constant constexpr float kGeluCubicCoeff = 0.044715f;
@@ -599,6 +602,100 @@ static inline float2 moe_int4_gate_up_rows_simd_dev_vec_u16load(
     return float2(simd_sum(g_acc), simd_sum(u_acc));
 }
 
+// Threadgroup-staged activation counterpart of
+// moe_int4_gate_up_rows_simd_dev_vec_u16load above: all rows in a threadgroup
+// share the same x vector, but each SIMD row loop re-reads it from device
+// memory. Staging x in threadgroup memory once per threadgroup (cooperative
+// load + barrier) removes those redundant re-reads.
+static inline float2 moe_int4_gate_up_rows_simd_tgmem_u16load(
+    threadgroup const half* x,
+    device const uint8_t* gateW,
+    device const bfloat* gateS,
+    device const bfloat* gateB,
+    device const uint8_t* upW,
+    device const bfloat* upS,
+    device const bfloat* upB,
+    uint row,
+    uint N,
+    uint lane
+) {
+    const uint n_groups = N / kMoEGroupSize;
+    const uint row_bytes = N / 2;
+    device const uint8_t* gW_row = gateW + uint(row) * row_bytes;
+    device const uint8_t* uW_row = upW + uint(row) * row_bytes;
+    device const bfloat* gS_row = gateS + uint(row) * n_groups;
+    device const bfloat* gB_row = gateB + uint(row) * n_groups;
+    device const bfloat* uS_row = upS + uint(row) * n_groups;
+    device const bfloat* uB_row = upB + uint(row) * n_groups;
+
+    float g_acc = 0.0f;
+    float u_acc = 0.0f;
+    const uint full_blocks = n_groups / 4;
+    for (uint blk = 0; blk < full_blocks; ++blk) {
+        const uint byte_base = blk * 128u + lane * 4u;
+        device const ushort* gp = (device const ushort*)(gW_row + byte_base);
+        device const ushort* up = (device const ushort*)(uW_row + byte_base);
+        const uint gw4 = uint(gp[0]) | (uint(gp[1]) << 16);
+        const uint uw4 = uint(up[0]) | (uint(up[1]) << 16);
+        const uint g = blk * 4u + (lane >> 3);
+        const float gs = float(gS_row[g]);
+        const float gb = float(gB_row[g]);
+        const float us = float(uS_row[g]);
+        const float ub = float(uB_row[g]);
+        const uint elem = byte_base * 2u;
+        const float e0 = float(x[elem]), e1 = float(x[elem + 1u]);
+        const float e2 = float(x[elem + 2u]), e3 = float(x[elem + 3u]);
+        const float e4 = float(x[elem + 4u]), e5 = float(x[elem + 5u]);
+        const float e6 = float(x[elem + 6u]), e7 = float(x[elem + 7u]);
+        const float sum = e0 + e1 + e2 + e3 + e4 + e5 + e6 + e7;
+
+        const uint gb0 = gw4 & 0xFFu;
+        const uint gb1 = (gw4 >> 8) & 0xFFu;
+        const uint gb2 = (gw4 >> 16) & 0xFFu;
+        const uint gb3 = (gw4 >> 24) & 0xFFu;
+        float g_dot = 0.0f;
+        g_dot = fma(float(gb0 & 0x0Fu), e0, g_dot); g_dot = fma(float(gb0 >> 4), e1, g_dot);
+        g_dot = fma(float(gb1 & 0x0Fu), e2, g_dot); g_dot = fma(float(gb1 >> 4), e3, g_dot);
+        g_dot = fma(float(gb2 & 0x0Fu), e4, g_dot); g_dot = fma(float(gb2 >> 4), e5, g_dot);
+        g_dot = fma(float(gb3 & 0x0Fu), e6, g_dot); g_dot = fma(float(gb3 >> 4), e7, g_dot);
+
+        const uint ub0 = uw4 & 0xFFu;
+        const uint ub1 = (uw4 >> 8) & 0xFFu;
+        const uint ub2 = (uw4 >> 16) & 0xFFu;
+        const uint ub3 = (uw4 >> 24) & 0xFFu;
+        float u_dot = 0.0f;
+        u_dot = fma(float(ub0 & 0x0Fu), e0, u_dot); u_dot = fma(float(ub0 >> 4), e1, u_dot);
+        u_dot = fma(float(ub1 & 0x0Fu), e2, u_dot); u_dot = fma(float(ub1 >> 4), e3, u_dot);
+        u_dot = fma(float(ub2 & 0x0Fu), e4, u_dot); u_dot = fma(float(ub2 >> 4), e5, u_dot);
+        u_dot = fma(float(ub3 & 0x0Fu), e6, u_dot); u_dot = fma(float(ub3 >> 4), e7, u_dot);
+
+        g_acc = fma(gs, g_dot, g_acc);
+        g_acc = fma(gb, sum, g_acc);
+        u_acc = fma(us, u_dot, u_acc);
+        u_acc = fma(ub, sum, u_acc);
+    }
+    for (uint g = full_blocks * 4u; g < n_groups; ++g) {
+        const float gs = float(gS_row[g]);
+        const float gb = float(gB_row[g]);
+        const float us = float(uS_row[g]);
+        const float ub = float(uB_row[g]);
+        const uint8_t gbv = gW_row[g * (kMoEGroupSize / 2) + lane];
+        const uint8_t ubv = uW_row[g * (kMoEGroupSize / 2) + lane];
+        const float x0 = float(x[g * kMoEGroupSize + lane * 2u]);
+        const float x1 = float(x[g * kMoEGroupSize + lane * 2u + 1u]);
+        const float sum = x0 + x1;
+        float g_dot = fma(float(uint(gbv & 0x0Fu)), x0, 0.0f);
+        g_dot = fma(float(uint(gbv >> 4)), x1, g_dot);
+        float u_dot = fma(float(uint(ubv & 0x0Fu)), x0, 0.0f);
+        u_dot = fma(float(uint(ubv >> 4)), x1, u_dot);
+        g_acc = fma(gs, g_dot, g_acc);
+        g_acc = fma(gb, sum, g_acc);
+        u_acc = fma(us, u_dot, u_acc);
+        u_acc = fma(ub, sum, u_acc);
+    }
+    return float2(simd_sum(g_acc), simd_sum(u_acc));
+}
+
 // Group-size-agnostic counterpart to
 // moe_int4_gate_up_rows_simd_dev_vec_u16load above, same rationale as
 // moe_int4_gemv_row_simd_dev_vec_generic: strided-lane loop instead of the
@@ -737,10 +834,35 @@ kernel void moe_phase1_gate_up_act_u16load(
     uint sg_idx [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]
 ) {
-    constexpr uint rows_per_tg = 8;
-    moe_phase1_gate_up_act_u16load_body(
-        routed, routed_offsets, x, acts, moe_fc_d(D), moe_fc_f(F),
-        moe_fc_top_k(top_k), rows_per_tg, tg_idx, sg_idx, lane);
+    // 16 rows per threadgroup with the shared activation staged in
+    // threadgroup memory: every row loop in moe_phase1_gate_up_act_u16load_body
+    // independently re-read x from device memory even though all rows in a
+    // threadgroup share it. Staging once (cooperative load + barrier) raises
+    // measured bandwidth from ~38% to ~56% of peak (see NVMAI moe_phase1_xsh16).
+    constexpr uint rows_per_tg = 16;
+    threadgroup half xt[kMoEXMaxD];
+    const uint DD = moe_fc_d(D);
+    for (uint i = lane; i < DD; i += 32u) {
+        xt[i] = x[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint rowg = tg_idx * rows_per_tg + sg_idx;
+    if (rowg >= moe_fc_top_k(top_k) * moe_fc_f(F)) return;
+    const uint slot = rowg / moe_fc_f(F);
+    const uint f = rowg % moe_fc_f(F);
+
+    device const uint8_t* base = routed.blob[slot];
+    const ExpertOffsets re = routed_offsets;
+    const float2 gu = moe_int4_gate_up_rows_simd_tgmem_u16load(
+        xt, base + re.gate_W_off,
+        (device const bfloat*)(base + re.gate_s_off),
+        (device const bfloat*)(base + re.gate_b_off),
+        base + re.up_W_off,
+        (device const bfloat*)(base + re.up_s_off),
+        (device const bfloat*)(base + re.up_b_off),
+        f, DD, lane);
+    if (lane == 0) acts[slot * moe_fc_f(F) + f] = half( ((is_function_constant_defined(FC_USE_SILU) && FC_USE_SILU) ? silu(gu.x) : gelu_pytorch_tanh(gu.x)) * gu.y );
 }
 
 kernel void moe_phase1_gate_up_act_subset_u16load(
@@ -757,11 +879,32 @@ kernel void moe_phase1_gate_up_act_subset_u16load(
     uint sg_idx [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]
 ) {
-    constexpr uint rows_per_tg = 8;
-    moe_phase1_gate_up_act_subset_u16load_body(
-        routed, routed_offsets, x, acts, active_slots, active_count,
-        moe_fc_d(D), moe_fc_f(F), moe_fc_top_k(top_k), rows_per_tg,
-        tg_idx, sg_idx, lane);
+    constexpr uint rows_per_tg = 16;
+    threadgroup half xt[kMoEXMaxD];
+    const uint DD = moe_fc_d(D);
+    for (uint i = lane; i < DD; i += 32u) {
+        xt[i] = x[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint rowg = tg_idx * rows_per_tg + sg_idx;
+    if (rowg >= active_count * moe_fc_f(F)) return;
+    const uint active_idx = rowg / moe_fc_f(F);
+    const uint slot = active_slots[active_idx];
+    if (slot >= moe_fc_top_k(top_k)) return;
+    const uint f = rowg % moe_fc_f(F);
+
+    device const uint8_t* base = routed.blob[slot];
+    const ExpertOffsets re = routed_offsets;
+    const float2 gu = moe_int4_gate_up_rows_simd_tgmem_u16load(
+        xt, base + re.gate_W_off,
+        (device const bfloat*)(base + re.gate_s_off),
+        (device const bfloat*)(base + re.gate_b_off),
+        base + re.up_W_off,
+        (device const bfloat*)(base + re.up_s_off),
+        (device const bfloat*)(base + re.up_b_off),
+        f, DD, lane);
+    if (lane == 0) acts[slot * moe_fc_f(F) + f] = half( ((is_function_constant_defined(FC_USE_SILU) && FC_USE_SILU) ? silu(gu.x) : gelu_pytorch_tanh(gu.x)) * gu.y );
 }
 
 // Generic-groupSize counterparts of the two phase-1 bodies above, calling

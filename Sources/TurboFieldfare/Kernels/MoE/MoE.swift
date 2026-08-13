@@ -381,9 +381,19 @@ final class MoE {
         if useGeneric {
             encoder.setBytes(&group, length: MemoryLayout<UInt32>.stride, index: 7)
         }
-        encoder.dispatchThreadgroups(
-            MTLSize(width: (Int(topK * f) + 7) / 8, height: 1, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        // moe_phase1_gate_up_act_u16load (non-generic) uses 16 rows/threadgroup
+        // with the shared activation staged in threadgroup memory — measured
+        // +36% routedCB on the reference fork. The generic strided-lane
+        // kernel is untouched and still dispatches at 8 rows/256 threads.
+        if useGeneric {
+            encoder.dispatchThreadgroups(
+                MTLSize(width: (Int(topK * f) + 7) / 8, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        } else {
+            encoder.dispatchThreadgroups(
+                MTLSize(width: (Int(topK * f) + 15) / 16, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 512, height: 1, depth: 1))
+        }
         encoder.endEncoding()
     }
 
@@ -435,9 +445,15 @@ final class MoE {
         if useGeneric {
             encoder.setBytes(&group, length: MemoryLayout<UInt32>.stride, index: 9)
         }
-        encoder.dispatchThreadgroups(
-            MTLSize(width: (Int(activeCount * f) + 7) / 8, height: 1, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        if useGeneric {
+            encoder.dispatchThreadgroups(
+                MTLSize(width: (Int(activeCount * f) + 7) / 8, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        } else {
+            encoder.dispatchThreadgroups(
+                MTLSize(width: (Int(activeCount * f) + 15) / 16, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 512, height: 1, depth: 1))
+        }
         encoder.endEncoding()
     }
 
