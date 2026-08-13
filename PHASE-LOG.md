@@ -2156,3 +2156,62 @@ unprofiled and is the next open question before further speed work.
 still TODO.** What shipped this session is a correctness fix + safety
 fix for the existing batched kernel, not the throughput win #34 was
 supposed to deliver. The P6-3/P7-5 speed gate remains FAILED.
+
+### 2026-08-13 — MoE phase-1 kernel: ported NVMAI's threadgroup-staged activation, small gain, gate still FAILED
+
+**Context:** cross-referenced NVMAI's commit history
+(`/Users/guutong/Workspaces/NVMAI`, independent sibling fork of this
+project) for real throughput levers, since #34 remains unbuilt and
+the DeltaNet fix above moved nothing. Found three real, measured wins
+in their history: expert-cache slots 32->64 + pin (+10% decode),
+parallel `pread` fills across CPU cores (+28% decode — already
+present here as P6b-2, confirmed no-op to port), and a phase-1 MoE
+kernel rewrite (+36% routedCB, 38%->56% of peak bandwidth).
+
+**Ported the MoE phase-1 rewrite** (`5a7902b` in NVMAI): the
+`moe_phase1_gate_up_act_u16load` / `_subset_u16load` kernels
+(`moe.metal`) had every SIMD row loop independently re-read the
+shared `x` activation vector from device memory, even though all rows
+in a threadgroup share the same `x`. Added
+`moe_int4_gate_up_rows_simd_tgmem_u16load` — a threadgroup-memory
+variant that cooperatively stages `x` into `threadgroup half
+xt[kMoEXMaxD]` once per threadgroup (barrier before use), and widened
+`rows_per_tg` from 8 to 16 (512 threads/threadgroup). Only the
+non-generic (group-64) u16load kernels were touched; the
+group-agnostic strided-lane path is untouched, and `MoE.swift`'s
+dispatch now branches so the generic PSO keeps its original 8-row/256-
+thread dispatch. All 24 `MoE`-filtered tests pass (group64 and
+group128 parity against the CPU oracle). Committed `7d58561`.
+
+**Re-measured** (release build, default 16-slot cache, same command
+as all prior gate runs):
+```
+[stop=maxTokens prefill=5tok new=48tok decode=23.38s tok/s=2.053]
+maximum resident set size: 1694793728 (1.58 GB)
+```
+
+**Verdict: still FAILED.** tok/s 2.053 vs the prior 1.943-1.99 range
+— a ~5-6% gain, at the edge of run-to-run noise seen elsewhere in this
+log (e.g. the 256-slot experiment's 2.003 vs 1.97-1.99 baseline was
+called "statistically indistinguishable"). Not a confirmed win, and
+nowhere near closing the gap to >=4 tok/s. Memory gate still passes
+(1.58 GB vs <=2 GB).
+
+**Learned:** NVMAI's own reported gain (+36% routedCB, i.e. one
+sub-span of the decode step) does not translate to a comparable
+end-to-end tok/s gain here. Either this repo's MoE phase-1 span is a
+much smaller fraction of total decode time than in NVMAI's build, or
+something else dominates (dispatch overhead, attention, expert I/O
+even with P6b-2 already applied, or Air vs M3 hardware differences).
+Confirms the note above: the per-token time breakdown is unprofiled
+and guessing at individual kernel optimizations one at a time, without
+per-command-buffer GPU timing (which NVMAI built and this repo has
+not), is not converging on the gate. Building that profiling
+capability is the priority before further point-fixes.
+
+**Next:** either (a) build per-command-buffer / per-kernel GPU timing
+instrumentation to find where decode time actually goes, or (b)
+proceed with #34's originally-scoped layer-major restructuring on the
+hypothesis that per-token dispatch overhead across 40 layers, not any
+single kernel's bandwidth, is the dominant cost. Not decided this
+session — stopping here per user request.
