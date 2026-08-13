@@ -2041,3 +2041,34 @@ redefinition.
 **Next:** #34 (layer-major DeltaNet kernel) is the only remaining path
 to closing the speed gate — confirmed unblocked by hardware or
 cross-machine ambiguity now.
+
+### 2026-08-13 — Note — expert-cache slot count ruled out as speed bottleneck
+
+**Context:** user authorized raising the RAM budget to <=50% of the
+16 GB Air (<=8 GB), well above the 1.6-1.8 GB actually used. Cheap
+experiment before starting #34: does giving the expert cache more
+room close any of the gap to the >=4 tok/s gate? Extended
+`RuntimeConfiguration.allowedExpertCacheSlots` from `[8,16,24,32]` to
+`[8,16,24,32,64,128,256]` (`RuntimeConfiguration.swift:23`, plus the
+matching `--expert-cache-slots` help text in `Args.swift`) — additive,
+no other behavior change.
+
+**Ran:** `--expert-cache-slots 256` (= `numExperts`, every expert
+resident simultaneously, cache misses structurally impossible for a
+single-prompt decode run):
+```
+[stop=maxTokens prefill=5tok new=48tok decode=23.97s tok/s=2.003]
+maximum resident set size: 1776517120 (1.78 GB)
+```
+
+**Learned:** tok/s **2.003** vs the 16-slot baseline's **1.97-1.99** —
+statistically indistinguishable, and RSS stayed at 1.78 GB even with
+every expert loaded. Expert-cache hit rate is not the binding
+constraint on decode speed at any slot count between 16 and 256; the
+`>=4` tok/s gate cannot be closed by cache tuning. This directly rules
+out one candidate path and leaves #34 (layer-major DeltaNet kernel —
+replacing the sequential per-token forward pass, not just batching the
+existing one) as the only mechanism left that changes the actual
+per-token work being done.
+
+**Next:** proceed to #34.
