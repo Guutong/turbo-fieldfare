@@ -2072,3 +2072,87 @@ existing one) as the only mechanism left that changes the actual
 per-token work being done.
 
 **Next:** proceed to #34.
+
+### 2026-08-13 — #34 — DeltaNet batched-kernel bugs found + fixed; DraftVerifier reverted to encode(); speed gate still FAILED
+
+**Context:** started #34 by writing the first-ever K>1 parity test for
+`DeltaNetMetalBlock.encodeBatched` (`DeltaNetMetalParityTests.swift`,
+`encodeBatchedMatchesKSequentialCPUCallsChainingState`) — no test had
+ever exercised the batched path against a chained-state CPU oracle.
+First run: relL2 1.0/NaN on every token, total failure. This was not
+"unoptimized," it was broken. Cross-referenced NVMAI (independent
+sibling fork, `sources/NVMAI/Metal/GDN/gdn.metal`) for a
+proven-correct batched-recurrence design to compare against.
+
+**Four real bugs found and fixed in `deltanet.metal` /
+`DeltaNetMetalBlock.swift`:**
+1. `dn_conv_step_batched` / `dn_recurrence_batched` indexed state
+   per-token (`token * stateSize`) into buffers sized for **one**
+   token only — actual GPU out-of-bounds writes, plus no cross-token
+   chaining. Fixed: single fixed state slice per thread, sequential
+   internal loop over the batch (matches NVMAI's `gdn_delta_step_prefill`
+   pattern).
+2. `encodeBatched`'s 5 matvec call sites used the **non-batched**
+   `dn_matvec` kernel via a `rows: X * tk` scaling hack — reads
+   token-0's input for every "row" and, past the real row count, reads
+   garbage weight memory. The correct `dn_matvec_batched` pipeline
+   (`psoMatVecB`, compiled but never wired in) was hooked up via a new
+   `matVecBatched()` Swift helper.
+3. `dn_qknorm_expand_batched` assumed q/k live in separate
+   contiguous per-token arrays; the real `convOutBuf` is token-major
+   interleaved `[q,k,v]` with stride = `convDim`. Fixed with an
+   explicit `rowStride` kernel parameter — no buffer-offset fix was
+   possible, this was a real stride mismatch.
+4. `dn_recurrence_batched`'s `v`-read and `y`-write used bare `vIdx`
+   instead of `tid = head*headVDim+vIdx`, silently dropping the
+   per-head offset — only correct at `numValueHeads==1`.
+
+After all four fixes: new K=6 parity test passes at relL2 <=1e-5, and
+the full `DeltaNetParityTests` suite (4 tests, including the existing
+30-layer P4-2 sweep) passes clean. Committed `99d7c42`.
+
+**Second problem, found after kernel correctness was fixed:** fixing
+the kernel math alone did not make `encodeBatched` safe to call the
+way `DraftVerifier` called it. The caller pattern was
+`for tk in 0..<K { encodeBatched(..., tk: tk+1, ...) }` — repeated
+calls with a growing prefix against the same real, persistent
+`convState`/`recurrentState` buffers. No checkpoint/rollback exists
+anywhere in the codebase for rejected speculative-decode drafts. Once
+the kernel correctly assumes each call starts from pristine pre-round
+state, a larger-`tk` call after a smaller-`tk` call reads
+already-mutated state — silently wrong, and O(K²) besides. **Fix:**
+removed `encodeBatched` from `DraftVerifier` entirely; added a
+`hiddenOffset` parameter to the already-correct, O(1)-per-token
+`encode()` and call it once per `tk` inside the same token-major loop
+as attention/MoE (`DraftVerifier.swift`, `DeltaNetMetalBlock.swift`).
+`encodeBatched` itself is left in place, tested, and correct — a
+validated building block for a real future layer-major rewrite, but
+currently unused in production. Committed `ffa65d0`.
+
+**Re-measured after this fix** (release build,
+`--expert-cache-slots` default 16):
+```
+[stop=maxTokens prefill=5tok new=48tok decode=24.71s tok/s=1.943]
+maximum resident set size: 1749483520 (1.63 GB)
+```
+
+**Verdict: no speed change** — 1.943 tok/s vs the pre-fix 1.97-1.99
+(within noise), still far below the >=4 gate. Memory gate still
+passes (1.63 GB vs <=2 GB).
+
+**Learned:** the batched-DeltaNet bugs were real correctness/safety
+bugs (worth fixing on their own merit — GPU OOB writes and silent
+state corruption are not acceptable regardless of throughput), but
+DeltaNet's per-token forward cost was never the dominant term in
+decode wall-clock time at this K. Fixing it, or reverting to the safe
+single-token path, moves tok/s by noise, not by a multiple. The actual
+#34 scope — a true layer-major restructuring that changes what runs
+per decode step, not just how DeltaNet's linear layers are batched —
+remains unbuilt. Where the real per-token time is going (attention?
+MoE dispatch/expert load? per-kernel dispatch overhead?) is still
+unprofiled and is the next open question before further speed work.
+
+**Status: #34 as originally scoped (layer-major restructuring) is
+still TODO.** What shipped this session is a correctness fix + safety
+fix for the existing batched kernel, not the throughput win #34 was
+supposed to deliver. The P6-3/P7-5 speed gate remains FAILED.
