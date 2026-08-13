@@ -98,7 +98,7 @@ smaller tasks in `plan.md`, add them to the board with new IDs, and stop with
 | P7-2 | Batched full-attention KV writes for K positions | TODO | Phase 7 · reuse Gemma's executePrefillChunk KV-write path for Qwen3.6's 10 full-attn layers |
 | P7-3 | Layer-major DeltaNet kernel (K tokens, one round-trip) | TODO | Phase 7 · ⚠️ frontier · highest-risk task, relL2 gate unchanged (≤1e-5), the actual bottleneck fix |
 | P7-4 | Wire batched forward pass into decode loop | TODO | Phase 7 · ⚠️ frontier · makes P6b-4's speculator's tokensPerRound ceiling cashable into real tok/s |
-| P7-5 | Re-measure the P6-3 mission gate | TODO | Phase 7 · closes the loop honestly, PASS/FAIL as measured, no gate redefinition |
+| P7-5 | Re-measure the P6-3 mission gate | IN PROGRESS | Phase 7 · partial Studio data captured (3.23 tok/s, ~3.15 GB RSS ×2) but gate-machine ambiguous — see 2026-08-13 entry |
 | P3-1 | DeltaNet conv1d + state (Swift) | DONE | 5 hand-checked tests; 662/662 suite |
 | P3-2 | Delta rule + gating (Swift) | DONE | 16 tests; 678/678 suite; oracle-verified |
 | P3-3 | Layer-0 isolation test | DONE | Real repack (LayerWriter fix) into scratch/qwen36.gturbo; gate passes relL2≤0.0075, maxAbs≤0.0039 — see History |
@@ -1848,3 +1848,86 @@ not a new bug: `Tokenizer.swift` resolves `endOfTurnID` from the Gemma-specific
 silently resolves to id 0 and never fires. Still open; `3.633 tok/s` should be treated
 as a rough draft number until that's fixed and the run re-measured with a clean
 `stop=endOfTurn`.
+
+### 2026-08-13 — P7-5 — IN PROGRESS (partial Studio measurements; gate machine unresolved)
+
+Did:      Measurement only. No source code was changed. The task is to
+          re-run P6-3's exact protocol against the Phase 7 batched decode
+          path (P7-1/P7-2/P7-3/finishPendingMoE + P7-4 wiring) and report
+          the mission-gate numbers as-is, no gate redefinition.
+Ran:      Two runs of P6-3's exact command on the remote Mac Studio
+          (Mac13,1, M1 Max, 32 GB, macOS 26.5.2), HEAD 9b9eb0f (includes
+          all Phase 7 commits, router-scoring fix e7f5f78, and the eos-fix
+          4c909b4), release binary built Aug 11 00:31, scratch/qwen36.gturbo
+          installed (47 files, ~18 GB on disk, verified-install confirmed
+          during the Aug 10–11 session). model_weights.bin = 1389476096 B
+          = 1.29 GB — matches P6-3's "1325 MB", so the resident weight
+          load is unchanged.
+
+          `/usr/bin/time -l ./.build/release/TurboFieldfareCLI --model
+          scratch/qwen36.gturbo --prompt "The capital of France is"
+          --temperature 0 --max-new 48 --prefill off`
+
+          **Run 1:** `[stop=maxTokens prefill=5tok new=48tok
+          decode=14.83s tok/s=3.237]`, `31.65 real  11.05 user  5.35 sys`,
+          `3148316672 maximum resident set size` (2.93 GB).
+          **Run 2:** `[stop=maxTokens prefill=5tok new=48tok
+          decode=14.85s tok/s=3.232]`, `30.37 real  10.94 user  4.97 sys`,
+          `3714842624 maximum resident set size` (3.46 GB).
+          Both runs produced coherent, correct output ("Paris, a city
+          renowned for its iconic landmarks such as the Eiffel Tower, the
+          Louvre Museum, and Notre-Dame Cathedral. ... The capital of
+          Germany is Berlin"), consistent with P6-3's output and with the
+          eos-fix's end-of-turn behaviour on the short-prompt maxTokens
+          path.
+Learned:  **(a) The Phase 7 batched path is measurably faster, but the
+          comparison is muddied by a machine change.** The headline speed
+          is 3.23 tok/s vs P6-3's 2.298 tok/s — a 1.41× improvement. On
+          the same hardware that would be a clear sign the P7-3 / P7-4
+          work paid off. But plan.md line 6 declares the gate's target
+          machine is the 16 GB M2 MacBook Air, and P6-3's 2.298 tok/s
+          baseline was taken on the Air (HANDOFF R5's "scratch/ already
+          holds 73 GB" disk accounting placed the model there; local
+          scratch was only cleaned up between Aug 10–13 during the Studio
+          deployment). The 3.23 tok/s was taken on the Mac Studio. So the
+          before/after is NOT apples-to-apples — the 1.41× could be real,
+          could be partly Studio-vs-Air, or both. A same-machine re-run
+          is needed for the verdict to stand.
+          **(b) Resident memory nearly doubled.** P6-3 measured 1.57 GB
+          peak RSS; P7-5 measures 2.93–3.46 GB across the two runs.
+          model_weights.bin is unchanged at ~1.29 GB, so the jump is
+          coming from the Phase 7 runtime — most likely the batched
+          expert fetch buffers (K×topK experts planned, deduplicated,
+          held across a layer in the `finishPendingMoE` pipeline) plus
+          the K-token decode staging. The two runs disagree with each
+          other by ~0.5 GB, which is consistent with cache/disk-read
+          variance rather than a deterministic allocation change.
+          **(c) The Studio was not fully idle.** `omlx-server` was running
+          (RSS 2.9 GB, 0.7% CPU) plus oMLX and Activity Monitor (javis
+          session active). Mild contamination, in the same sense as
+          P6-3's own concurrent-TurboFieldfareCLI caveat.
+Unproven: **The gate verdict has not been issued.** 3.23 tok/s is below
+          the ≥4 tok/s gate on the Studio; ~3.15 GB RSS is above the
+          ≤2 GB gate on the Studio (assuming the RSS jump is the same on
+          the Air, which is plausible given model_weights.bin is the same
+          size and the batch buffers are software-side). But neither
+          number is valid until taken on the same machine as P6-3's
+          baseline — which is the Air, per plan.md line 6, and the Air
+          no longer has the model installed. The jump could also be
+          partly Studio-vs-Air (different memory controllers, different
+          page fault behaviour), in which case the ≤2 GB finding might
+          be overstated. The `omlx-server` background process is a small
+          but nonzero contamination.
+Next:     **User to decide machine.** Two options on the table:
+          **(A) rsync qwen36.gturbo (~18 GB) from Studio back to the M2
+          Air, rebuild on the Air, measure there for a strict
+          apples-to-apples against P6-3's 2.298 / 1.57 GB baseline.**
+          Local disk has ~109 GB free, fits easily. Cost: 20–40 min
+          transfer over Tailscale/LAN, rebuild a few minutes.
+          **(B) Accept the Studio as the new reference hardware going
+          forward** and record 3.23 tok/s / ~3.15 GB RSS as P7-5's
+          final number with a "different machine than P6-3" caveat.
+          Faster, but the mission-gate comparison (vs 2.298 / 1.57 GB)
+          becomes illustrative rather than rigorous. Whichever is
+          chosen, `omlx-server` should be stopped before the gate run
+          (P6-3 lesson: verify machine idle).
