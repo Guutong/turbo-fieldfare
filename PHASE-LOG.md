@@ -98,7 +98,7 @@ smaller tasks in `plan.md`, add them to the board with new IDs, and stop with
 | P7-2 | Batched full-attention KV writes for K positions | TODO | Phase 7 · reuse Gemma's executePrefillChunk KV-write path for Qwen3.6's 10 full-attn layers |
 | P7-3 | Layer-major DeltaNet kernel (K tokens, one round-trip) | TODO | Phase 7 · ⚠️ frontier · highest-risk task, relL2 gate unchanged (≤1e-5), the actual bottleneck fix |
 | P7-4 | Wire batched forward pass into decode loop | TODO | Phase 7 · ⚠️ frontier · makes P6b-4's speculator's tokensPerRound ceiling cashable into real tok/s |
-| P7-5 | Re-measure the P6-3 mission gate | FINAL | FAIL: 3.78 tok/s vs ≥4; RSS 5.74 GB vs ≤2GB. Verdict from Studio fresh repack (fp16 not needed — SSD I/O is bottleneck). See below |
+| P7-5 | Re-measure the P6-3 mission gate | FAILED | speed FAIL (3.78 tok/s vs ≥4) · memory FAIL (5.74 GB vs ≤2GB) — Studio fresh repack, fp16 ruled out (SSD I/O is the bottleneck, not compute) — see History |
 | P3-1 | DeltaNet conv1d + state (Swift) | DONE | 5 hand-checked tests; 662/662 suite |
 | P3-2 | Delta rule + gating (Swift) | DONE | 16 tests; 678/678 suite; oracle-verified |
 | P3-3 | Layer-0 isolation test | DONE | Real repack (LayerWriter fix) into scratch/qwen36.gturbo; gate passes relL2≤0.0075, maxAbs≤0.0039 — see History |
@@ -1850,7 +1850,7 @@ as a rough draft number until that's fixed and the run re-measured with a clean
 `stop=endOfTurn`.
 
 
-### 2026-08-13 — P7-5 — FINAL (Studio fresh repack; FP16 not needed)
+### 2026-08-13 — P7-5 — TODO -> FAILED (Studio fresh repack; both gates missed)
 
 Did:      Measurement only. No source code was changed. Re-ran P6-3's
           exact protocol against the Phase 7 batched decode path
@@ -1908,12 +1908,29 @@ Unproven: **The comparison between P7-5's 3.78 tok/s and P6-3's 2.298
           more cores and higher SSD bandwidth than M2 Air) and partly
           real Phase 7 improvements. Same-machine re-run on the Air
           would resolve this, but the user opted out of rsync.
-Next:     Two paths forward:
-          1. **Fix the remaining gaps:** speed needs another ~14% boost
-             to hit 4 tok/s (current 3.78), RSS needs major reduction
-             to meet ≤2 GB (currently 5.74 GB). Likely candidates:
-             reduce batch buffer footprint (#34 layer-major DeltaNet
-             kernel), context cap tuning.
-          2. **Ship what we have and iterate** — 3.78 tok/s is a significant
-             improvement over the 2.298 baseline even with cross-machine
-             caveats.
+Next:     Investigated whether the RSS jump could be patched cheaply
+          (read through `RealForwardRunner`'s scratch-buffer sizing,
+          `DraftVerifier.finishPendingMoE`, `ModelExpertIO.fetchRoutedExperts`,
+          and `PreadExpertStreamer`'s per-slot `MTLBuffer` allocation). The
+          scratch buffers scale by `maxBatchFactor = 8` on `hiddenSize`/
+          `moeIntermediateSize` (small, low tens of MB) and the expert-cache
+          slot buffers are sized identically to the P6-3 era (slotCount ×
+          expertStride, unchanged by Phase 7) — neither is the ~4 GB
+          source on its own from a read-through. Isolating it needs actual
+          instrumentation (peak-RSS breakdown by allocation site, not code
+          reading), which is Phase 7's real remaining task: **#34, the
+          layer-major DeltaNet kernel**, was never built — P7-3/P7-4 wired
+          the K-token batching around the *existing* sequential DeltaNet
+          path rather than replacing it, so the RSS growth is most likely
+          the K-token staging duplicating per-token intermediate state
+          across K rounds without the layer-major kernel's single-pass
+          design to collapse it. No source change made here — this was
+          scoped as a quick patch and turned out not to be one.
+          Two paths forward, unchanged in substance from before:
+          1. **Build #34** (highest risk/benefit, frontier-only): the
+             layer-major DeltaNet kernel is both the speed lever (collapses
+             K×40 round-trips to 1×40) and, per this investigation, the
+             most likely RSS lever too.
+          2. **Ship what we have and iterate** — 3.78 tok/s is a real
+             improvement over the 2.298 baseline even with the cross-machine
+             caveat; document it as provisional and move on.
