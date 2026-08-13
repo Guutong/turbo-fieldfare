@@ -1934,3 +1934,58 @@ Next:     Investigated whether the RSS jump could be patched cheaply
           2. **Ship what we have and iterate** — 3.78 tok/s is a real
              improvement over the 2.298 baseline even with the cross-machine
              caveat; document it as provisional and move on.
+
+### 2026-08-13 — Note — flash-moe paper cross-check, deferred pending #34
+
+**Context:** external paper (Anemll's flash-moe, arXiv-style PDF supplied
+by user) documents a 397B Qwen3.5 MoE streamed from NVMe on an M3 Max,
+5.74 tok/s sustained. Read in full to check for techniques applicable
+here. No source code changed.
+
+**Finding worth carrying forward:** their Section 5.3 ("Trust the OS")
+reports a **38% speedup (4.11 → 5.74 tok/s) from *removing* their
+application-level Metal LRU expert cache** (9.8 GB, GPU-visible shared
+memory) and letting macOS's page cache handle all expert-file caching
+instead. Root cause: GPU-visible shared memory pages can't be relocated
+or compressed by Apple Silicon's memory compressor, so a large
+app-level cache sitting in that memory class forces the compressor to
+thrash (60K–130K decompressions/sec measured via `vm_stat`) rather than
+evict — competing with GPU memory bandwidth. Their `F_NOCACHE` +
+2-bit config was *also* about 1% slower than trusting the OS cache
+outright (Table 6). This is the same shape of result as our own P6b-5
+(`F_NOCACHE` on the expert fd — measured NEUTRAL), but P6b-5 only
+toggled a read hint and left the slot-based Metal cache itself in
+place; it never tested removing the cache entirely, which is what
+the paper's win actually came from.
+
+**Why not acted on now:** `PreadExpertStreamer`'s slot pool
+(`slotBuffers: [MTLBuffer]`, `posix_memalign`-backed, GPU-visible
+shared memory — architecturally the same category the paper flags) is
+not an optional add-on here the way it was in their engine. P7-1
+through P7-4's entire batched multi-token path is built on top of it:
+`planExpertsCached(tokens:)`'s K-token dedup returns slot indices,
+P6b-1's pinning protects in-flight slots from concurrent eviction
+during the deferred-CMD3-style overlap, and `finishPendingMoE` assumes
+slot buffers exist to read multiple layers' resident experts from
+without re-fetching. Removing the slot pool means redesigning the
+batched-plan primitive's addressing scheme, not flipping a flag —
+real regression risk across all of Phase 7, and P7-5 already
+identified excess RSS in this exact code path as the open question
+`#34` is meant to resolve. Investigating this properly (even just a
+`vm_stat` probe during a real run) is deferred until #34 lands, at
+which point whatever buffer-lifetime shape the layer-major kernel
+ends up needing should be designed with the compressor-thrashing risk
+in mind from the start rather than retrofitted.
+
+**Other cross-checks, no action needed:** their `pread()`-over-`mmap`
+finding (5× faster for large uncached reads) matches our existing
+choice (`PreadExpertStreamer` never used mmap for experts). Their
+scattered-read fragmentation (4 non-contiguous `pread()`s per layer,
+60% I/O efficiency) is a problem we already solved ahead of them via
+P6b-2's offset-sorted batched fetch — worth noting we're ahead of the
+reference on that axis. Their `K`-pruning experiments (default top-10
+→ top-4 experts, 2.6× speedup, no quality loss) don't transfer
+directly: Qwen3.6's `topKExperts = 8` is a fixed architecture constant
+from the checkpoint, not a runtime knob we're free to prune without
+retraining/re-validating router behavior — different situation from
+their empirically-tuned MoE.
