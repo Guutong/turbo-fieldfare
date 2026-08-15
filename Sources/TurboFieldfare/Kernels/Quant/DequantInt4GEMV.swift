@@ -66,13 +66,41 @@ final class DequantInt4GEMV {
                 m: UInt32,
                 n: UInt32,
                 groupSize: Int = Quantization.groupSize) {
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encode(encoder: encoder, weights: weights, weightsOffset: weightsOffset,
+               scales: scales, scalesOffset: scalesOffset,
+               biases: biases, biasesOffset: biasesOffset,
+               x: x, xOffset: xOffset, y: y, yOffset: yOffset,
+               m: m, n: n, groupSize: groupSize)
+        encoder.endEncoding()
+    }
+
+    /// P7-7: encoder-level entry point so callers that already have an open
+    /// `MTLComputeCommandEncoder` (e.g. `DeltaNetMetalBlock.encode`, which
+    /// keeps every stage of one layer in a single encoder) can dispatch this
+    /// kernel without paying for an extra encoder begin/end pair. Same
+    /// dispatch as the command-buffer entry point above, which now just
+    /// wraps this and calls `endEncoding()` itself — behavior unchanged.
+    func encode(encoder: MTLComputeCommandEncoder,
+                weights: MTLBuffer,
+                weightsOffset: Int = 0,
+                scales: MTLBuffer,
+                scalesOffset: Int = 0,
+                biases: MTLBuffer,
+                biasesOffset: Int = 0,
+                x: MTLBuffer,
+                xOffset: Int = 0,
+                y: MTLBuffer,
+                yOffset: Int = 0,
+                m: UInt32,
+                n: UInt32,
+                groupSize: Int = Quantization.groupSize) {
         precondition(n % UInt32(groupSize) == 0,
                      "N must be a multiple of \(groupSize)")
         // The kernel reads packed weights through a `ushort*`; the repacker
         // guarantees two-byte sub-tensor alignment but not four-byte alignment.
         precondition(weightsOffset % 2 == 0,
                      "dequant_int4_gemv_simd needs a 2-aligned weightsOffset, got \(weightsOffset)")
-        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         // groupSize 64 keeps using the hand-vectorized fast path (identical
         // pipeline objects and dispatch to before group-128 existed); any
         // other groupSize (currently only 128) goes through the generic
@@ -104,6 +132,5 @@ final class DequantInt4GEMV {
             depth: 1)
         encoder.dispatchThreadgroups(threadgroupCount,
                                      threadsPerThreadgroup: threadgroupSize)
-        encoder.endEncoding()
     }
 }

@@ -23,12 +23,27 @@ final class DeltaNetMetalBlock {
     /// `DeltaNetCPUBlock.LayerWeights` — same values, same layout, just
     /// device-resident instead of `[Float]`.
     final class LayerWeights {
+        // P7-7: default path keeps the five big projections int4-resident
+        // (`qkvTV`/`zTV`/`aTV`/`bTV`/`outTV` — TensorViews into the model's
+        // existing mmap'd resident buffer, no copy, no dequant). Set
+        // `TFF_DELTANET_FP32=1` to fall back to the legacy fp32-dequantized
+        // path (`qkv`/`z`/`a`/`b`/`out`), kept for A/B measurement and
+        // rollback. Task 3 wires `encode()` to consume the TensorViews via
+        // `DequantInt4GEMV`; until then the fp32 fields are the only ones
+        // `encode()` reads, so they stay force-unwrapped there.
+        static let useFP32 = ProcessInfo.processInfo.environment["TFF_DELTANET_FP32"] == "1"
+
         let inputNorm: MTLBuffer   // [D]
-        let qkv: MTLBuffer         // [convDim x D]
-        let z: MTLBuffer           // [valueDim x D]
-        let a: MTLBuffer           // [numValueHeads x D]
-        let b: MTLBuffer           // [numValueHeads x D]
-        let out: MTLBuffer         // [D x valueDim]
+        let qkv: MTLBuffer?        // [convDim x D], fp32 legacy path only
+        let z: MTLBuffer?          // [valueDim x D], fp32 legacy path only
+        let a: MTLBuffer?          // [numValueHeads x D], fp32 legacy path only
+        let b: MTLBuffer?          // [numValueHeads x D], fp32 legacy path only
+        let out: MTLBuffer?        // [D x valueDim], fp32 legacy path only
+        let qkvTV: TensorView      // int4-resident, [convDim x D]
+        let zTV: TensorView        // int4-resident, [valueDim x D]
+        let aTV: TensorView        // int4-resident, [numValueHeads x D]
+        let bTV: TensorView        // int4-resident, [numValueHeads x D]
+        let outTV: TensorView      // int4-resident, [D x valueDim]
         let conv: MTLBuffer        // [convDim * 4]
         let deltaNorm: MTLBuffer   // [headVDim]
         let aLog: MTLBuffer        // [numValueHeads]
@@ -58,16 +73,27 @@ final class DeltaNetMetalBlock {
             typealias CPU = DeltaNetCPUBlock.LayerWeights
             inputNorm = try upload(CPU.bf16Vector(try model.inputNorm(layer: L), count: D),
                                    "input_norm")
-            qkv = try upload(CPU.dequantResident(try model.deltaQKVProj(layer: L),
-                                                 rows: convDim, cols: D, bits: 4), "qkv")
-            z = try upload(CPU.dequantResident(try model.deltaZProj(layer: L),
-                                               rows: valueDim, cols: D, bits: 4), "z")
-            a = try upload(CPU.dequantResident(try model.deltaAProj(layer: L),
-                                               rows: dims.numValueHeads, cols: D, bits: 4), "a")
-            b = try upload(CPU.dequantResident(try model.deltaBProj(layer: L),
-                                               rows: dims.numValueHeads, cols: D, bits: 4), "b")
-            out = try upload(CPU.dequantResident(try model.deltaOutProj(layer: L),
-                                                 rows: D, cols: valueDim, bits: 4), "out")
+
+            qkvTV = try model.deltaQKVProj(layer: L)
+            zTV = try model.deltaZProj(layer: L)
+            aTV = try model.deltaAProj(layer: L)
+            bTV = try model.deltaBProj(layer: L)
+            outTV = try model.deltaOutProj(layer: L)
+
+            if Self.useFP32 {
+                qkv = try upload(CPU.dequantResident(qkvTV, rows: convDim, cols: D, bits: 4), "qkv")
+                z = try upload(CPU.dequantResident(zTV, rows: valueDim, cols: D, bits: 4), "z")
+                a = try upload(CPU.dequantResident(aTV, rows: dims.numValueHeads, cols: D, bits: 4), "a")
+                b = try upload(CPU.dequantResident(bTV, rows: dims.numValueHeads, cols: D, bits: 4), "b")
+                out = try upload(CPU.dequantResident(outTV, rows: D, cols: valueDim, bits: 4), "out")
+            } else {
+                qkv = nil
+                z = nil
+                a = nil
+                b = nil
+                out = nil
+            }
+
             conv = try upload(CPU.bf16Vector(try model.deltaConv1d(layer: L),
                                              count: convDim * 4), "conv")
             deltaNorm = try upload(CPU.bf16Vector(try model.deltaNorm(layer: L),
@@ -340,10 +366,10 @@ final class DeltaNetMetalBlock {
         dispatch(enc, psoRMSNorm, threads: D)
 
         // Projections.
-        matVec(enc, w: weights.qkv, x: normedBuf, y: qkvBuf, rows: dims.convDim, cols: D)
-        matVec(enc, w: weights.z, x: normedBuf, y: zBuf, rows: valueDim, cols: D)
-        matVec(enc, w: weights.a, x: normedBuf, y: aRawBuf, rows: dims.numValueHeads, cols: D)
-        matVec(enc, w: weights.b, x: normedBuf, y: bRawBuf, rows: dims.numValueHeads, cols: D)
+        matVec(enc, w: weights.qkv!, x: normedBuf, y: qkvBuf, rows: dims.convDim, cols: D)
+        matVec(enc, w: weights.z!, x: normedBuf, y: zBuf, rows: valueDim, cols: D)
+        matVec(enc, w: weights.a!, x: normedBuf, y: aRawBuf, rows: dims.numValueHeads, cols: D)
+        matVec(enc, w: weights.b!, x: normedBuf, y: bRawBuf, rows: dims.numValueHeads, cols: D)
 
         // Causal conv1d + silu, conv state resident in `convState`.
         enc.setBuffer(qkvBuf, offset: 0, index: 0)
@@ -412,7 +438,7 @@ final class DeltaNetMetalBlock {
         dispatch(enc, psoOutputGate, threads: valueDim)
 
         // out_proj, then fold back into the FP16 residual stream.
-        matVec(enc, w: weights.out, x: gatedBuf, y: deltaOutBuf, rows: D, cols: valueDim)
+        matVec(enc, w: weights.out!, x: gatedBuf, y: deltaOutBuf, rows: D, cols: valueDim)
 
         enc.setBuffer(hidden, offset: hiddenOffset, index: 0)
         enc.setBuffer(xBuf, offset: 0, index: 1)
@@ -463,13 +489,13 @@ final class DeltaNetMetalBlock {
         dispatch(enc, psoRMSNormB, threads: tk * D)
 
         // Projections — batched mat-vec on all tk tokens at once.
-        matVecBatched(enc, w: weights.qkv, x: normedBuf, y: qkvBuf,
+        matVecBatched(enc, w: weights.qkv!, x: normedBuf, y: qkvBuf,
                       rows: dims.convDim, cols: D, batch: tk)
-        matVecBatched(enc, w: weights.z, x: normedBuf, y: zBuf,
+        matVecBatched(enc, w: weights.z!, x: normedBuf, y: zBuf,
                       rows: valueDim, cols: D, batch: tk)
-        matVecBatched(enc, w: weights.a, x: normedBuf, y: aRawBuf,
+        matVecBatched(enc, w: weights.a!, x: normedBuf, y: aRawBuf,
                       rows: dims.numValueHeads, cols: D, batch: tk)
-        matVecBatched(enc, w: weights.b, x: normedBuf, y: bRawBuf,
+        matVecBatched(enc, w: weights.b!, x: normedBuf, y: bRawBuf,
                       rows: dims.numValueHeads, cols: D, batch: tk)
 
         // Causal conv1d + silu, per-token state in convState.
@@ -557,7 +583,7 @@ final class DeltaNetMetalBlock {
         dispatch(enc, psoOutputGateB, threads: valueDim * tk)
 
         // out_proj, then fold back into FP16 residual stream.
-        matVecBatched(enc, w: weights.out, x: gatedBuf, y: deltaOutBuf,
+        matVecBatched(enc, w: weights.out!, x: gatedBuf, y: deltaOutBuf,
                       rows: D, cols: valueDim, batch: tk)
 
         enc.setBuffer(hidden, offset: 0, index: 0)
