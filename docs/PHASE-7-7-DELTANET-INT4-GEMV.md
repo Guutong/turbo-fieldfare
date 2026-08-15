@@ -213,10 +213,50 @@ Two frictions to resolve before coding:
    (`func encode(encoder: MTLComputeCommandEncoder, ...)`) and have the
    existing command-buffer method call it — a pure refactor, no behaviour
    change, and the existing tests must keep passing.
-2. **Precision.** DeltaNet buffers are fp32; these kernels typically produce
-   fp16. Check the output dtype and, if it is fp16, either write into a fp16
-   buffer and convert in the consuming stage, or confirm the parity tests in
-   Task 4 still pass within tolerance. Do not silently change tolerances.
+2. **Precision.** DeltaNet buffers are fp32; these kernels dequantize to and
+   accumulate in fp16. Do not treat that as a problem to work around — see
+   section 5.1. Follow the precision policy there rather than converting fp16
+   results back to fp32 at every stage boundary.
+
+### 5.1 Precision policy: fp16 math, fp32 state
+
+M1/M2 GPU ALUs execute float16 natively at roughly twice the fp32 rate, so
+fp16 is the right arithmetic precision here, not a compromise. The existing
+int4 kernels already dequantize to `half` and accumulate in fp16, which means
+**Option A delivers the bandwidth win (int4 storage) and the ALU win (fp16
+math) in the same change** — there is nothing extra to do to get the second one.
+
+Apply this split:
+
+| Data | Precision | Why |
+|---|---|---|
+| Projection weights (`qkv`, `z`, `a`, `b`, `out`) | **int4** + BF16 scales/biases | The bandwidth win; format already on disk |
+| Projection outputs, `q`/`k`/`v`, `beta`, `g`, conv output | **fp16** | Native ALU rate; single-step values, no error accumulation |
+| **Recurrent state** (`recurrentState`, 32x128x128 fp32) | **fp32 — do not change** | Accumulates across every token of the sequence; fp16 here drifts |
+| Conv state | fp32 (leave as is) | Tiny (98 KB/layer); not worth the risk |
+
+This is the same split `mpsops/mps-linear-attention` uses for gated delta rule
+on Apple Silicon (state fp32, Q/K/V/beta fp16), which is useful independent
+precedent that fp16 is safe for the non-recurrent parts of this exact
+algorithm.
+
+The `deltaOut relL2` parity check in Task 4 is what proves it on our weights.
+If parity fails, suspect the state or the recurrence accumulator first, not
+the projections.
+
+### 5.2 If int4 integration stalls: fp16-only as an interim step
+
+If Option A's encoder refactor turns into a multi-day detour, a smaller change
+is available: keep the weights dense but upload them as **fp16 instead of
+fp32** and make `dn_matvec` a `half` kernel. That alone halves the weight
+bytes (135 -> 67 MB/layer, ~2 GB saved) and doubles ALU throughput.
+
+Be clear about what it does *not* fix: at 12% of peak bandwidth, the dominant
+loss is the uncoalesced one-thread-per-row access pattern (section 3.2), which
+is dtype-independent. Expect roughly 2x, not the ~17x that int4 plus a
+SIMD-reduction kernel projects. Treat this as a checkpoint on the way to
+Option A, not a destination — and if you stop here, say so explicitly in the
+PHASE-LOG entry so the next agent knows the main win is still unclaimed.
 
 ### Option B — new int4 kernel inside `deltanet.metal`
 
@@ -348,7 +388,8 @@ explicitly.
 | Risk | Signal | Response |
 |---|---|---|
 | int4 precision degrades output | relL2 jumps, or text differs | Stop. Compare per-layer relL2 to find which projection is sensitive; consider keeping that one tensor fp32. |
-| fp16 vs fp32 dtype mismatch | Metal validation error, or NaN | Resolve the precision question in Option A *before* Task 3, not during. |
+| fp16 vs fp32 dtype mismatch | Metal validation error, or NaN | Follow the precision policy in section 5.1; settle it before Task 3, not during. |
+| fp16 applied to the recurrent state | parity drifts, worse on later tokens than early ones | The state must stay fp32 (section 5.1). Error growing with token index is the signature. |
 | Speedup below projection | `cb1GPUlinear` well above 40 ms/tok | Weights are int4 but the kernel is weak — go to Option B. |
 | Memory does not drop | RSS still 4+ GB | The fp32 arrays are still being materialized — check that `dequantResident` is gone from the hot path and no host copy is retained. |
 | A gate passes but text changed | Task 4 text check | Treat as a failure, not a win. Correctness first. |
