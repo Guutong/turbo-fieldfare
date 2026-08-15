@@ -72,7 +72,7 @@ extension Model {
     public func adviseRoutedExperts(layer: Int,
                                     experts: [Int]) throws -> ExpertIOAdviceResult {
         try ensureLayerOpened(layer)
-        let streamer = streamersQueue.sync { streamersBox.streamers[layer]! }
+        let streamer = streamersLock.withLock { streamersBox.streamers[layer]! }
         return streamer.adviseExpertMisses(experts: experts)
     }
 
@@ -80,7 +80,7 @@ extension Model {
                                                missCount: Int) throws -> UInt64 {
         guard missCount > 0 else { return 0 }
         try ensureLayerOpened(layer)
-        let streamer = streamersQueue.sync { streamersBox.streamers[layer]! }
+        let streamer = streamersLock.withLock { streamersBox.streamers[layer]! }
         return UInt64(missCount) * streamer.layout.expertStride
     }
 
@@ -88,11 +88,15 @@ extension Model {
                                   experts: [Int],
                                   avoidingSlots: Set<Int> = []) throws -> RoutedExpertFetchPlan? {
         try ensureLayerOpened(layer)
-        let streamer = streamersQueue.sync { streamersBox.streamers[layer]! }
+        let tSync = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+        let streamer = streamersLock.withLock { streamersBox.streamers[layer]! }
+        Model.debugQueueSyncNanos &+= clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tSync
+        Model.debugQueueSyncCalls &+= 1
         let validSlots = Set(avoidingSlots.filter { $0 >= 0 && $0 < streamer.slotCount })
-        return RoutedExpertFetchPlan(
-            layer: layer,
-            cachePlan: streamer.planExpertsCached(experts: experts, avoidingSlots: validSlots))
+        let tPlan = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+        let cachePlan = streamer.planExpertsCached(experts: experts, avoidingSlots: validSlots)
+        PreadExpertStreamer.debugCachePlanNanos &+= clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tPlan
+        return RoutedExpertFetchPlan(layer: layer, cachePlan: cachePlan)
     }
 
     public func planRoutedExpertsIfPossible(layer: Int,
@@ -100,7 +104,7 @@ extension Model {
                                             avoidingSlots: Set<Int> = []) throws
         -> RoutedExpertFetchPlan? {
         try ensureLayerOpened(layer)
-        let streamer = streamersQueue.sync { streamersBox.streamers[layer]! }
+        let streamer = streamersLock.withLock { streamersBox.streamers[layer]! }
         let validSlots = Set(avoidingSlots.filter { $0 >= 0 && $0 < streamer.slotCount })
         guard let cachePlan = streamer.planExpertsCachedIfPossible(
             experts: experts,
@@ -119,7 +123,7 @@ extension Model {
                                   tokens: [[Int]],
                                   avoidingSlots: Set<Int> = []) throws -> RoutedExpertBatchFetchPlan? {
         try ensureLayerOpened(layer)
-        let streamer = streamersQueue.sync { streamersBox.streamers[layer]! }
+        let streamer = streamersLock.withLock { streamersBox.streamers[layer]! }
         let validSlots = Set(avoidingSlots.filter { $0 >= 0 && $0 < streamer.slotCount })
         let batchPlan = streamer.planExpertsCached(tokens: tokens, avoidingSlots: validSlots)
         return RoutedExpertBatchFetchPlan(layer: layer, batchPlan: batchPlan)
@@ -130,7 +134,7 @@ extension Model {
     public func fetchRoutedExperts(plan: RoutedExpertBatchFetchPlan) async throws
         -> [[TensorView]] {
         try ensureLayerOpened(plan.layer)
-        let streamer = streamersQueue.sync { streamersBox.streamers[plan.layer]! }
+        let streamer = streamersLock.withLock { streamersBox.streamers[plan.layer]! }
         // Execute once on the unified plan — all tokens share the resident set.
         let buffers = try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
@@ -187,7 +191,7 @@ extension Model {
     /// with no open streamer (mmap/full-resident modes).
     public func pinRoutedExpertSlots(layer: Int, slots: [Int]) {
         guard !slots.isEmpty else { return }
-        streamersQueue.sync {
+        streamersLock.withLock {
             guard streamersBox.streamers.indices.contains(layer) else { return }
             streamersBox.streamers[layer]?.pinSlots(slots)
         }
@@ -195,7 +199,7 @@ extension Model {
 
     public func unpinRoutedExpertSlots(layer: Int, slots: [Int]) {
         guard !slots.isEmpty else { return }
-        streamersQueue.sync {
+        streamersLock.withLock {
             guard streamersBox.streamers.indices.contains(layer) else { return }
             streamersBox.streamers[layer]?.unpinSlots(slots)
         }
@@ -205,7 +209,7 @@ extension Model {
     /// be attributed to. Applies to every already-open layer and is remembered
     /// for layers that open later.
     public func setExpertCachePhase(_ phase: ExpertCachePhase) {
-        streamersQueue.sync {
+        streamersLock.withLock {
             streamersBox.cachePhase = phase
             for streamer in streamersBox.streamers {
                 streamer?.setCachePhase(phase)
@@ -214,12 +218,12 @@ extension Model {
     }
 
     public func expertCachePhase() -> ExpertCachePhase {
-        streamersQueue.sync { streamersBox.cachePhase }
+        streamersLock.withLock { streamersBox.cachePhase }
     }
 
     /// P6-1: cumulative routed-expert cache hit/miss counts across all opened layers.
     public func routedExpertCacheStats() -> ExpertCacheStats {
-        streamersQueue.sync {
+        streamersLock.withLock {
             streamersBox.streamers.compactMap { $0 }
                 .reduce(ExpertCacheStats()) { $0 + $1.cacheStats }
         }
@@ -227,7 +231,7 @@ extension Model {
 
     /// P6-1: per-layer cumulative routed-expert cache stats (nil for unopened layers).
     public func routedExpertCacheStatsByLayer() -> [ExpertCacheStats?] {
-        streamersQueue.sync { streamersBox.streamers.map { $0?.cacheStats } }
+        streamersLock.withLock { streamersBox.streamers.map { $0?.cacheStats } }
     }
 
     public func routedExpertCacheSlotCount(layer _: Int) -> Int? {
@@ -237,7 +241,7 @@ extension Model {
 
     public func routedExpertBuffers(for plan: RoutedExpertFetchPlan) throws -> [TensorView] {
         try ensureLayerOpened(plan.layer)
-        let streamer = streamersQueue.sync { streamersBox.streamers[plan.layer]! }
+        let streamer = streamersLock.withLock { streamersBox.streamers[plan.layer]! }
         return Self.makeExpertViews(
             streamer.expertCachePlanBuffers(plan.cachePlan),
             layer: plan.layer,
@@ -246,13 +250,13 @@ extension Model {
 
     public func adviseRoutedExperts(plan: RoutedExpertFetchPlan) throws -> ExpertIOAdviceResult {
         try ensureLayerOpened(plan.layer)
-        let streamer = streamersQueue.sync { streamersBox.streamers[plan.layer]! }
+        let streamer = streamersLock.withLock { streamersBox.streamers[plan.layer]! }
         return streamer.adviseExpertCachePlanMisses(plan.cachePlan)
     }
 
     public func fetchRoutedExperts(plan: RoutedExpertFetchPlan) async throws -> [TensorView] {
         try ensureLayerOpened(plan.layer)
-        let streamer = streamersQueue.sync { streamersBox.streamers[plan.layer]! }
+        let streamer = streamersLock.withLock { streamersBox.streamers[plan.layer]! }
         return try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
@@ -270,7 +274,7 @@ extension Model {
 
     public func fetchRoutedExperts(layer: Int, experts: [Int]) async throws -> [TensorView] {
         try ensureLayerOpened(layer)
-        let streamer = streamersQueue.sync { streamersBox.streamers[layer]! }
+        let streamer = streamersLock.withLock { streamersBox.streamers[layer]! }
         return try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 do {

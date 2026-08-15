@@ -80,7 +80,13 @@ public struct Model {
     /// Lazy state. Held inside a reference box so `Model` can stay a struct
     /// while still letting accessors mutate layer state via a serial queue.
     let streamersBox: StreamersBox
-    let streamersQueue: DispatchQueue
+    /// P7-6: was a serial `DispatchQueue` — `.sync`'s per-call thread-hop
+    /// overhead measured ~2.5ms/call on the decode hot path (80 calls/token
+    /// across ~40 layers = ~206ms/tok, the single largest cost in decode).
+    /// `NSLock` gives the same mutual exclusion without going through GCD's
+    /// scheduling machinery for what is, after the first token, almost
+    /// always an uncontended idempotent lookup.
+    let streamersLock = NSLock()
 
     final class StreamersBox: @unchecked Sendable {
         var streamers: [PreadExpertStreamer?]
@@ -119,7 +125,6 @@ public struct Model {
         self.directoryURL = directoryURL
         self.modelDirectory = modelDirectory
         self.streamersBox = StreamersBox(numLayers: packedExpertsLayout.numLayers)
-        self.streamersQueue = DispatchQueue(label: "turbo-fieldfare.expert-streamers")
     }
 
     // MARK: - Resident accessors
@@ -377,7 +382,7 @@ public struct Model {
     /// cache-slot `(MTLBuffer, offset)` pair.
     public func routedExpert(layer L: Int, expert E: Int) throws -> TensorView {
         try ensureLayerOpened(L)
-        let backend = streamersQueue.sync { streamersBox.streamers[L]! }
+        let backend = streamersLock.withLock { streamersBox.streamers[L]! }
         let r = try backend.loadExpert(layer: 0, expert: E)
         return TensorView(
             buffer: r.buffer,
@@ -389,18 +394,32 @@ public struct Model {
             dtype: GTurboFormatV1.DType.u32.rawValue)
     }
 
+    /// Debug-only: accumulated `streamersLock` round-trip time, for
+    /// diagnosing the per-layer decode `plan` phase-timing breakdown
+    /// (`TFF_PHASE_TIMING=1`). Decode is single-threaded on this path so a
+    /// plain accumulator is safe; not meant for concurrent production use.
+    public nonisolated(unsafe) static var debugQueueSyncNanos: UInt64 = 0
+    public nonisolated(unsafe) static var debugQueueSyncCalls: UInt64 = 0
+
     /// Open layer L's file + verify SHA, idempotent.
     func ensureLayerOpened(_ L: Int) throws {
-        try streamersQueue.sync {
+        let t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+        defer {
+            Model.debugQueueSyncNanos &+= clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0
+            Model.debugQueueSyncCalls &+= 1
+        }
+        try streamersLock.withLock {
             try openLayerLocked(L)
         }
     }
 
     /// Best-effort overlap hook for prefill: starts the same lazy layer open on
-    /// the model's streamer queue without waiting for the first expert fetch.
+    /// a background queue without waiting for the first expert fetch.
     public func beginOpeningRoutedExpertStreamer(layer L: Int) {
         nonisolated(unsafe) let model = self
-        streamersQueue.async {
+        DispatchQueue.global(qos: .utility).async {
+            model.streamersLock.lock()
+            defer { model.streamersLock.unlock() }
             try? model.openLayerLocked(L)
         }
     }
@@ -466,7 +485,7 @@ public struct Model {
 
     /// Test hook: how many layer files have been opened so far.
     public func openLayerFileCount() -> Int {
-        streamersQueue.sync { streamersBox.streamers.compactMap { $0 }.count }
+        streamersLock.withLock { streamersBox.streamers.compactMap { $0 }.count }
     }
 
 }

@@ -78,13 +78,27 @@ public func run(args: Args,
         } else {
             expectedArch = .gemma4_26B_A4B
         }
+        // P7-6: full SHA-256 verification hashes every routed-expert layer
+        // file (hundreds of MB each) on its first touch during decode —
+        // Instruments showed this as the dominant cost inside the decode
+        // `plan` phase (~200ms/tok average, since ~40 layers each first-open
+        // during the first token). `TurboFieldfareRepack --verify-install`
+        // already SHA-256-verified the install once and wrote a signed
+        // receipt; trusting that receipt (size-check only, no re-hash) is
+        // safe for repeated benchmark/decode runs against an already-
+        // verified install. Opt-in via env var — full re-verification stays
+        // the default for untrusted or freshly-copied installs.
+        let integrityPolicy: ModelIntegrityPolicy =
+            ProcessInfo.processInfo.environment["TFF_TRUST_INSTALL"] == "1"
+            ? .sizeCheckTrustedReceipt
+            : .fullSha256
         let model = try Model.load(
             directoryURL: modelURL,
             device: context.device,
             expecting: expectedArch,
             streamingMode: .pread(slotCount: runtime.expertCacheSlots),
             expertCachePolicy: runtime.modelExpertCachePolicy,
-            integrityPolicy: .fullSha256)
+            integrityPolicy: integrityPolicy)
         let runner = try RealForwardRunner(
             model: model,
             context: context,
@@ -142,8 +156,12 @@ public func run(args: Args,
                 Double(nanos) / 1_000_000 / forwards
             }
             let head = runner.totalHeadNanos &+ runner.totalHeadFusedNanos
-            let line = "[phase-timing ms/tok: cb1=\(String(format: "%.3f", msPerTok(runner.totalCb1Nanos))) io=\(String(format: "%.3f", msPerTok(runner.totalIoNanos))) cb2=\(String(format: "%.3f", msPerTok(runner.totalCb2Nanos))) head=\(String(format: "%.3f", msPerTok(head))) rdadvise=\(String(format: "%.3f", msPerTok(runner.totalRDAdviseNanos)))]\n"
+            let line = "[phase-timing ms/tok: cb1=\(String(format: "%.3f", msPerTok(runner.totalCb1Nanos))) cb1Wait=\(String(format: "%.3f", msPerTok(runner.totalCb1WaitNanos))) plan=\(String(format: "%.3f", msPerTok(runner.totalPlanNanos))) io=\(String(format: "%.3f", msPerTok(runner.totalIoNanos))) cb2=\(String(format: "%.3f", msPerTok(runner.totalCb2Nanos))) head=\(String(format: "%.3f", msPerTok(head))) rdadvise=\(String(format: "%.3f", msPerTok(runner.totalRDAdviseNanos)))]\n"
             stderr.write(Data(line.utf8))
+            let planLine = "[plan-breakdown ms/tok: route=\(String(format: "%.3f", msPerTok(runner.totalPlanRouteNanos))) pin=\(String(format: "%.3f", msPerTok(runner.totalPlanPinNanos))) argBuild=\(String(format: "%.3f", msPerTok(runner.totalPlanArgBuildNanos))) sharedFFN=\(String(format: "%.3f", msPerTok(runner.totalPlanSharedFFNNanos)))]\n"
+            stderr.write(Data(planLine.utf8))
+            let routeLine = "[route-breakdown ms/tok: queueSync=\(String(format: "%.3f", msPerTok(runner.debugQueueSyncNanos))) cacheLockWait=\(String(format: "%.3f", msPerTok(runner.debugCacheLockWaitNanos))) cachePlanTotal=\(String(format: "%.3f", msPerTok(runner.debugCachePlanComputeNanos))) calls=\(runner.debugQueueSyncCalls) avgUsPerCall=\(String(format: "%.1f", Double(runner.debugQueueSyncNanos) / 1000.0 / Double(max(runner.debugQueueSyncCalls, 1))))]\n"
+            stderr.write(Data(routeLine.utf8))
         }
         if ProcessInfo.processInfo.environment["TFF_EXPERT_CACHE_STATS"] == "1" {
             let cache = model.routedExpertCacheStats()

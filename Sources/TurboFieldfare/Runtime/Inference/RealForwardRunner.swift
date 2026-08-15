@@ -653,7 +653,19 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     }
 
     public private(set) var totalIoNanos: UInt64 = 0
+    public private(set) var totalPlanNanos: UInt64 = 0
+    public private(set) var totalPlanRouteNanos: UInt64 = 0
+    public private(set) var totalPlanPinNanos: UInt64 = 0
+    public private(set) var totalPlanArgBuildNanos: UInt64 = 0
+    public private(set) var totalPlanSharedFFNNanos: UInt64 = 0
+    public var debugQueueSyncNanos: UInt64 { Model.debugQueueSyncNanos }
+    public var debugCacheLockWaitNanos: UInt64 { PreadExpertStreamer.debugLockWaitNanos }
+    public var debugCachePlanComputeNanos: UInt64 { PreadExpertStreamer.debugCachePlanNanos }
+    public var debugQueueSyncCalls: UInt64 { Model.debugQueueSyncCalls }
     public private(set) var totalCb1Nanos: UInt64 = 0
+    /// GPU-busy time waiting for cb1 to complete — previously computed and
+    /// subtracted out of `totalCb1Nanos` without being recorded anywhere.
+    public private(set) var totalCb1WaitNanos: UInt64 = 0
     public private(set) var totalCb2Nanos: UInt64 = 0
     public private(set) var totalHeadNanos: UInt64 = 0
     public private(set) var totalHeadFusedNanos: UInt64 = 0
@@ -2279,6 +2291,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 let tWait = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
                 try waitForCompletion(cb)
                 let waitNanos = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tWait
+                totalCb1WaitNanos &+= waitNanos
                 if let pending = pendingRoutedCommand {
                     try finishPendingRoutedCommand(pending, waitIfNeeded: false)
                     pendingRoutedCommand = nil
@@ -2333,12 +2346,14 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             let tWait = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
             waitUntilCompleted(cb)
             let waitNanos = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tWait
+            totalCb1WaitNanos &+= waitNanos
             if let pending = pendingRoutedCommand {
                 try finishPendingRoutedCommand(pending, waitIfNeeded: false)
                 pendingRoutedCommand = nil
             }
             try checkCommandBufferError(cb.error)
             totalCb1Nanos &+= clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tCb1Start - waitNanos
+            let tPlanStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
 
             // CPU readback to fetch routed-expert blobs from disk.
             let idxPtr = outIndices.contents().bindMemory(to: UInt32.self,
@@ -2351,9 +2366,11 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             let topK = UInt32(cfg.topKExperts)
             let canPlanPhase1HitSplit =
                 cfg.topKExperts <= MoE.maxStreamedExperts
+            let tRouteStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
             let plannedFetch = canPlanPhase1HitSplit
                 ? try model.planRoutedExperts(layer: L, experts: experts)
                 : nil
+            totalPlanRouteNanos &+= clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tRouteStart
             var phase1HitCB: MTLCommandBuffer?
             var phase1HitSplitArgBuf: MTLBuffer?
             var phase1HitSplitRoutedBufs: [MTLBuffer] = []
@@ -2364,10 +2381,12 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             // as the phase-1/phase-2 encodes reading them stay in flight. The
             // pins are released in finishPendingRoutedCommand.
             var pinnedSlots: [Int] = []
+            let tPinStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
             if let plan = plannedFetch {
                 pinnedSlots = plan.cachePlan.assignedSlots.filter { $0 >= 0 }
                 model.pinRoutedExpertSlots(layer: L, slots: pinnedSlots)
             }
+            totalPlanPinNanos &+= clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tPinStart
             if let plan = plannedFetch {
                 let missSet = Set(plan.misses)
                 phase1HitSlots = (0..<cfg.topKExperts)
@@ -2416,6 +2435,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     groupSize: UInt32(model.routedExpertGroupSize))
             }
 
+            let tArgBuildStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
             if let plan = plannedFetch,
                plan.hits > 0,
                !plan.misses.isEmpty {
@@ -2437,6 +2457,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     phase1HitCB = cb
                 }
             }
+            totalPlanArgBuildNanos &+= clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tArgBuildStart
 
             // The shared dense MLP depends only on denseX, not on the routed
             // experts. Commit it without waiting so its GPU work overlaps the
@@ -2456,6 +2477,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             // Pre-norm topologies (Qwen3.6, and any generalized dense-MLP arch
             // using `.preNorm`) skip the post-FFN norm — h1Buf is raw MLP
             // output. `sharedProj.postF1` is nil exactly in that case.
+            let tSharedFFNStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
             let sharedCB: MTLCommandBuffer
             if let postF1 = sharedProj.postF1 {
                 sharedCB = ctx.queue.makeCommandBuffer()!
@@ -2490,6 +2512,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             if let cb = phase1HitCB {
                 cb.commit()
             }
+            totalPlanSharedFFNNanos &+= clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tSharedFFNStart
             if rdadviseEnabled && rdadvisePolicyMode != .off {
                 let requestedMisses = plannedFetch?.misses.count ?? experts.count
                 let estimatedAdviceBytes = try model.routedExpertAdviceByteEstimate(
@@ -2516,6 +2539,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
 
             // Routed-expert pread — overlaps the shared MLP GPU work above.
             let tIoStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+            totalPlanNanos &+= tIoStart - tPlanStart
             let blobs: [TensorView]
             if let plannedFetch {
                 blobs = try await model.fetchRoutedExperts(plan: plannedFetch)

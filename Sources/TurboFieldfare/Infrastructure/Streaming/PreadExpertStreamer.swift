@@ -506,13 +506,20 @@ public final class PreadExpertStreamer: @unchecked Sendable {
         return BatchedExpertCachePlan(plan: plan, slotIndices: slotIndices)
     }
 
+    /// Debug-only accumulators for `TFF_PHASE_TIMING=1`'s `route=` breakdown —
+    /// module-level since decode is single-threaded on this call path.
+    public nonisolated(unsafe) static var debugLockWaitNanos: UInt64 = 0
+    public nonisolated(unsafe) static var debugCachePlanNanos: UInt64 = 0
+
     private func makeExpertCachePlan(experts: [Int],
                                      avoidingSlots rawAvoidingSlots: Set<Int>) -> ExpertCachePlan? {
         precondition(experts.count <= slotCount,
                      "expert cache needs at least \(experts.count) slots")
         let avoidingSlots = Set(rawAvoidingSlots.filter { $0 >= 0 && $0 < slotCount })
 
+        let tLock = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
         cacheLock.lock()
+        Self.debugLockWaitNanos &+= clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tLock
         defer { cacheLock.unlock() }
 
         let clock = useClock + 1
