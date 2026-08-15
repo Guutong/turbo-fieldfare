@@ -1,0 +1,412 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Token Passage — decode pipeline</title>
+<style>
+:root{
+  --bg:#f4f5f7; --surface:#ffffff; --surface-2:#eceef1; --border:#d7dbe0;
+  --text:#191c20; --text-dim:#585f68; --text-faint:#8a919b;
+  --gpu:#0f7ea3; --cpu:#b3690f; --io:#6b4fc4;
+  --gpu-glow:#0f7ea333; --cpu-glow:#b3690f33; --io-glow:#6b4fc433;
+  --good:#1a8a5f; --track:#e2e5e9;
+  --shadow: 0 1px 2px rgba(20,22,26,0.06), 0 8px 24px rgba(20,22,26,0.06);
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#0c0e11; --surface:#14171b; --surface-2:#1b1f24; --border:#2a2f36;
+    --text:#e7e9ec; --text-dim:#9aa1ab; --text-faint:#666e79;
+    --gpu:#5fc4ec; --cpu:#f0a94e; --io:#a993f2;
+    --gpu-glow:#5fc4ec26; --cpu-glow:#f0a94e26; --io-glow:#a993f226;
+    --good:#4ecf9a; --track:#20242a;
+    --shadow: 0 1px 2px rgba(0,0,0,0.4), 0 12px 32px rgba(0,0,0,0.45);
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0c0e11; --surface:#14171b; --surface-2:#1b1f24; --border:#2a2f36;
+  --text:#e7e9ec; --text-dim:#9aa1ab; --text-faint:#666e79;
+  --gpu:#5fc4ec; --cpu:#f0a94e; --io:#a993f2;
+  --gpu-glow:#5fc4ec26; --cpu-glow:#f0a94e26; --io-glow:#a993f226;
+  --good:#4ecf9a; --track:#20242a;
+  --shadow: 0 1px 2px rgba(0,0,0,0.4), 0 12px 32px rgba(0,0,0,0.45);
+}
+
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  background:var(--bg);
+  color:var(--text);
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+  min-height:100vh;
+  display:flex; flex-direction:column; align-items:center;
+  padding:32px 16px 48px;
+  gap:20px;
+}
+.mono{font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace}
+
+.wrap{width:100%; max-width:980px; display:flex; flex-direction:column; gap:20px;}
+
+header{display:flex; align-items:baseline; justify-content:space-between; gap:16px; flex-wrap:wrap;}
+h1{
+  font-size:1.5rem; margin:0; font-weight:650; letter-spacing:-0.01em;
+  text-wrap:balance;
+}
+.subtitle{color:var(--text-dim); font-size:0.92rem; margin-top:4px;}
+.hw{
+  font-size:0.72rem; color:var(--text-faint); text-transform:uppercase; letter-spacing:0.06em;
+  text-align:right; line-height:1.5;
+}
+
+/* ---- controls ---- */
+.controls{
+  display:flex; align-items:center; gap:14px; flex-wrap:wrap;
+  background:var(--surface); border:1px solid var(--border); border-radius:12px;
+  padding:10px 16px; box-shadow:var(--shadow);
+}
+button.play{
+  display:flex; align-items:center; gap:8px;
+  background:var(--surface-2); border:1px solid var(--border); color:var(--text);
+  border-radius:8px; padding:8px 14px; font-size:0.85rem; font-weight:600;
+  cursor:pointer; font-family:inherit;
+}
+button.play:hover{ border-color:var(--gpu); }
+button.play:focus-visible{ outline:2px solid var(--gpu); outline-offset:2px; }
+.speedgroup{ display:flex; align-items:center; gap:6px; margin-left:4px; }
+.speedgroup span{ font-size:0.72rem; color:var(--text-faint); text-transform:uppercase; letter-spacing:0.05em; }
+.speed-btn{
+  background:transparent; border:1px solid var(--border); color:var(--text-dim);
+  border-radius:6px; padding:5px 10px; font-size:0.78rem; cursor:pointer; font-family:inherit;
+}
+.speed-btn.active{ background:var(--gpu-glow); border-color:var(--gpu); color:var(--gpu); font-weight:600; }
+.speed-btn:focus-visible{ outline:2px solid var(--gpu); outline-offset:1px; }
+.layer-readout{ margin-left:auto; font-size:0.82rem; color:var(--text-dim); }
+.layer-readout b{ color:var(--text); font-variant-numeric:tabular-nums; }
+
+/* ---- stage strip: embed -> layers -> head ---- */
+.stage-strip{
+  display:flex; align-items:center; gap:0;
+  background:var(--surface); border:1px solid var(--border); border-radius:14px;
+  padding:20px; box-shadow:var(--shadow); position:relative; overflow:hidden;
+}
+.stage{
+  display:flex; flex-direction:column; align-items:center; gap:6px;
+  padding:0 14px; position:relative; z-index:1; flex-shrink:0;
+}
+.stage .icon{
+  width:44px; height:44px; border-radius:10px; display:flex; align-items:center; justify-content:center;
+  background:var(--surface-2); border:1px solid var(--border); font-size:1.15rem;
+  transition:border-color .25s, box-shadow .25s, transform .25s;
+}
+.stage .label{ font-size:0.72rem; color:var(--text-dim); font-weight:600; white-space:nowrap; }
+.stage.active .icon{
+  border-color:var(--gpu); box-shadow:0 0 0 4px var(--gpu-glow); transform:scale(1.08);
+}
+.stage.active .label{ color:var(--gpu); }
+
+.layer-loop{
+  flex:1; min-width:280px; display:flex; flex-direction:column; align-items:center; gap:8px;
+  padding:12px 16px; border-radius:12px; background:var(--surface-2);
+  border:1px dashed var(--border); position:relative;
+}
+.layer-loop-title{ font-size:0.72rem; color:var(--text-faint); text-transform:uppercase; letter-spacing:0.06em; font-weight:600; }
+.layer-count{ font-size:1.3rem; font-weight:700; font-variant-numeric:tabular-nums; }
+.layer-count .of{ color:var(--text-faint); font-weight:500; font-size:0.95rem; }
+.layer-dots{ display:flex; gap:3px; flex-wrap:wrap; max-width:220px; justify-content:center; }
+.layer-dots i{ width:5px; height:5px; border-radius:50%; background:var(--track); display:block; }
+.layer-dots i.done{ background:var(--good); }
+.layer-dots i.now{ background:var(--gpu); box-shadow:0 0 0 3px var(--gpu-glow); }
+
+.connector{ width:26px; height:2px; background:var(--track); flex-shrink:0; position:relative; z-index:0; }
+.connector.lit{ background:var(--gpu); }
+
+.token-pill{
+  position:absolute; top:8px; left:20px;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:0.78rem; font-weight:600;
+  background:var(--gpu-glow); color:var(--gpu); border:1px solid var(--gpu);
+  border-radius:999px; padding:2px 10px;
+  transition:left 0.5s cubic-bezier(.4,.0,.2,1);
+  z-index:2;
+}
+
+/* ---- swimlanes ---- */
+.lanes{
+  background:var(--surface); border:1px solid var(--border); border-radius:14px;
+  padding:20px; box-shadow:var(--shadow); display:flex; flex-direction:column; gap:14px;
+}
+.lanes-title{ font-size:0.78rem; color:var(--text-faint); text-transform:uppercase; letter-spacing:0.06em; font-weight:600; }
+.lane{ display:flex; align-items:center; gap:14px; }
+.lane-label{
+  width:96px; flex-shrink:0; font-size:0.78rem; font-weight:700; text-align:right;
+}
+.lane-label small{ display:block; font-weight:500; color:var(--text-faint); font-size:0.66rem; margin-top:1px; }
+.lane-label.gpu{ color:var(--gpu); }
+.lane-label.cpu{ color:var(--cpu); }
+.lane-label.io{ color:var(--io); }
+
+.lane-track{
+  flex:1; height:34px; background:var(--track); border-radius:8px; position:relative; overflow:hidden;
+}
+.lane-seg{
+  position:absolute; top:0; bottom:0; left:0; width:0;
+  border-radius:8px; opacity:0.9;
+  display:flex; align-items:center; justify-content:center;
+  font-size:0.68rem; font-weight:700; color:var(--bg);
+  transition:width 0.12s linear;
+  white-space:nowrap; overflow:hidden;
+}
+.lane-seg.gpu{ background:var(--gpu); }
+.lane-seg.cpu{ background:var(--cpu); }
+.lane-seg.io{ background:var(--io); }
+.lane-seg .segtext{ padding:0 8px; mix-blend-mode:normal; }
+
+/* ---- stats readout ---- */
+.stats{
+  display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:1px;
+  background:var(--border); border:1px solid var(--border); border-radius:14px; overflow:hidden;
+  box-shadow:var(--shadow);
+}
+.stat{
+  background:var(--surface); padding:14px 16px; display:flex; flex-direction:column; gap:4px;
+}
+.stat .k{ font-size:0.68rem; color:var(--text-faint); text-transform:uppercase; letter-spacing:0.05em; font-weight:600; }
+.stat .v{ font-size:1.25rem; font-weight:700; font-variant-numeric:tabular-nums; }
+.stat.gpu .v{ color:var(--gpu); }
+.stat.cpu .v{ color:var(--cpu); }
+.stat.io .v{ color:var(--io); }
+.stat .note{ font-size:0.68rem; color:var(--good); font-weight:600; }
+
+footer{ font-size:0.74rem; color:var(--text-faint); text-align:center; max-width:640px; line-height:1.5; }
+footer code{ font-family:ui-monospace,SFMono-Regular,Menlo,monospace; background:var(--surface-2); padding:1px 5px; border-radius:4px; }
+
+@media (max-width:640px){
+  .stage-strip{ flex-wrap:wrap; }
+  .lane-label{ width:72px; font-size:0.7rem; }
+}
+
+@media (prefers-reduced-motion: reduce){
+  *{ animation-duration:0.01ms !important; transition-duration:0.01ms !important; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>Token Passage</h1>
+      <div class="subtitle">One decode step through turbo-fieldfare's Qwen3.6-35B-A3B pipeline — 40 transformer layers, MoE routing, streamed from SSD.</div>
+    </div>
+    <div class="hw">Apple M2 · 16GB<br>measured, per-token avg</div>
+  </header>
+
+  <div class="controls">
+    <button class="play" id="playBtn" aria-pressed="true">
+      <span id="playIcon">&#10074;&#10074;</span> <span id="playLabel">Pause</span>
+    </button>
+    <div class="speedgroup">
+      <span>Speed</span>
+      <button class="speed-btn" data-speed="0.5">0.5×</button>
+      <button class="speed-btn active" data-speed="1">1×</button>
+      <button class="speed-btn" data-speed="2">2×</button>
+    </div>
+    <div class="layer-readout">Layer <b id="layerNum">1</b> <span class="mono">/ 40</span></div>
+  </div>
+
+  <div class="stage-strip">
+    <div class="token-pill mono" id="tokenPill">"Paris"</div>
+    <div class="stage" data-stage="embed"><div class="icon">&#128190;</div><div class="label">Embed</div></div>
+    <div class="connector" data-conn="0"></div>
+    <div class="layer-loop">
+      <div class="layer-loop-title">Layer loop</div>
+      <div class="layer-count"><span id="layerCountBig">1</span><span class="of"> / 40</span></div>
+      <div class="layer-dots" id="layerDots"></div>
+    </div>
+    <div class="connector" data-conn="1"></div>
+    <div class="stage" data-stage="head"><div class="icon">&#127919;</div><div class="label">LM head</div></div>
+  </div>
+
+  <div class="lanes">
+    <div class="lanes-title">Inside one layer — three lanes run at once</div>
+
+    <div class="lane">
+      <div class="lane-label gpu">GPU<small>cb1 / cb2</small></div>
+      <div class="lane-track"><div class="lane-seg gpu" id="segGpu"><span class="segtext" id="segGpuText"></span></div></div>
+    </div>
+    <div class="lane">
+      <div class="lane-label cpu">CPU plan<small>cache lookup</small></div>
+      <div class="lane-track"><div class="lane-seg cpu" id="segCpu"><span class="segtext" id="segCpuText"></span></div></div>
+    </div>
+    <div class="lane">
+      <div class="lane-label io">SSD I/O<small>expert pread</small></div>
+      <div class="lane-track"><div class="lane-seg io" id="segIo"><span class="segtext" id="segIoText"></span></div></div>
+    </div>
+  </div>
+
+  <div class="stats">
+    <div class="stat gpu"><div class="k">cb1 — attn + router</div><div class="v mono">95 ms</div></div>
+    <div class="stat cpu"><div class="k">plan — cache lookup</div><div class="v mono">206 &rarr; ~1 ms</div><div class="note">NSLock fix, this session</div></div>
+    <div class="stat io"><div class="k">io — expert pread</div><div class="v mono">105 ms</div></div>
+    <div class="stat gpu"><div class="k">cb2 — MoE combine</div><div class="v mono">3 ms</div></div>
+    <div class="stat"><div class="k">head — LM head</div><div class="v mono">7 ms</div></div>
+  </div>
+
+  <footer>
+    Per-layer: <code>cb1</code> (attention + router, GPU) hands expert indices to <code>plan</code> (CPU cache-hit/miss lookup) which kicks off <code>io</code> (SSD pread for cache misses) — <code>io</code> overlaps the shared-expert FFN still running on GPU. <code>cb2</code> combines routed-expert output back into the residual before the next layer starts.
+  </footer>
+</div>
+
+<script>
+(function(){
+  const NUM_LAYERS = 40;
+  const STAGE_MS = { embed: 500, gpu1: 950, plan: 300, io: 1050, gpu2: 350, head: 700 };
+  // Sequence of steps per layer: gpu1 (cb1) -> [plan + io overlap, plan short] -> gpu2 (cb2, overlapping tail of io)
+  let layer = 1;
+  let playing = true;
+  let speed = 1;
+  let raf = null;
+  let phaseStart = performance.now();
+  let phase = 'embed'; // embed, gpu1, planio, gpu2, head, done
+
+  const dotsEl = document.getElementById('layerDots');
+  for (let i=0;i<NUM_LAYERS;i++){
+    const d = document.createElement('i');
+    dotsEl.appendChild(d);
+  }
+  function renderDots(){
+    const dots = dotsEl.children;
+    for (let i=0;i<NUM_LAYERS;i++){
+      dots[i].classList.remove('done','now');
+      if (i < layer-1) dots[i].classList.add('done');
+      else if (i === layer-1) dots[i].classList.add('now');
+    }
+  }
+
+  const layerNumEl = document.getElementById('layerNum');
+  const layerCountBig = document.getElementById('layerCountBig');
+  const tokenPill = document.getElementById('tokenPill');
+  const stages = {
+    embed: document.querySelector('.stage[data-stage="embed"]'),
+    head: document.querySelector('.stage[data-stage="head"]'),
+  };
+  const conns = document.querySelectorAll('.connector');
+  const layerLoop = document.querySelector('.layer-loop');
+
+  const segGpu = document.getElementById('segGpu');
+  const segCpu = document.getElementById('segCpu');
+  const segIo  = document.getElementById('segIo');
+  const segGpuText = document.getElementById('segGpuText');
+  const segCpuText = document.getElementById('segCpuText');
+  const segIoText  = document.getElementById('segIoText');
+
+  const stripRect = () => document.querySelector('.stage-strip').getBoundingClientRect();
+
+  function resetLanes(){
+    [segGpu,segCpu,segIo].forEach(s=>{ s.style.width='0%'; });
+    segGpuText.textContent=''; segCpuText.textContent=''; segIoText.textContent='';
+  }
+
+  function setStageActive(name){
+    stages.embed.classList.toggle('active', name==='embed');
+    stages.head.classList.toggle('active', name==='head');
+    layerLoop.style.borderColor = (name==='layer') ? 'var(--gpu)' : 'var(--border)';
+    conns[0].classList.toggle('lit', name!=='embed');
+    conns[1].classList.toggle('lit', name==='head');
+  }
+
+  function moveToken(target){
+    const stripBox = stripRect();
+    let x;
+    if (target==='embed') x = 20;
+    else if (target==='layer') x = stripBox.width*0.5 - 30;
+    else x = stripBox.width - 90;
+    tokenPill.style.left = Math.max(20, x) + 'px';
+  }
+
+  function tick(now){
+    const elapsed = (now - phaseStart) * speed;
+
+    if (phase==='embed'){
+      setStageActive('embed'); moveToken('embed');
+      tokenPill.textContent = '"Paris"';
+      resetLanes();
+      if (elapsed > STAGE_MS.embed){ phase='gpu1'; phaseStart=now; }
+    }
+    else if (phase==='gpu1'){
+      setStageActive('layer'); moveToken('layer');
+      tokenPill.textContent = 'h_' + layer;
+      const p = Math.min(1, elapsed/STAGE_MS.gpu1);
+      segGpu.style.width = (p*40)+'%';
+      segGpu.style.background = 'var(--gpu)';
+      segGpuText.textContent = p>0.35 ? 'cb1: attn + router' : '';
+      if (elapsed > STAGE_MS.gpu1){ phase='planio'; phaseStart=now; }
+    }
+    else if (phase==='planio'){
+      setStageActive('layer'); moveToken('layer');
+      const totalMs = Math.max(STAGE_MS.plan, STAGE_MS.io);
+      const p = Math.min(1, elapsed/totalMs);
+      // plan: quick burst right after cb1
+      const planP = Math.min(1, elapsed/STAGE_MS.plan);
+      segCpu.style.width = (40 + planP*15)+'%';
+      segCpuText.textContent = planP>0.3 ? 'plan: cache lookup' : '';
+      // io overlaps with the tail of gpu (shared FFN) conceptually; runs alongside plan
+      const ioP = Math.min(1, elapsed/STAGE_MS.io);
+      segIo.style.width = (40 + ioP*45)+'%';
+      segIoText.textContent = ioP>0.25 ? 'io: expert pread (SSD)' : '';
+      // shared-FFN visual: extend gpu bar slightly further while io runs
+      segGpu.style.width = (40 + ioP*20)+'%';
+      segGpuText.textContent = ioP>0.15 ? 'shared FFN (overlaps io)' : '';
+      if (elapsed > totalMs){ phase='gpu2'; phaseStart=now; }
+    }
+    else if (phase==='gpu2'){
+      setStageActive('layer'); moveToken('layer');
+      const p = Math.min(1, elapsed/STAGE_MS.gpu2);
+      segGpu.style.width = (60 + p*40)+'%';
+      segGpuText.textContent = 'cb2: MoE combine';
+      if (elapsed > STAGE_MS.gpu2){
+        if (layer >= NUM_LAYERS){ phase='head'; phaseStart=now; }
+        else { layer += 1; layerNumEl.textContent=layer; layerCountBig.textContent=layer; renderDots(); phase='gpu1'; phaseStart=now; }
+      }
+    }
+    else if (phase==='head'){
+      setStageActive('head'); moveToken('head');
+      tokenPill.textContent = '"Paris"';
+      resetLanes();
+      if (elapsed > STAGE_MS.head){ phase='done'; phaseStart=now; }
+    }
+    else if (phase==='done'){
+      if (elapsed > 700){
+        layer = 1; layerNumEl.textContent=layer; layerCountBig.textContent=layer; renderDots();
+        phase='embed'; phaseStart=now;
+      }
+    }
+
+    if (playing) raf = requestAnimationFrame(tick);
+  }
+
+  renderDots();
+
+  const playBtn = document.getElementById('playBtn');
+  const playIcon = document.getElementById('playIcon');
+  const playLabel = document.getElementById('playLabel');
+  playBtn.addEventListener('click', function(){
+    playing = !playing;
+    playBtn.setAttribute('aria-pressed', String(playing));
+    playIcon.innerHTML = playing ? '&#10074;&#10074;' : '&#9654;';
+    playLabel.textContent = playing ? 'Pause' : 'Play';
+    if (playing){ phaseStart = performance.now(); raf = requestAnimationFrame(tick); }
+    else if (raf){ cancelAnimationFrame(raf); }
+  });
+
+  document.querySelectorAll('.speed-btn').forEach(btn=>{
+    btn.addEventListener('click', function(){
+      document.querySelectorAll('.speed-btn').forEach(b=>b.classList.remove('active'));
+      btn.classList.add('active');
+      speed = parseFloat(btn.dataset.speed);
+    });
+  });
+
+  raf = requestAnimationFrame(tick);
+})();
+</script>
+</body>
+</html>

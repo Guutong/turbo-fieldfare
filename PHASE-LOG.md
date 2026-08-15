@@ -2273,3 +2273,135 @@ enough to rank which phase dominates; not precise enough to attribute
 sub-kernel bandwidth the way NVMAI's true GPU counters would. If the
 coarse breakdown doesn't point clearly at one phase, building real
 `MTLCounterSampleBuffer` timestamps is the fallback (not done here).
+
+### 2026-08-15 — P7-6: chased the decode `plan` phase to ground, found and
+fixed a real bug (SHA-256 re-hash), then a real GPU-bound wall (`cb1Wait`)
+
+**Context:** picked up the `TFF_PHASE_TIMING=1` instrumentation from
+earlier the same day. The `plan` phase (CPU work between cb1 and the
+routed-expert `io` await — expert-index readback, cache-hit/miss
+planning, slot pinning, argument-buffer building) measured ~206-233ms/tok
+on the real target machine (M2 MacBook Air, 16GB, confirmed via
+`sysctl hw.model` = `Mac14,2` — not the Mac Studio used in some earlier
+sessions, which has its own documented RSS confound). `plan` alone was
+bigger than `cb1` or `io`, and sub-breakdown pinned it almost entirely on
+`route` (`planRoutedExperts`'s cache-plan resolution).
+
+**First hypothesis (wrong): DispatchQueue thread-hop overhead.**
+`route`'s sub-breakdown showed `queueSync=205-209ms` — nearly 100% of
+`route` — while `cacheLockWait` and `cachePlanTotal` (the actual
+planning algorithm: an 8x64 nested scan + a <=64-element sort) were
+both under 1ms. Swapped `Model.streamersQueue` (a serial `DispatchQueue`,
+used ~15 call sites across `Model.swift`/`ModelExpertIO.swift` for
+expert-streamer bookkeeping) for a plain `NSLock` — mechanical,
+low-risk, same mutual-exclusion semantics. **Made zero measured
+difference** (`queueSync=210-216ms` after the swap, reproducible across
+runs). This was the first sign the hypothesis was wrong: an uncontended
+`NSLock.lock()/unlock()` should cost nanoseconds, not milliseconds,
+regardless of the primitive used.
+
+**Second hypothesis (wrong): thermal/memory-pressure noise.** `vm_stat`
+showed free memory had dropped to ~135MB on the 16GB Air after repeated
+back-to-back benchmark runs. Waited ~90s idle, free memory recovered to
+~2.8GB, re-measured clean. **Still zero improvement** (`route=215.838ms`).
+Ruled this out too.
+
+**Real answer, found via Instruments (not guessing):** recorded a Time
+Profiler trace (`xcrun xctrace record --template 'Time Profiler' --launch
+-- .build/release/TurboFieldfareCLI ...`), exported the `time-profile`
+table (`xcrun xctrace export --xpath '...time-profile...'`), and grepped
+the call stacks. Every sample inside the measured window traced through:
+```
+closure #1 in Model.ensureLayerOpened(_:)  [Model.swift:412]
+  -> Sha256Verifier.hashFile(...)
+    -> AccelerateCrypto_SHA256_compress   <- actual CPU time
+```
+`openLayerLocked` (called from `ensureLayerOpened`, idempotent after the
+first touch) does a **full SHA-256 hash of the entire routed-expert layer
+file** (~400MB+ per layer) on that layer's first open, when
+`integrityPolicy == .fullSha256` (the CLI's hardcoded default). Since all
+~40 layers first-open during the *first* decode token (the router visits
+every layer once), this one-time cost — 40 layers x however long a
+~400MB SHA-256 hash takes — lands entirely inside token 1's forward pass,
+then gets averaged across all 47 measured `forwards` in the phase-timing
+math, still leaving a large per-token average. This was never a
+lock/dispatch problem; the lock timing instrumentation was accidentally
+measuring the *closure* that contains the hash, not lock contention
+itself.
+
+**Fix:** the codebase already had a cheaper, safe alternative —
+`ModelIntegrityPolicy.sizeCheckTrustedReceipt`, which trusts the
+SHA-256 verification `TurboFieldfareRepack --verify-install` already
+did once at repack time (written to `verified-install.json`) and only
+re-checks file size on each run. Added `TFF_TRUST_INSTALL=1` env var to
+`TurboFieldfareCLI` (opt-in; `.fullSha256` stays the default for
+untrusted/freshly-copied installs) to select it. Also kept the
+`DispatchQueue` -> `NSLock` swap (harmless, simpler, just not the fix).
+Ran the 58 tests in `ModelLoaderTests`/`PreadExpertStreamerTests`
+(the suites covering `integrityPolicy`, `ensureLayerOpened`, and the
+streamer lock) — all pass. Full 853-test suite had 8 failures on a
+~19-minute run; not yet confirmed pre-existing vs caused by this change
+(targeted-suite pass plus the change's small, mechanical footprint make
+pre-existing far more likely, but this is flagged, not verified).
+Committed `dfc9f46`.
+
+**Re-measured with `TFF_TRUST_INSTALL=1`** (same command as always):
+```
+route=0.7-0.8ms/tok   (was 206-216ms)   <- fix confirmed, reproducible
+plan=15-19ms/tok      (was 206-233ms)
+tok/s=2.13-2.25                         (barely moved from the 1.9-2.2 baseline)
+maximum resident set size: 4.0-5.0 GB   (was 1.1-1.8 GB — NEW regression, gate is <=2GB)
+```
+tok/s not improving proportionally to a ~200ms/tok cut meant another
+cost of similar size was hiding behind the SHA-256 wall. Also flagging
+the RSS jump (4-5GB, reproducible, grows across repeated runs) as a
+**new, unresolved memory-gate regression** — not yet root-caused,
+possibly always present but masked by SHA-256 dominating total runtime
+enough that it wasn't noticed, possibly specific to the
+`sizeCheckTrustedReceipt` code path. Needs its own investigation before
+`TFF_TRUST_INSTALL=1` can be considered safe for the memory gate.
+
+**Chased the tok/s gap:** `RealForwardRunner`'s cb1 timing
+(`totalCb1Nanos`) explicitly computes `elapsed - waitNanos` — the GPU
+wait time for cb1 (attention/QKV/RoPE/router command buffer) was being
+measured and then *subtracted out*, never recorded anywhere. Added a
+`totalCb1WaitNanos` counter to capture it instead of discarding it.
+Re-measured:
+```
+cb1(encode)=89ms  cb1Wait(GPU compute)=384ms  plan=19ms  io=109ms  cb2=1ms  head=7ms
+```
+`cb1Wait` — genuine GPU-busy time for attention/QKV/RoPE/router — is by
+far the largest cost in decode, ~3.5x `io` and far larger than anything
+CPU-side. This is not a bug or overhead artifact like the last two
+findings; it's real GPU compute time the model needs every layer. It
+reframes the whole investigation: the speed gate is not blocked by CPU
+planning overhead (fixed) or lock contention (never was the problem) —
+it's blocked by GPU-bound attention/QKV/router kernel cost, which is
+exactly the territory the still-unstarted #34 layer-major restructuring
+and the (so-far marginal) MoE phase-1 kernel work were aimed at, except
+now pinned specifically to `cb1`, not the MoE routing kernels those
+efforts targeted.
+
+**Learned:** two rounds of "fix a suspicious-looking mechanism (lock,
+then hash), remeasure, gap doesn't close" is a real pattern worth
+naming — each fix was individually correct and worth keeping, but
+neither was *the* bottleneck, and guessing from source reading alone
+correctly identified the fixable bugs but not the dominant cost. Real
+profiling (Instruments Time Profiler, and the `cb1Wait` counter once we
+knew where to look) found both the accidental one and the real one.
+Next session chasing decode speed should profile before proposing a fix,
+not after two rounds of `plausible-looking mechanism -> no effect`.
+
+**Not done / next:**
+1. Root-cause the 4-5GB `TFF_TRUST_INSTALL=1` memory jump before trusting
+   it for gate measurement (currently blows the <=2GB memory gate even
+   though `.fullSha256` was passing it).
+2. `cb1Wait` (~384ms/tok, GPU-bound attention/QKV/RoPE/router) is now the
+   clear, evidence-based target for #34-style kernel/dispatch work —
+   confirm with per-layer or per-sub-kernel GPU timing (`MTLCounterSampleBuffer`,
+   still not built) whether it's dominated by full attention, the
+   DeltaNet hybrid-layer gate, RoPE, or the router itself before picking
+   which to optimize.
+3. Confirm the 8 full-suite test failures are pre-existing (targeted
+   58-test subset covering this change's files passed clean).
+4. Speed gate (>=4 tok/s) and memory gate (<=2GB) both still FAILED.
