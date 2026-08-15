@@ -666,6 +666,15 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     /// GPU-busy time waiting for cb1 to complete — previously computed and
     /// subtracted out of `totalCb1Nanos` without being recorded anywhere.
     public private(set) var totalCb1WaitNanos: UInt64 = 0
+    /// True GPU execution time of cb1 (Metal's own `gpuStartTime`/`gpuEndTime`
+    /// timestamps, read after completion). The difference between
+    /// `totalCb1WaitNanos` and this is CPU<->GPU scheduling/idle gap — the
+    /// decisive split for the P7-7 cb1Wait investigation.
+    public private(set) var totalCb1GPUNanos: UInt64 = 0
+    /// `totalCb1GPUNanos` split by layer kind: DeltaNet linear-attention
+    /// layers (mask 2, 30 of 40) vs full-attention layers (mask 1, 10 of 40).
+    public private(set) var totalCb1GPULinearNanos: UInt64 = 0
+    public private(set) var totalCb1GPUFullNanos: UInt64 = 0
     public private(set) var totalCb2Nanos: UInt64 = 0
     public private(set) var totalHeadNanos: UInt64 = 0
     public private(set) var totalHeadFusedNanos: UInt64 = 0
@@ -2292,6 +2301,12 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 try waitForCompletion(cb)
                 let waitNanos = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tWait
                 totalCb1WaitNanos &+= waitNanos
+                if cb.gpuEndTime > cb.gpuStartTime {
+                    let g = UInt64((cb.gpuEndTime - cb.gpuStartTime) * 1e9)
+                    totalCb1GPUNanos &+= g
+                    if cfg.layerKindMask[L] == 2 { totalCb1GPULinearNanos &+= g }
+                    else { totalCb1GPUFullNanos &+= g }
+                }
                 if let pending = pendingRoutedCommand {
                     try finishPendingRoutedCommand(pending, waitIfNeeded: false)
                     pendingRoutedCommand = nil
@@ -2347,6 +2362,12 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             waitUntilCompleted(cb)
             let waitNanos = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tWait
             totalCb1WaitNanos &+= waitNanos
+            if cb.gpuEndTime > cb.gpuStartTime {
+                let g = UInt64((cb.gpuEndTime - cb.gpuStartTime) * 1e9)
+                totalCb1GPUNanos &+= g
+                if cfg.layerKindMask[L] == 2 { totalCb1GPULinearNanos &+= g }
+                else { totalCb1GPUFullNanos &+= g }
+            }
             if let pending = pendingRoutedCommand {
                 try finishPendingRoutedCommand(pending, waitIfNeeded: false)
                 pendingRoutedCommand = nil
