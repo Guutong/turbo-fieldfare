@@ -129,6 +129,22 @@ public func run(args: Args,
             let line = "[spec-decode rounds=\(s.rounds) committed=\(s.committedTokens) drafts=\(s.draftsProposed) noEvidence=\(s.roundsWithoutEvidence) proposed=\(s.draftTokensProposed) accepted=\(s.draftTokensAccepted) acceptRate=\(String(format: "%.4f", s.acceptanceRate)) tokensPerRound=\(String(format: "%.3f", s.tokensPerRound))]\n"
             stderr.write(Data(line.utf8))
         }
+        if ProcessInfo.processInfo.environment["TFF_PHASE_TIMING"] == "1" {
+            // RealForwardRunner already tracks cumulative wall-clock nanos per
+            // decode phase (cb1 = input-norm/QKV/attention/router,
+            // io = routed-expert pread, cb2 = shared-FFN + tail combine,
+            // head = LM head). This just surfaces those existing counters —
+            // no new instrumentation on the hot path. Matches the
+            // `forwards = generated - 1` convention RealInferenceClient uses:
+            // the final sampled token never runs a forward pass.
+            let forwards = Double(max(stats.newTokens - 1, 1))
+            func msPerTok(_ nanos: UInt64) -> Double {
+                Double(nanos) / 1_000_000 / forwards
+            }
+            let head = runner.totalHeadNanos &+ runner.totalHeadFusedNanos
+            let line = "[phase-timing ms/tok: cb1=\(String(format: "%.3f", msPerTok(runner.totalCb1Nanos))) io=\(String(format: "%.3f", msPerTok(runner.totalIoNanos))) cb2=\(String(format: "%.3f", msPerTok(runner.totalCb2Nanos))) head=\(String(format: "%.3f", msPerTok(head))) rdadvise=\(String(format: "%.3f", msPerTok(runner.totalRDAdviseNanos)))]\n"
+            stderr.write(Data(line.utf8))
+        }
         if ProcessInfo.processInfo.environment["TFF_EXPERT_CACHE_STATS"] == "1" {
             let cache = model.routedExpertCacheStats()
             let rate = String(format: "%.4f", cache.hitRate)
