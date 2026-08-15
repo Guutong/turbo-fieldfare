@@ -200,6 +200,12 @@ final class DeltaNetMetalBlock {
     private let psoRecurrence: MTLComputePipelineState
     private let psoOutputGate: MTLComputePipelineState
 
+    // P7-7: int4 GEMV for the five big projections (int4-resident path),
+    // plus casts bridging it to the fp32 chain around it (see deltanet.metal).
+    private let int4GEMV: DequantInt4GEMV
+    private let psoCastToHalf: MTLComputePipelineState
+    private let psoCastToFloat: MTLComputePipelineState
+
     // MARK: - Batched pipelines.
 
     private let psoLoadHiddenB: MTLComputePipelineState
@@ -234,6 +240,17 @@ final class DeltaNetMetalBlock {
     private let gatedBuf: MTLBuffer      // [maxTK × valueDim]
     private let deltaOutBuf: MTLBuffer   // [maxTK × D]
 
+    // P7-7: half-precision scratch for the int4 GEMV boundary. Only the
+    // GEMV's direct in/out need a half copy; everything downstream reads the
+    // existing fp32 buffers unchanged (populated by a cast kernel).
+    private let normedBufF16: MTLBuffer    // [D], GEMV input, shared by qkv/z/a/b
+    private let qkvBufF16: MTLBuffer       // [convDim]
+    private let zBufF16: MTLBuffer         // [valueDim]
+    private let aRawBufF16: MTLBuffer      // [numValueHeads]
+    private let bRawBufF16: MTLBuffer      // [numValueHeads]
+    private let gatedBufF16: MTLBuffer     // [valueDim], GEMV input for out_proj
+    private let deltaOutBufF16: MTLBuffer  // [D]
+
     init(context: MetalContext, hiddenSize: Int, dims: DeltaNetDimensions,
          maxTK: Int = DeltaNetMetalBlock.defaultMaxTK) throws {
         self.ctx = context
@@ -250,6 +267,10 @@ final class DeltaNetMetalBlock {
         psoGates = try context.pipeline("dn_gates")
         psoRecurrence = try context.pipeline("dn_recurrence")
         psoOutputGate = try context.pipeline("dn_output_gate")
+
+        int4GEMV = try DequantInt4GEMV(context: context)
+        psoCastToHalf = try context.pipeline("dn_cast_f32_to_f16")
+        psoCastToFloat = try context.pipeline("dn_cast_f16_to_f32")
 
         // Batched pipelines.
         psoLoadHiddenB  = try context.pipeline("dn_load_hidden_batched")
@@ -287,6 +308,26 @@ final class DeltaNetMetalBlock {
         yBuf = try buf(maxTK * valueDim, "y")
         gatedBuf = try buf(maxTK * valueDim, "gated")
         deltaOutBuf = try buf(maxTK * hiddenSize, "gated_out")
+
+        func bufH(_ count: Int, _ label: String) throws -> MTLBuffer {
+            guard let b = context.device.makeBuffer(
+                length: max(count, 1) * MemoryLayout<Float16>.size,
+                options: .storageModeShared) else {
+                throw ModelError.residentBufferWrapFailed
+            }
+            b.label = "deltanet.\(label).f16"
+            return b
+        }
+        // Single-token sized (not maxTK ×) — the int4 GEMV boundary is only
+        // used by the non-batched `encode()` path; `encodeBatched` keeps the
+        // fp32 dn_matvec_batched path regardless of `useFP32Weights`.
+        normedBufF16 = try bufH(hiddenSize, "normed")
+        qkvBufF16 = try bufH(dims.convDim, "qkv")
+        zBufF16 = try bufH(valueDim, "z")
+        aRawBufF16 = try bufH(dims.numValueHeads, "a_raw")
+        bRawBufF16 = try bufH(dims.numValueHeads, "b_raw")
+        gatedBufF16 = try bufH(valueDim, "gated")
+        deltaOutBufF16 = try bufH(hiddenSize, "gated_out")
     }
 
     // MARK: - Encoding.
@@ -310,6 +351,34 @@ final class DeltaNetMetalBlock {
         enc.setBytes(&r, length: MemoryLayout<UInt32>.size, index: 3)
         enc.setBytes(&c, length: MemoryLayout<UInt32>.size, index: 4)
         dispatch(enc, psoMatVec, threads: rows)
+    }
+
+    private func cast(_ enc: MTLComputeCommandEncoder, _ pso: MTLComputePipelineState,
+                      src: MTLBuffer, dst: MTLBuffer, count: Int) {
+        enc.setBuffer(src, offset: 0, index: 0)
+        enc.setBuffer(dst, offset: 0, index: 1)
+        var c = UInt32(count)
+        enc.setBytes(&c, length: MemoryLayout<UInt32>.size, index: 2)
+        dispatch(enc, pso, threads: count)
+    }
+
+    /// int4-resident matVec: casts `xF32` (fp32) to a half scratch buffer,
+    /// runs the int4 SIMD GEMV kernel, casts the half result back into
+    /// `yF32` — so callers downstream of `y` see the same fp32 buffer they
+    /// always did. `w` is int4-packed with BF16 scales/biases, addressed by
+    /// `TensorView` offsets into the model's resident weight arena.
+    private func matVecInt4(_ enc: MTLComputeCommandEncoder,
+                            w: TensorView, xF32: MTLBuffer, xF16: MTLBuffer,
+                            yF16: MTLBuffer, yF32: MTLBuffer,
+                            rows: Int, cols: Int) {
+        cast(enc, psoCastToHalf, src: xF32, dst: xF16, count: cols)
+        int4GEMV.encode(encoder: enc,
+                        weights: w.buffer, weightsOffset: Int(w.offset),
+                        scales: w.buffer, scalesOffset: Int(w.scaleOffset),
+                        biases: w.buffer, biasesOffset: Int(w.biasOffset),
+                        x: xF16, y: yF16,
+                        m: UInt32(rows), n: UInt32(cols))
+        cast(enc, psoCastToFloat, src: yF16, dst: yF32, count: rows)
     }
 
     private func matVecBatched(_ enc: MTLComputeCommandEncoder,
@@ -365,11 +434,24 @@ final class DeltaNetMetalBlock {
         enc.setBytes(&epsValue, length: MemoryLayout<Float>.size, index: 4)
         dispatch(enc, psoRMSNorm, threads: D)
 
-        // Projections.
-        matVec(enc, w: weights.qkv!, x: normedBuf, y: qkvBuf, rows: dims.convDim, cols: D)
-        matVec(enc, w: weights.z!, x: normedBuf, y: zBuf, rows: valueDim, cols: D)
-        matVec(enc, w: weights.a!, x: normedBuf, y: aRawBuf, rows: dims.numValueHeads, cols: D)
-        matVec(enc, w: weights.b!, x: normedBuf, y: bRawBuf, rows: dims.numValueHeads, cols: D)
+        // Projections. int4-resident path (default) uses the SIMD GEMV
+        // kernel through a half scratch boundary; fp32 path (TFF_DELTANET_
+        // FP32=1) keeps the original one-thread-per-row dn_matvec.
+        if DeltaNetMetalBlock.LayerWeights.useFP32 {
+            matVec(enc, w: weights.qkv!, x: normedBuf, y: qkvBuf, rows: dims.convDim, cols: D)
+            matVec(enc, w: weights.z!, x: normedBuf, y: zBuf, rows: valueDim, cols: D)
+            matVec(enc, w: weights.a!, x: normedBuf, y: aRawBuf, rows: dims.numValueHeads, cols: D)
+            matVec(enc, w: weights.b!, x: normedBuf, y: bRawBuf, rows: dims.numValueHeads, cols: D)
+        } else {
+            matVecInt4(enc, w: weights.qkvTV, xF32: normedBuf, xF16: normedBufF16,
+                      yF16: qkvBufF16, yF32: qkvBuf, rows: dims.convDim, cols: D)
+            matVecInt4(enc, w: weights.zTV, xF32: normedBuf, xF16: normedBufF16,
+                      yF16: zBufF16, yF32: zBuf, rows: valueDim, cols: D)
+            matVecInt4(enc, w: weights.aTV, xF32: normedBuf, xF16: normedBufF16,
+                      yF16: aRawBufF16, yF32: aRawBuf, rows: dims.numValueHeads, cols: D)
+            matVecInt4(enc, w: weights.bTV, xF32: normedBuf, xF16: normedBufF16,
+                      yF16: bRawBufF16, yF32: bRawBuf, rows: dims.numValueHeads, cols: D)
+        }
 
         // Causal conv1d + silu, conv state resident in `convState`.
         enc.setBuffer(qkvBuf, offset: 0, index: 0)
@@ -438,7 +520,12 @@ final class DeltaNetMetalBlock {
         dispatch(enc, psoOutputGate, threads: valueDim)
 
         // out_proj, then fold back into the FP16 residual stream.
-        matVec(enc, w: weights.out!, x: gatedBuf, y: deltaOutBuf, rows: D, cols: valueDim)
+        if DeltaNetMetalBlock.LayerWeights.useFP32 {
+            matVec(enc, w: weights.out!, x: gatedBuf, y: deltaOutBuf, rows: D, cols: valueDim)
+        } else {
+            matVecInt4(enc, w: weights.outTV, xF32: gatedBuf, xF16: gatedBufF16,
+                      yF16: deltaOutBufF16, yF32: deltaOutBuf, rows: D, cols: valueDim)
+        }
 
         enc.setBuffer(hidden, offset: hiddenOffset, index: 0)
         enc.setBuffer(xBuf, offset: 0, index: 1)
@@ -463,6 +550,14 @@ final class DeltaNetMetalBlock {
                        recurrentState: MTLBuffer,
                        tk: Int,
                        eps: Float = 1e-6) {
+        // P7-7 Task 6 (not yet done): the batched path used by DraftVerifier
+        // still requires the fp32-dequant projections. Fail loudly here
+        // rather than force-unwrap a nil into a crash with no context.
+        guard DeltaNetMetalBlock.LayerWeights.useFP32 else {
+            fatalError("DeltaNetMetalBlock.encodeBatched requires TFF_DELTANET_FP32=1 " +
+                      "until P7-7 Task 6 wires the int4 GEMV into the batched path " +
+                      "(see docs/PHASE-7-7-DELTANET-INT4-GEMV.md)")
+        }
         guard let enc = cb.makeComputeCommandEncoder() else { return }
         enc.label = "deltanet.batched"
         let keyDim = dims.numKeyHeads * dims.headKDim

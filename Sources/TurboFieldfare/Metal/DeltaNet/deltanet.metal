@@ -122,6 +122,37 @@ void dn_matvec(
 }
 
 // ---------------------------------------------------------------------------
+// P7-7: fp32 <-> half casts bridging the int4 GEMV kernel (which requires
+// `half` in/out, see DequantInt4GEMV) to the rest of this file's fp32 chain.
+// Kept as separate elementwise passes rather than touching dn_rmsnorm /
+// dn_conv_step / etc. — those aren't the bottleneck (int4 GEMV is), and this
+// way every existing kernel's fp32 arithmetic, and its ADR-0002 bit-exact
+// parity with the CPU reference, is completely untouched.
+// ---------------------------------------------------------------------------
+
+[[kernel, max_total_threads_per_threadgroup(256)]]
+void dn_cast_f32_to_f16(
+    device const float* src   [[buffer(0)]],
+    device half*         dst  [[buffer(1)]],
+    constant uint&        count [[buffer(2)]],
+    uint                   tid   [[thread_position_in_grid]]
+) {
+    if (tid >= count) return;
+    dst[tid] = half(src[tid]);
+}
+
+[[kernel, max_total_threads_per_threadgroup(256)]]
+void dn_cast_f16_to_f32(
+    device const half*  src   [[buffer(0)]],
+    device float*        dst   [[buffer(1)]],
+    constant uint&        count [[buffer(2)]],
+    uint                   tid   [[thread_position_in_grid]]
+) {
+    if (tid >= count) return;
+    dst[tid] = float(src[tid]);
+}
+
+// ---------------------------------------------------------------------------
 // Causal depthwise conv1d (width 4) + silu, then slide the conv state.
 // One thread per channel; a channel's three state rows are touched only by
 // that channel's thread, so the in-place slide is race-free.
