@@ -2215,3 +2215,61 @@ proceed with #34's originally-scoped layer-major restructuring on the
 hypothesis that per-token dispatch overhead across 40 layers, not any
 single kernel's bandwidth, is the dominant cost. Not decided this
 session — stopping here per user request.
+
+### 2026-08-15 — Per-phase decode timing surfaced in CLI (task (a) from prior next-steps)
+
+**Context:** prior entry concluded that point-fixing individual kernels
+(MoE phase-1 rewrite, commit `7d58561`) without knowing where decode
+time actually goes was not converging on the >=4 tok/s speed gate, and
+proposed either (a) build per-command-buffer/per-kernel GPU timing
+instrumentation, or (b) proceed with #34's layer-major restructuring.
+User picked "a then b".
+
+**Finding:** `RealForwardRunner` already tracks cumulative wall-clock
+nanoseconds per decode phase — `totalCb1Nanos` (input-norm through
+attention + router, first command buffer of the layer),
+`totalIoNanos` (routed-expert pread), `totalCb2Nanos` (shared-FFN +
+layer-tail combine), `totalHeadNanos`/`totalHeadFusedNanos` (LM head),
+`totalRDAdviseNanos` (readahead advice syscalls) — via
+`clock_gettime_nsec_np(CLOCK_UPTIME_RAW)` bracketing around each
+command buffer's commit/wait. `RealInferenceClient` (the Mac app's
+client) already diffs and averages these per token
+(`AppRunnerDiagnostics`), but nothing in `TurboFieldfareCLI` — the
+binary every gate measurement in this log has used — printed them.
+
+**Built:** `Sources/TurboFieldfareCLI/Run.swift` now prints an
+env-gated `[phase-timing ms/tok: cb1=... io=... cb2=... head=...
+rdadvise=...]` footer line when `TFF_PHASE_TIMING=1` is set, using the
+runner's existing counters divided by `newTokens - 1` forward passes
+(same convention as `RealInferenceClient`). No new instrumentation was
+added to the hot path — this only exposes state the runner already
+collects. `swift build -c release --product TurboFieldfareCLI` builds
+clean. Committed `b138c22`.
+
+**Not measured on real hardware this session:** attempted to reach the
+dev box (`javis@192.168.1.46`, has the model weights) via SSH — it is
+reachable, but its checkout of `qwen36-bringup`
+(`/Users/javis/Workspaces/turbo-fieldfare`, at `9b9eb0f`) has diverged
+from local HEAD by several commits in both directions (local has the
+unstaged/uncommitted MoE phase-1 + this timing commit; remote has
+`9b9eb0f`/`4c909b4`/`5e40f59`/`03b95aa`/`bd5681e` that local does not).
+Reconciling that divergence (merge/rebase/force-sync) is a call for
+whoever owns that box's state, not something to resolve unattended
+inside this task — flagging it rather than picking a side. **Next
+session:** decide how to sync the dev box, then re-run the standard
+gate benchmark with `TFF_PHASE_TIMING=1` to get the real per-phase
+breakdown, before deciding whether cb1 (attention/dispatch-heavy) or
+io (expert fetch) or cb2 (FFN combine) dominates — that answer decides
+whether task (b), the #34 layer-major restructuring, is actually the
+right next lever.
+
+**Coarseness caveat:** these are CPU wall-clock nanos around
+commit+wait, not true GPU-only timing (no `MTLCommandBuffer`
+`gpuStartTime`/`gpuEndTime` or `MTLCounterSampleBuffer` capture) — they
+include CPU-side encode and queue-submission overhead alongside actual
+GPU execution, and `cb1`'s wait is itself deliberately overlapped with
+the previous layer's pipelined MoE combine in some code paths. Good
+enough to rank which phase dominates; not precise enough to attribute
+sub-kernel bandwidth the way NVMAI's true GPU counters would. If the
+coarse breakdown doesn't point clearly at one phase, building real
+`MTLCounterSampleBuffer` timestamps is the fallback (not done here).
