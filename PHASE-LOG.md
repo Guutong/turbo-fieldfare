@@ -2493,3 +2493,26 @@ text output:  byte-identical to the fp32 baseline at temperature 0
    `DeltaNetMetalParityTests` only; if int4 GEMV gets reused elsewhere
    for DeltaNet-family tensors, re-derive rather than assume the same
    ceiling applies.
+
+---
+
+## P8-1: Spec Decode Correctness (2026-08-16)
+
+**Status:** Committed (9b669f8). Build clean, all tests pass.
+
+**What:** Fixed speculative decode state corruption bugs preventing `TFF_SPEC_DECODE=1` from running correctly.
+
+**Changes:**
+1. Wired `enableSpeculation` from `--spec-decode` CLI flag and `TFF_SPEC_DECODE` env var through `RuntimeConfiguration`
+2. Added `DeltaNetStateSnapshot` with `snapshot()`/`restoreSnapshot()` on `GPUStateStore` — DraftVerifier snapshots before each draft token, restores to pre-spec state after
+3. Added `snapshotPosition()`/`restorePosition()` on `KVCacheManager` — KV data from rejected drafts sits beyond `validTokenCount`, invisible to attention
+4. Restructured `RawCompletion` spec decode branch to observational mode — DraftVerifier runs for stats only, all token emission through standard path
+
+**Honest assessment:** Sequential verification (K separate forward passes) provides NO speed benefit over baseline. Each pass costs ~250ms, same as standard decode. K passes for ~K tokens = same tok/s.
+
+**Path to actual speed gain:**
+- Phase 2 (CB fusion): 180 CBs/tok → ~40 CBs/tok, saves ~40ms/tok → ~5.5-6 tok/s
+- Phase 3 (layer-major batched verification): 1 CB per layer for all K tokens, shared expert fetch → ~8-10 tok/s
+- Phase 4 (true batched kernels): GEMM instead of K×GEMV → theoretical 12-15 tok/s (at hardware limit)
+
+**Tests:** DeltaNet parity passed (30 layers, worst relL2 0.001). 853 tests total, exit code 0.
