@@ -419,6 +419,14 @@ public struct Model {
         }
     }
 
+    /// P8-3: Pre-open all expert streamer layers at startup to avoid lazy-open
+    /// overhead during first token decode. Call after Model initialization.
+    public func preOpenAllLayers() throws {
+        for L in 0..<packedExpertsLayout.numLayers {
+            _ = try ensureLayerOpened(L)
+        }
+    }
+
     /// Best-effort overlap hook for prefill: starts the same lazy layer open on
     /// a background queue without waiting for the first expert fetch.
     public func beginOpeningRoutedExpertStreamer(layer L: Int) {

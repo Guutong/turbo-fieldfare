@@ -556,6 +556,10 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         for i in 0..<cfg.numExperts { oneDst[i] = oneBits }
         ones.label = "router.per_expert_scale.ones"
         self.routerOnesPerExpert = ones
+
+        // P8-3: Pre-open all expert streamer layers at startup to avoid
+        // lazy-open overhead during first token decode (~9s for 40 layers).
+        try model.preOpenAllLayers()
     }
 
     /// Splits `qRawScratch`'s `[numHeads, 2 * headDim]` gated q_proj output into
