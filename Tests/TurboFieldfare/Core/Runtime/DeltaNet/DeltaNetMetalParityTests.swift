@@ -24,8 +24,34 @@ import Testing
 /// state 4.7e-07 — i.e. ~10x headroom under the gate, and flat rather than
 /// compounding across tokens, which is what confirms the GPU-resident state
 /// is not drifting away from the reference.
+///
+/// P7-7: this no longer holds for the DEFAULT path. `DeltaNetMetalBlock`'s
+/// five big projections went int4-resident and now round through a `half`
+/// scratch boundary around `DequantInt4GEMV` (see deltanet.metal's
+/// `dn_cast_f32_to_f16`/`dn_cast_f16_to_f32`); the fp32 dequant kernel this
+/// test's 1e-5 gate was calibrated against only runs under
+/// `TFF_DELTANET_FP32=1`. Measured on the int4 path (M2 Air, all 30 layers,
+/// 2026-08-16): deltaOut relL2 flat at ~4e-4 to 1.2e-3 across every layer —
+/// not growing with token index, which is the signature of rounding noise,
+/// not a state-plumbing bug. The magnitude matches fp16's ~2^-11 relative
+/// mantissa precision almost exactly. `intGate` below is deliberately an
+/// ADR-0002 EXCEPTION for this one kernel family: the ADR's ~1e-2 model-
+/// level budget already anticipated quantization error this size, and the
+/// int4 GEMV is the documented, load-bearing design (P7-7, both the speed
+/// and memory gates depend on it) — not an unexamined regression being
+/// waved through. If this gate is ever hit with a value that grows across
+/// tokens rather than staying flat, that IS a real bug; don't just widen
+/// further.
 @Suite struct DeltaNetParityTests {
     private static let modelDir = "scratch/qwen36.gturbo"
+
+    /// P7-7: 1e-5 for the untouched fp32 kernel (`TFF_DELTANET_FP32=1`);
+    /// ~2e-3 for the default int4-resident path, which pays fp16 cast-
+    /// boundary rounding on top of int4 quantization noise (see the suite
+    /// doc comment above for the measured distribution this was set from).
+    private static var intGate: Float {
+        DeltaNetMetalBlock.LayerWeights.useFP32 ? 1e-5 : 2e-3
+    }
 
     private static var isModelAvailable: Bool {
         FileManager.default.fileExists(atPath: modelDir)
@@ -121,7 +147,7 @@ import Testing
             let ours = block.lastDeltaOut
             let relL2 = Self.relativeL2(ours, reference)
             let maxAbs = Self.maxAbsolute(ours, reference)
-            #expect(relL2 <= 1e-5,
+            #expect(relL2 <= Self.intGate,
                     "token \(token) deltaOut relL2 \(relL2) (maxAbs \(maxAbs))")
             #expect(ours.allSatisfy { $0.isFinite })
 
@@ -147,8 +173,8 @@ import Testing
         }
         let convRelL2 = Self.relativeL2(gpuConv, cpuConvState)
         let recurrentRelL2 = Self.relativeL2(gpuRecurrent, cpuRecurrentState)
-        #expect(convRelL2 <= 1e-5, "conv state relL2 \(convRelL2)")
-        #expect(recurrentRelL2 <= 1e-5, "recurrent state relL2 \(recurrentRelL2)")
+        #expect(convRelL2 <= Self.intGate, "conv state relL2 \(convRelL2)")
+        #expect(recurrentRelL2 <= Self.intGate, "recurrent state relL2 \(recurrentRelL2)")
     }
 
     /// P4-2: the same lockstep diff, but for EVERY DeltaNet layer in the model
@@ -227,7 +253,7 @@ import Testing
                 layerWorstDelta = max(layerWorstDelta, relL2)
                 #expect(ours.allSatisfy { $0.isFinite },
                         "layer \(layer) token \(token) produced non-finite output")
-                #expect(relL2 <= 1e-5,
+                #expect(relL2 <= Self.intGate,
                         "layer \(layer) token \(token) deltaOut relL2 \(relL2) (maxAbs \(maxAbs))")
             }
 
@@ -239,8 +265,8 @@ import Testing
             }
             let convRelL2 = Self.relativeL2(gpuConv, cpuConvState)
             let recurrentRelL2 = Self.relativeL2(gpuRecurrent, cpuRecurrentState)
-            #expect(convRelL2 <= 1e-5, "layer \(layer) conv state relL2 \(convRelL2)")
-            #expect(recurrentRelL2 <= 1e-5,
+            #expect(convRelL2 <= Self.intGate, "layer \(layer) conv state relL2 \(convRelL2)")
+            #expect(recurrentRelL2 <= Self.intGate,
                     "layer \(layer) recurrent state relL2 \(recurrentRelL2)")
 
             let layerWorst = max(layerWorstDelta, max(convRelL2, recurrentRelL2))
@@ -330,7 +356,7 @@ import Testing
             let ours = block.batchedDeltaOut(token: t)
             let relL2 = Self.relativeL2(ours, reference[t])
             let maxAbs = Self.maxAbsolute(ours, reference[t])
-            #expect(relL2 <= 1e-5,
+            #expect(relL2 <= Self.intGate,
                     "token \(t) deltaOut relL2 \(relL2) (maxAbs \(maxAbs))")
             #expect(ours.allSatisfy { $0.isFinite })
         }
@@ -343,8 +369,8 @@ import Testing
         }
         let convRelL2 = Self.relativeL2(gpuConv, cpuConvState)
         let recurrentRelL2 = Self.relativeL2(gpuRecurrent, cpuRecurrentState)
-        #expect(convRelL2 <= 1e-5, "conv state relL2 \(convRelL2)")
-        #expect(recurrentRelL2 <= 1e-5, "recurrent state relL2 \(recurrentRelL2)")
+        #expect(convRelL2 <= Self.intGate, "conv state relL2 \(convRelL2)")
+        #expect(recurrentRelL2 <= Self.intGate, "recurrent state relL2 \(recurrentRelL2)")
     }
 
     @Test(.enabled(if: isModelAvailable))
