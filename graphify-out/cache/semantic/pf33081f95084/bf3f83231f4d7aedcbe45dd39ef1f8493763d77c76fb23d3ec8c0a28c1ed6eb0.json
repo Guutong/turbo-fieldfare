@@ -1,1 +1,1 @@
-{"nodes": [{"id": "third_party_notices_md", "label": "THIRD_PARTY_NOTICES.md", "file_type": "document", "source_file": "THIRD_PARTY_NOTICES.md"}], "edges": [], "hyperedges": []}
+{"nodes": [{"id": "third_party_notices_md", "label": "THIRD_PARTY_NOTICES.md", "file_type": "document", "source_file": "THIRD_PARTY_NOTICES.md"}, {"id": "third_party_notices", "label": "Third-Party Notices", "file_type": "document", "source_file": "THIRD_PARTY_NOTICES.md"}], "edges": [], "hyperedges": []}

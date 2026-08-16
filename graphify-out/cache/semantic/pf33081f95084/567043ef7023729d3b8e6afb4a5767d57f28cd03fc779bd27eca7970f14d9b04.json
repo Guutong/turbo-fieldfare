@@ -1,1 +1,1 @@
-{"nodes": [{"id": "diagnosing_bugs_skill", "label": "Diagnosing Bugs", "file_type": "document", "source_file": ".agents/skills/diagnosing-bugs/SKILL.md"}], "edges": [], "hyperedges": []}
+{"nodes": [{"id": "diagnosing_bugs_skill", "label": "Diagnosing Bugs", "file_type": "document", "source_file": ".agents/skills/diagnosing-bugs/SKILL.md"}, {"id": "skill_diagnosing_bugs", "label": "Diagnosing Bugs Skill", "file_type": "document", "source_file": ".agents/skills/diagnosing-bugs/SKILL.md"}], "edges": [], "hyperedges": []}

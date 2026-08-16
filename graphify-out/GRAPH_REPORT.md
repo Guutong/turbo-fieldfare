@@ -1,1400 +1,1328 @@
-# Graph Report - .  (2026-08-10)
+# Graph Report - .  (2026-08-16)
 
 ## Corpus Check
-- cluster-only mode — file stats not available
+- Large corpus: 516 files · ~408,692 words. Semantic extraction will be expensive (many Claude tokens). Consider running on a subfolder.
 
 ## Summary
-- 5840 nodes · 15957 edges · 358 communities (254 shown, 104 thin omitted)
-- Extraction: 89% EXTRACTED · 11% INFERRED · 0% AMBIGUOUS · INFERRED: 1816 edges (avg confidence: 0.8)
-- Token cost: 0 input · 0 output
-
-## Graph Freshness
-- Built from commit: `ba8dc238`
-- Run `git rev-parse HEAD` and compare to check if the graph is stale.
-- Run `graphify update .` after code changes (no API cost).
+- 6074 nodes · 16477 edges · 287 communities (242 shown, 45 thin omitted)
+- Extraction: 88% EXTRACTED · 12% INFERRED · 0% AMBIGUOUS · INFERRED: 2001 edges (avg confidence: 0.8)
+- Token cost: 208,344 input · 8,597 output
 
 ## Community Hubs (Navigation)
-- Metal Compute Kernels
-- Affine Quantization Logic
-- AppRuntimeOptions
-- Core System Dependencies
-- Model Validation Testing
-- Model Installation Client
-- Tensor Metadata Loading
-- .run
-- File System Access
-- Metal Shader Compilation
-- MoE Expert Offsets
-- ServerHTTPHandler
-- Expert Streaming Model
-- Model Installation Probing
-- Posix Memory Mapping
-- macOS App UI
-- Message
-- RealForwardRunner
-- Resident Index Codec
-- App Input Behavior
-- runRawCompletion
-- Prefill Layer Encoding
-- Model Installation Tests
-- Rich Text Formatting
-- Prefill Chunk Management
-- Model Installer Tasks
-- Attention Kernel Tests
-- OpenAI API Models
-- Remote Data Transfer
-- Model Directory Access
-- Expert Layout Reader
-- Local Checkpoint Repacking
-- Int4 Prefill Matrix-Multiplication
-- AppGenerationRequest
-- Sub-Byte Quantization
-- JSON Value Handling
-- Shared Expert Logits
-- HTTP Server Testing
-- Seed Tree Randomization
-- Manifest Reader Tests
-- Expert Layout Codec
-- Structured Output Diagnostics
-- DeltaNet Recurrent Layers
-- Diagnostic UI Components
-- Installation Verification Tool
-- Remote Streaming Installer
-- Resident Index Reader
-- MoE Tile Scheduling
-- KV Cache Management
-- Model Manifest Codec
-- Chat Completion Parameters
-- Fused QKV GEMV
-- MoE Streamed Parameters
-- N-Gram Speculative Decoding
-- HuggingFace Remote Source
-- GFTokenizer
-- TokenizerTests
-- ValidatedChatRequest
-- Remote Download Session
-- Transcript UI Styling
-- SHA256 Hashing Utilities
-- Prefill MoE Grouping
-- Attention Mechanism Tests
-- Remote Retry Policy
-- Gemma Tool Parser
-- Model Manifest Reader
-- Logit Production Runner
-- Remote Payload Tests
-- Verified Install Receipt
-- .executePrefillChunk
-- Routed Tile Scheduler
-- Range Copy Planning
-- OpenAI Request Validation
-- App Scroll View
-- App Model Synchronization
-- Activation Function Implementation
-- DeltaNet Metal Kernels
-- Expert Streamer Errors
-- Fused Metal Kernels
-- Prefill Attention Kernels
-- DecodeServiceInferenceClient
-- Command Line Arguments
-- HTTPServerTests.swift
-- Expert Cache Planning
-- Logit Softmax Kernels
-- Model Source Selection
-- Numeric Isolation Fixtures
-- Integrity Verification Tests
-- MoE Synthetic Testing
-- DeltaNet GPU Dispatch
-- Prefill Scratch Allocation
-- Model Catalog UI
-- Model Install Readiness
-- Architecture Configuration Detection
-- Expert Cache Phase
-- Attention Geometry Encoding
-- Runtime Path Configuration
-- HuggingFace Search Client
-- GTurbo Format Validation
-- Fake Inference Testing
-- Error Handling and Types
-- MoE Router Kernels
-- .encode
-- Expert Routing Management
-- Decode Service Outbox
-- Prefill Attention Setup
-- Tool Call Parsing
-- DecodeRuntimeOptions
-- Installation Locking
-- Mock HTTP Protocol
-- Server Coordination
-- Prefill Router Tests
-- CLI Shell Utilities
-- Streamed MoE Prefill
-- Shared Expert Prefill
-- RoPE Metal Kernels
-- Architecture Configuration
-- RMSNorm Reference Implementation
-- Fused GEMV Tests
-- Sampler Logic Tests
-- Int8 Shared Expert
-- Attention Metal Kernels
-- Int4 Dequantization Kernels
-- Digest and Byte Providers
-- Prefill Attention Tests
-- Model Component Source
-- Metric Formatting
-- HuggingFace API Client
-- Prefill QKV Epilogue
-- Response Routing Service
-- Decode Command Queue
-- Int4 GEMV Tests
-- ContinuationProducer
-- Draft Verification Service
-- Model Installation States
-- Model Layout Repacker
-- Remote Install Checkpoints
-- Server Logging
-- Qwen36 Layer Isolation
-- QKV Epilogue Tests
-- KV Cache Management
-- Decode Frame Codec
-- Expert Cache Planning
-- Expert IO Advice
-- Model Location Resolution
-- App Presentation State
-- Safetensors Header Parsing
-- Inference Client Infrastructure
-- Model Topology Types
-- Prefill Attention Pipeline
-- Prefill Router Encoding
-- Sampler
-- ChildChannelRegistry
-- Model Loading States
-- Model Lifecycle Actions
-- Rig
-- App Inference Client
-- Server Termination Signals
-- Read Advice Utilities
-- Prompt Preset Management
-- Weight Encoding Kernels
-- Sub-byte Dequantization Kernels
-- Context Capacity Validation
-- DeltaNetDimensions
-- DeltaNet CPU Implementation
-- Generation Configuration Keys
-- Repack CLI Parser
-- Server Argument Parsing
-- Model Loader Tests
-- Text Range Mutation
-- DeltaNet Parity Tests
-- Expert Cache Statistics
-- RoPE Pipeline Dispatch
-- Int6 GEMV Implementation
-- Attention Parameter Schema
-- Int8 Dequantization Kernels
-- Runtime Prefill Policy
-- .generate
-- Generation Transcript Mailbox
-- Install Event Tracking
-- Presentation State Tests
-- Fused QKV Tests
-- Qwen36 Model Loading
-- Repack CLI Tests
-- Synthetic Snapshot Builder
-- Qwen36 Reference Script
-- Resident Buffer Management
-- Fused Layer Tail
-- Prefill Metal Kernels
-- RMSNorm Metal Kernels
-- Tokenizer.swift
-- RealForwardRunner.swift
-- ServerPromptCacheMode
-- Model Load Phases
-- Install Progress Tracking
-- Scripted Logit Production
-- RoPE Reference Implementation
-- Logit Softcap Reference
-- Expert Streamer Tests
-- Sampler Unit Tests
-- Metal Rope Scaling
-- Fused Post-Attention Setup
-- Int4 Greedy Decoding
-- Expert Gate Weights
-- Prompt Submission Tests
-- Conversation UI Layout
-- Unix Socket Decoding
-- Status HUD Phases
-- Error Banner Policy
-- Message Execution Runner
-- Service Event States
-- Streaming Kernel Tests
-- Int5 GEMV Tests
-- URL Loading Protocol
-- App Delegate Lifecycle
-- Random Number Generation
-- Metal Buffer Encoding
-- .encode
-- RoPE Prefill Parameters
-- Prompt Submission Logic
-- Model Manifest Encoding
-- Bounded Memory Buffer
+- Int4 Embed Lookup & Buffers
+- Metal Context & Model Directory
+- App Model Installer Client
+- Install Probe & Runtime Tests
+- Sub-byte Quantization Rows
+- Gemma Tool Call Parser
+- Index Loader & Tensor Metadata
+- Resident Index & TensorView
+- Int4/Int8 Affine Quantization
+- Install Status & Run State
+- Metal Pipeline Compilation
+- Raw Completion & Decode Progress
+- SwiftUI App Scene & Shortcuts
+- MoE Metal Kernels
+- App Stop Reason & Memory Sampler
+- Posix File IO & Mmap
+- NIO HTTP Server
+- Checkpoint Repacker & Validator
+- App Prompt Presets & Options
+- Model Load & Install Tests
+- Generate Control UI
 - Model Loader Symlink Tests
-- Fused QKV Tests
-- Int8 GEMV Tests
-- Generator Stop Reasons
-- Prefill Routing Policy
-- HuggingFace Search UI
-- Embedding Lookup Reference
-- Markdown Link Validation
-- DeltaNet Oracle Script
-- Metal Command Encoding
-- Metal Prefill Kernels
-- Task Execution Drive
-- Pread Model Loading
-- Softmax Reference Tests
-- Per-Head Metal Encoding
-- .encode
-- .encode
-- Metal Compute Encoding
-- Prefill Token Pairs
-- App Installation Status
-- Lazy Streaming Tests
-- Runtime Configuration Tests
-- Attention Quantization Tests
-- HITL Loop Script
-- Domain Modeling Agents
-- DeltaNet Stage Dumper
-- Metal Threadgroup Kernels
-- Sampling Path Strategy
-- CLI Command Core
-- MLP Stage Dumper
-- Resident Index Parser
-- Run State Machine
-- Integer Offset Math
-- Floating Point Tolerances
-- Qwen Model Loading
-- Codebase Design Reporting
-- Design Iteration Strategy
-- Prototyping Phases
-- Performance Benchmarks
-- Swift Package Definition
-- Shell Test Script
-- Remote Chunk Policy
-- Ask Matt Agent
-- Phase Boundary Definitions
-- Ask Matt Feature
-- Code Review Agent
-- Code Review Process
-- Codebase Design Task
-- Bug Diagnosis Agent
-- Bug Diagnosis Process
-- ADR Documentation Format
-- Context Markdown Format
-- Domain Modeling Task
-- Grill Me Agent
-- Grill Me Feature
-- Grill with Docs
-- Grilling Agent Logic
-- Grilling Process
-- Handoff Agent
-- Handoff Process
-- Implementation Agent
-- Implementation Task
-- Architecture Improvement
-- Prototype Agent
-- Prototyping Task
-- Research Agent
-- Research Task
-- Merge Conflict Agent
-- Merge Conflict Resolution
-- Matt Pocock Skills
-- GitHub Issue Tracker
-- GitLab Issue Tracker
-- Markdown Issue Tracker
-- Skills Setup Agent
-- Triage Label Management
-- TDD Agent
-- Mocking Best Practices
-- Test Driven Development
-- Test Quality Standards
-- Teaching Agent
-- Glossary Documentation Format
-- Learning Record Standards
-- Mission Documentation Format
-- Resource List Format
-- Educational Content
-- Questionnaire Generation Agent
-- Questionnaire Development
-- Specification Generation Agent
-- Technical Specification Process
-- Ticket Creation Agent
-- Task Ticketing Process
-- Agent Brief Writing
-- Triage Management Agent
-- Out-of-Scope Knowledge
-- Triage Process
-- Clarification Agent
-- Clarification Process
-- Navigation Wayfinder Agent
-- Wayfinding and Navigation
-- Wizard Setup Agent
-- Wizard Configuration Process
-- Agent Communication Agent
-- Writing for Agents
-- Skill Mechanics
-- Hybrid Compute ADR
-- Validation Skip ADR
-- Oracle Strategy ADR
-- App Screenshots
-- Brand Logo
-- Benchmark Prompts
-- Experiment Inventory
-- IO Experiment Results
-- Decode Performance Summaries
-- Cache Optimization Results
-- Memory Advice Experiments
-- Attention Mechanism Results
-- Prefill Performance Summaries
-- Fusion Optimization Results
-- Sampling Strategy Results
-- Validation Methodology
-- Implementation References
-- Local OpenAI Server
-- Optimization Journey
-- Runtime Controls
-- System Design
-- App Icon Assets
+- Sampling Kernels
+- KV Cache Manager
+- Installation Appmodelinstalldescriptor
+- Workflow Errors
+- Macpresentation Responsemarkdownrenderertests
+- Tokenization Tokenizer
+- Prefill Prefillruntimeconfig
+- Moe Prefillgroupedroutedmoe
+- System Diskspacechecker
+- Macpresentation Responsemarkdownrenderer
+- Inference Appgenerationrequesttests
+- Remote Remoterangetransfer
+- Inference Realforwardrunner
+- Prefill Prefillaffinetests
+- Primitives Rmsnorm
+- Serverpromptcache
+- Diagnostics Appdiagnostics
+- Serverinference
+- Remote Huggingfaceremote
+- Turbofieldfaredecodeservice Decodeserviceoutbox
+- Modelio Manifestreadertests
+- Moe Prefillmoegrouping
+- Turbofieldfareformat Gturbopackedexpertslayoutv1
+- Deltanet Deltanetruletests
+- Runtime Ngramspeculatortests
+- Turbofieldfareformat Gturbomanifestv1
+- Remote Remotestreamingrepacker
+- Modelio Modeltypes
+- Tokenization Tokenizertests
+- Remote Supportedmodelsource
+- Planning Rangecopyplanner
+- Httpservertests
+- Modelio Modelruntimeschemavalidationtests
+- Prefill Prefill
+- Turbofieldfareformat Gturboresidentindexv1
+- Prefill Prefillchunkscratch
+- Openaimodels
+- Attention Attentiontests
+- Remote Remotedownloadsession
+- Installation Huggingfacemodelsearchclient
+- Inference Decodeprotocoltests
+- Modelio Modeltypes
+- Fusions Fusedqkvepiloguetests
+- Moe Routertopktests
+- Tensorcore Mppprefillint4qmmtests
+- Macpresentation Instructiontranscriptdocumentcontroller
+- Prefill Prefillruntimeconfig
+- Streaming Preadexpertstreamertests+cacheplanning
+- Httpservertests
+- Turbofieldfaredecodeprotocol Decodeprotocol
+- Installation Appmodelinstallstate
+- Verification Verifiedinstalltests
+- Remote Remotepayloadcopytests
+- Modelio Manifestreader
+- Serverinference
+- Verification Sha256stream
+- Modelio Residentindextests
+- Diagnostics Runnerdiagnosticssection
+- Prefill Prefillperheadnormtests
+- Moe Prefillroutedtilescheduler
+- Prefill Prefillsharedexperttests
+- Deltanet Deltanet
+- Prefill Prefillqkvepiloguetests
+- Deltanet Deltanetmetalblock
+- State Appmodel
+- Inference Modelexpertio
+- Turbofieldfarecli Args
+- Httpservertests
+- Generation Logitproducer
+- Fusions Fused
+- Prefill Prefill
+- Configuration Runtimeconfiguration
+- Inference Decodeserviceinferenceclient
+- Inference Realinferenceclient
+- Installation Downloadetaestimator
+- Kernels Layer0isolationnumerictests
+- Prefill Prefillgroupedroutedmoetests
+- Generation Outputpaneview
+- Sampling Logit
+- Modelio Modeltypes
+- Installation Modelpickerview
+- Attention Prefillattentiontests
+- Moe Sharedexpertint4
+- Attention Attention
+- Moe Moe
+- Generation Samplertests
+- System Gturbodirectoryaccess
+- Serverarguments
+- System Installlock
+- Format Safetensors
+- Modelio Verifiedinstallreceipt
+- Streaming Expertstreamer
+- Turbofieldfareformat Gturboformatcodectests
+- Remote Remoteretry
+- Openaivalidationtests
+- Remote Remotepayloadcopytests
+- Prefill Prefillroutertests
+- Wizard Template
+- Deltanet Deltanetmetalparitytests
+- Prefill Prefilllayertailtests
+- Primitives Rope
+- Turbofieldfareformat Gturboformatv1
+- Format Archinfotests
+- Remote Remoteinstallcheckpoint
+- Reference Rmsnormreferencetests
+- System Installlocktests
+- Streaming Preadexpertstreamer
+- Attention Attention
+- Quant Dequant Int4
+- Inference Draftverifier
+- Diagnostics Metricformat
+- Modelio Modeltypes
+- Inference Appinferenceerror
+- State Apppresentationstate
+- State Appmodelloadstate
+- Sampling Logitsoftcapsoftmaxtests
+- Fusions Fusedqkvgemvgenerictests
+- Quant Dequantint4gemvtests
+- State Appmodelservicereportingtests
+- Modelio Sha256verifier
+- Attention Attentiongatingtests
+- Quant Dequantint6gemvtests
+- Quant Dequantint8gemvtests
+- State Apppresentationstate
+- Installation Modelinstallview
+- Generation Promptcomposerview
+- Serverlog
+- Kernels Layer0isolationtests
+- Assets Turbofieldfare
+- Diagnostics Inspectorview
+- Streaming Preadexpertstreamer
+- Streaming Preadexpertstreamer
+- Inference Realforwardrunner
+- Moe Sharedexpertint8
+- Moe Prefillrouter
+- Generation Generator
+- Tokenization Structuredassistantdecoder
+- Httpserver
+- Configuration Appcontextlengthoption
+- Installation Appmodellocation
+- Streaming Rdadvice
+- Fusions Fusedqkvgemvgeneric
+- Streaming Preadexpertstreamer
+- Attention Prefillattention
+- Generation Streamingstopmatcher
+- Tokenization Tokenizerloadcoordinatortests
+- Command Main
+- Serverterminationsignals
+- Quant Dequant Subbyte
+- Cli Clicontextcaptests
+- Deltanet Deltanetconvstatetests
+- Deltanet Deltanetstate
+- Runtime Attentionquantselectiontests
+- Configuration Macappsettings
+- Inference Generationtranscriptmailbox
+- Generation Outputpaneview
+- Readme
+- Primitives Rope
+- Prefill Prefill
+- Quant Dequant Int8
+- Configuration Runtimeconfiguration
+- Deltanet Deltanetcpublock
+- State Appmodelloadstate
+- State Apppresentationstatetests
+- Diagnostics Statushudview
+- Fixtures Scriptedlogitproducer
+- Kernels Layer3isolationtests
+- Command Repackclitests
+- Support Syntheticsnapshot
+- Macpresentation Instructiontranscriptdocumentcontroller
+- Scripts Dump Qwen36
+- Modelio Residentbuffertests
+- Prefill Prefill
+- Primitives Rmsnorm
+- Generation Outputpaneview
+- Workflow Modelinstallprogress
+- Primitives Wht
+- Epilogues Prefillpostattentionsetup
+- Inference Realforwardrunner
+- Turbofieldfaredecodeservice Decodeserviceoutboxtests
+- Macpresentation Genericerrorbannerpolicytests
+- Format Gturbojson
+- Prefill Prefillpostattentionsetuptests
+- Macpresentation Promptsubmissionpolicytests
+- Fusions Lmheadchainint4tests
+- Generation Promptexamplesview
+- Turbofieldfaredecodeprotocol Decodeunixsocket
+- Modelio Packedexpertslayouttests
+- Fusions Fusedpostattentionsetup
+- Primitives Prefillprimitives
+- Prefill Qwen36sequentialprefilltests
+- Inference Sharedexpertgate
+- Installation Appmodelinstallationprobetests
+- Installation Huggingfacesearchview
+- Turbofieldfarecli Run
+- Writing Boundedscratch
+- Moe Moe
+- Turbofieldfaredecodeprotocol Decodeprotocol
+- App Turbofieldfaremacapp
+- Prng Splitmix64
+- Streaming Preadexpertstreamer
+- Fusions Fusedqkvgemv
+- Prefill Prefill
+- Streaming Preadexpertstreamertests
+- Inference Realforwardrunner
+- Format Tensormetadata
+- Quant Embedlookup
+- Scripts Check Markdown
+- Scripts Deltanet Oracle
+- Quant Embedlookupint4
+- Tensorcore Tensorops
+- Command Main
+- Verification Verifiedinstallreceiptwriter
+- Fusions Elementwiseadd
+- Quant Dequantint5gemv
+- Prefill Prefill
+- Generation Outputpaneview
+- Community 239
+- Scripts Hitl-loop
+- Configuration Apppromptpresettests
+- Moe Sharedexpertint8
+- Community 243
+- Scripts Dump Qwen36
+- Prefill Prefill
+- Cli Clicontextcaptests
+- Scripts Dump Qwen36
+- Scripts Parse Resident
+- Fixtures Offbymultiples
+- Tolerance Tolerances
+- Community 251
+- Context
+- Package
+- Scripts Test
+- Remote Remotechunkpolicy
+- Community 256
+- Community 257
+- Adr 0001-hybrid-compute-split-for-phase-3-deltanet
+- Adr 0001-skip-laguna-validation
+- Adr 0002-precommitted-parity-gate-and-oracle-strategy
+- Assets Decode-pipeline
+- Assets Turbofieldfare-logo-rounded
+- Benchmark-prompts Prefill-1024
+- Community 264
+- Community 265
+- Community 266
+- Community 267
+- Community 268
+- Community 269
+- Community 270
+- Community 271
+- Community 272
+- Community 273
+- Community 274
+- Docs Phase-7-7-deltanet-int4-gemv
+- Issue Template Config
+- Issue Template Feature
+- Workflows Ci
+- Handoff
+- Security
+- Deltanet Deltanetmetalblock
+- Inference Rawcompletion
+- Resources Turbofieldfare-app-icon
+- V1 Readme
+- Fixtures Readme
+- Third Party Notices
 
 ## God Nodes (most connected - your core abstractions)
-1. `Foundation` - 295 edges
-2. `MetalContext` - 195 edges
+1. `MetalContext` - 196 edges
+2. `AppModel` - 182 edges
 3. `Testing` - 163 edges
-4. `AppModel` - 146 edges
-5. `RepackError` - 145 edges
-6. `TurboFieldfare` - 136 edges
-7. `Metal` - 125 edges
-8. `RealForwardRunner` - 85 edges
+4. `RepackError` - 146 edges
+5. `TurboFieldfare` - 136 edges
+6. `Metal` - 125 edges
+7. `Model` - 111 edges
+8. `RealForwardRunner` - 92 edges
 9. `SeedTree` - 73 edges
-10. `TensorView` - 59 edges
+10. `ArchConfig` - 64 edges
 
 ## Surprising Connections (you probably didn't know these)
-- `YaRoPTests` --calls--> `RopeScaling`  [INFERRED]
-  Tests/TurboFieldfare/Core/Kernels/Primitives/YaRoPTests.swift → Sources/TurboFieldfare/Infrastructure/ModelIO/ModelTypes.swift
-- `writeAll()` --references--> `Array`  [INFERRED]
-  Tests/TurboFieldfareServer/HTTPServerTests.swift → Sources/TurboFieldfare/Tokenization/Tokenizer.swift
-- `ReportingInferenceClient` --calls--> `GenerationTranscriptMailbox`  [INFERRED]
-  Tests/TurboFieldfareApp/Core/State/AppModelServiceReportingTests.swift → Sources/TurboFieldfareApp/Core/Inference/GenerationTranscriptMailbox.swift
-- `FakeInferenceClient` --calls--> `GenerationTaskRegistry`  [INFERRED]
-  Tests/TurboFieldfareApp/Core/Support/FakeInferenceClient.swift → Sources/TurboFieldfareApp/Core/Inference/RealInferenceClient.swift
-- `Rig` --references--> `MetalContext`  [EXTRACTED]
-  Tests/TurboFieldfare/Core/Kernels/Sampling/SampleTopK64Tests.swift → Sources/TurboFieldfare/Infrastructure/Metal/MetalContext.swift
+- `PreadExpertStreamer` --implements--> `.gturbo Format`  [INFERRED]
+  Sources/TurboFieldfare/Runtime/Inference/PreadExpertStreamer.swift → CONTEXT.md
+- `TurboFieldfare README` --references--> `TurboFieldfareCLI`  [EXTRACTED]
+  README.md → Sources/TurboFieldfareCLI/TurboFieldfareCLI.swift
+- `TurboFieldfare README` --references--> `TurboFieldfareDecodeService`  [EXTRACTED]
+  README.md → Sources/TurboFieldfareDecodeService/TurboFieldfareDecodeService.swift
+- `TurboFieldfare README` --references--> `TurboFieldfareMac App`  [EXTRACTED]
+  README.md → Sources/TurboFieldfareMac/TurboFieldfareMac.swift
+- `TurboFieldfare README` --references--> `TurboFieldfareRepack`  [EXTRACTED]
+  README.md → Sources/TurboFieldfareRepack/TurboFieldfareRepack.swift
 
 ## Import Cycles
 - None detected.
 
 ## Hyperedges (group relationships)
-- **Main Flow: Idea to Ship** — agents_skills_grill_with_docs_skill, agents_skills_handoff_skill, agents_skills_prototype_skill, agents_skills_to_spec_skill, agents_skills_to_tickets_skill, agents_skills_implement_skill, agents_skills_tdd_skill, agents_skills_code_review_skill [EXTRACTED 1.00]
-- **On-ramps to Main Flow** — agents_skills_triage_skill, agents_skills_diagnosing_bugs_skill, agents_skills_wayfinder_skill [EXTRACTED 1.00]
-- **Vocabulary Layer** — agents_skills_domain_modeling_skill, agents_skills_codebase_design_skill [EXTRACTED 1.00]
-- **Codebase Design Flow** — agents_skills_codebase_design_deepening, agents_skills_codebase_design_design_it_twice, agents_skills_improve_codebase_architecture_html_report [EXTRACTED 0.90]
-- **Domain Modeling Standards** — agents_skills_domain_modeling_adr_format, agents_skills_domain_modeling_context_format, agents_skills_setup_matt_pocock_skills_domain [EXTRACTED 0.90]
-- **Triage and Issue Management** — agents_skills_triage_agent_brief, agents_skills_triage_out_of_scope, agents_skills_setup_matt_pocock_skills_triage_labels [EXTRACTED 0.85]
+- **TurboFieldfare Swift Products** — sources_turbofieldfare_turbofieldfare_lib, turbofieldfare_mac, turbofieldfare_cli, turbofieldfare_server, turbofieldfare_repack, turbofieldfare_decode_service [EXTRACTED 1.00]
+- **Agent Engineering Flow** — agents_skills_grilling_skill_grilling, agents_skills_domain_modeling_skill_domain_modeling, agents_skills_to_tickets_skill_to_tickets, agents_skills_tdd_skill_tdd, agents_skills_code_review_skill_code_review [EXTRACTED 0.90]
+- **Benchmark Documentation** — docs_benchmarks, docs_community_benchmarks, docs_benchmark_prompts_prefill_1024 [EXTRACTED]
+- **Optimization Experiment Summaries** — docs_experiments_summaries_01_model_install_and_expert_io, docs_experiments_summaries_02_decode_moe_int4_and_router, docs_experiments_summaries_03_expert_cache_prediction_and_layout, docs_experiments_summaries_04_rdadvise, docs_experiments_summaries_05_attention_and_kv_cache, docs_experiments_summaries_09_validation_and_measurement_lessons [EXTRACTED]
+- **DeltaNet Optimization Plan** — docs_phase_7_7_deltanet_int4_gemv, docs_adr_0001_hybrid_compute_split, docs_adr_0002_parity_gate [EXTRACTED]
+- **Production Prefill Optimizations** — docs_experiments_summaries_06_prefill_pf_01, docs_experiments_summaries_06_prefill_pf_02, docs_experiments_summaries_06_prefill_pf_12, docs_experiments_summaries_06_prefill_pf_15, docs_experiments_summaries_06_prefill_pf_17 [EXTRACTED 1.00]
+- **Production Orchestration and Fusions** — docs_experiments_summaries_07_fusions_head_and_orchestration_orch_01, docs_experiments_summaries_07_fusions_head_and_orchestration_orch_02, docs_experiments_summaries_07_fusions_head_and_orchestration_orch_04, docs_experiments_summaries_07_fusions_head_and_orchestration_orch_05, docs_experiments_summaries_07_fusions_head_and_orchestration_orch_09 [EXTRACTED 1.00]
+- **Methodology and Validation Lessons** — docs_experiments_summaries_09_validation_and_measurement_lessons_meth_01, docs_experiments_summaries_09_validation_and_measurement_lessons_meth_05 [INFERRED 0.90]
 
-## Communities (358 total, 104 thin omitted)
+## Communities (287 total, 45 thin omitted)
 
-### Community 0 - "Metal Compute Kernels"
-Cohesion: 0.04
-Nodes (53): MTLCommandQueue, MetalContext, AttentionGatingKernel, MTLComputePipelineState, PrefillRoPE, MTLComputePipelineState, RoPE, String (+45 more)
-
-### Community 1 - "Affine Quantization Logic"
+### Community 0 - "Int4 Embed Lookup & Buffers"
 Cohesion: 0.05
-Nodes (55): Int4AffineRow, Int8AffineRow, Quantization, Float, Int, UInt16, UInt8, DequantInt4GemvRef (+47 more)
+Nodes (48): EmbedLookupInt4, MTLComputePipelineState, Fp16Buffer, Float, Int, MTLBuffer, MTLDevice, SeedTree (+40 more)
 
-### Community 2 - "AppRuntimeOptions"
+### Community 1 - "Metal Context & Model Directory"
 Cohesion: 0.05
-Nodes (54): CaseIterable, AppExpertCachePolicy, lfu, lru, AppLoadedRuntimeKey, AppModelVerification, fullSha256, trustedInstall (+46 more)
+Nodes (5): Darwin, Darwin.Mach, Foundation, Metal, TurboFieldfareFormat
 
-### Community 3 - "Core System Dependencies"
+### Community 2 - "App Model Installer Client"
 Cohesion: 0.05
-Nodes (6): CommonCrypto, Darwin, Darwin.Mach, Foundation, Metal, TurboFieldfareFormat
+Nodes (48): AppModelInstallerClient, AppModel, .availableModelSources, .canCancel, .canCancelInstall, .canCancelLoad, .canDiscardModelDownload, .canInstallModel (+40 more)
 
-### Community 4 - "Model Validation Testing"
+### Community 3 - "Install Probe & Runtime Tests"
 Cohesion: 0.06
 Nodes (3): Testing, TurboFieldfare, TurboFieldfareValidationSupport
 
-### Community 5 - "Model Installation Client"
-Cohesion: 0.07
-Nodes (19): AppModelInstallerClient, AppModel, Bool, Double, Error, Int, Never, String (+11 more)
-
-### Community 6 - "Tensor Metadata Loading"
-Cohesion: 0.07
-Nodes (33): IndexLoader, SourceMetadata, Int, String, Dtype, bf16, fp16, fp32 (+25 more)
-
-### Community 7 - ".run"
-Cohesion: 0.08
-Nodes (25): AppMemorySampler, UInt64, Entry, GenerationTaskRegistry, ProgressState, RealInferenceClient, RealInferenceSession, RunnerCounterSnapshot (+17 more)
-
-### Community 8 - "File System Access"
-Cohesion: 0.05
-Nodes (54): GTurboDirectoryAccess, Bool, Data, Int, Int32, String, UInt64, RepackError (+46 more)
-
-### Community 9 - "Metal Shader Compilation"
-Cohesion: 0.05
-Nodes (41): Hashable, MetalError, libraryCompileFailed, missingFunction, missingShaderResource, noDevice, noQueue, MetalFunctionConstant (+33 more)
-
-### Community 10 - "MoE Expert Offsets"
-Cohesion: 0.12
-Nodes (55): float2, ExpertOffsets, down_b_off, down_s_off, down_W_off, gate_b_off, gate_s_off, gate_W_off (+47 more)
-
-### Community 11 - "ServerHTTPHandler"
-Cohesion: 0.11
-Nodes (24): ByteBuffer, ChannelHandlerContext, ChannelInboundHandler, EventLoop, EventLoopFuture, HTTPRequestHead, HTTPResponseStatus, NIOAny (+16 more)
-
-### Community 12 - "Expert Streaming Model"
-Cohesion: 0.12
-Nodes (14): DispatchQueue, MTLBuffer, UInt32, UInt64, TensorView, ResidentIndex, ExpertStreamingMode, Model (+6 more)
-
-### Community 13 - "Model Installation Probing"
-Cohesion: 0.08
-Nodes (20): AppModelInstallationProbe, ArchConfig, URL, AppModelInstallationProbeTests, makeCompleteModelInstall(), quantSlot(), Any, Int (+12 more)
-
-### Community 14 - "Posix Memory Mapping"
-Cohesion: 0.12
-Nodes (16): MmapHandle, Posix, Bool, Data, Int, Int32, off_t, String (+8 more)
-
-### Community 15 - "macOS App UI"
+### Community 4 - "Sub-byte Quantization Rows"
 Cohesion: 0.06
-Nodes (8): AppKit, PreferenceKey, ConversationChromeHeightKey, RootView, CGFloat, SwiftUI, TurboFieldfareAppCore, TurboFieldfareMacPresentation
+Nodes (38): Int5AffineRow, Int6AffineRow, Int8AffineRow, QuantizationSubByte, Float, Int, UInt16, UInt8 (+30 more)
 
-### Community 16 - "Message"
-Cohesion: 0.13
-Nodes (13): FunctionDefinition, invalidChatTemplate, HistoricalToolCall, Message, Role, assistant, developer, system (+5 more)
+### Community 5 - "Gemma Tool Call Parser"
+Cohesion: 0.06
+Nodes (36): Character, Decimal, Int64, GemmaToolCallParser, GemmaToolCallParserError, malformed, oversized, unknownTool (+28 more)
 
-### Community 17 - "RealForwardRunner"
-Cohesion: 0.09
-Nodes (23): ElementwiseAdd, MTLComputePipelineState, PrefillMoE, MTLComputePipelineState, PrefillEmbedLookupInt4, PrefillRMSNorm, MTLComputePipelineState, DequantInt5GEMV (+15 more)
+### Community 6 - "Index Loader & Tensor Metadata"
+Cohesion: 0.07
+Nodes (32): IndexLoader, SourceMetadata, Int, String, QuantSpec, SourceTensor, String, UInt64 (+24 more)
 
-### Community 18 - "Resident Index Codec"
-Cohesion: 0.13
-Nodes (17): q, GTurboResidentIndexCodec, GTurboResidentIndexEntryV1, GTurboResidentIndexHeaderV1, Int, String, UInt16, UInt32 (+9 more)
-
-### Community 19 - "App Input Behavior"
-Cohesion: 0.09
-Nodes (23): App, Binding, Scene, AppNewlineShortcut, `return`, shiftReturn, Self, AppSentPromptBehavior (+15 more)
-
-### Community 20 - "runRawCompletion"
-Cohesion: 0.09
-Nodes (28): GenerationConfig, RawCompletionScratch, RawCompletionStart, reset, resume, RawDecodeProgress, prefill, tail (+20 more)
-
-### Community 21 - "Prefill Layer Encoding"
-Cohesion: 0.08
-Nodes (24): PrefillLayerTail, Float, Int, MTLBuffer, MTLCommandBuffer, MTLComputePipelineState, UInt32, DownloadETAEstimator (+16 more)
-
-### Community 22 - "Model Installation Tests"
+### Community 7 - "Resident Index & TensorView"
 Cohesion: 0.10
-Nodes (16): AppModelInstallTests, MainActor, String, URL, MockAsyncGate, MockModelInstallerClient, State, AsyncThrowingStream (+8 more)
+Nodes (23): MTLBuffer, UInt32, UInt64, TensorView, ResidentIndex, ExpertStreamingMode, .distinctAttentionQuants, .embedding (+15 more)
 
-### Community 23 - "Rich Text Formatting"
-Cohesion: 0.10
-Nodes (24): AttributedString, InlinePresentationIntent, NSFont, NSParagraphStyle, PresentationIntent, Block, BlockKind, code (+16 more)
-
-### Community 24 - "Prefill Chunk Management"
+### Community 8 - "Int4/Int8 Affine Quantization"
 Cohesion: 0.08
-Nodes (26): Mode, chunked, off, PrefillChunkCommitState, PrefillChunkCompleteness, complete, unsupported, PrefillChunkPlanner (+18 more)
+Nodes (30): Int4AffineRow, Int8AffineRow, Quantization, Float, Int, UInt16, UInt8, DequantInt4GemvRef (+22 more)
 
-### Community 25 - "Model Installer Tasks"
-Cohesion: 0.09
-Nodes (20): ActiveInstall, InstallTaskState, RepackModelInstallerClient, AsyncThrowingStream, Error, Never, Task, URL (+12 more)
+### Community 9 - "Install Status & Run State"
+Cohesion: 0.07
+Nodes (48): Codable, Equatable, Sendable, ResidentIndexHeader, AppModelInstallationStatus, complete, missing, partial (+40 more)
 
-### Community 26 - "Attention Kernel Tests"
-Cohesion: 0.09
-Nodes (23): FusedPostAttentionSetupTests, Float, Int, MTLBuffer, UInt8, FusedQKVEpilogueTests, Float, Int (+15 more)
+### Community 10 - "Metal Pipeline Compilation"
+Cohesion: 0.07
+Nodes (30): Hashable, MTLCommandQueue, MetalContext, MetalError, .description, libraryCompileFailed, missingFunction, missingShaderResource (+22 more)
 
-### Community 27 - "OpenAI API Models"
-Cohesion: 0.14
-Nodes (33): Codable, Equatable, Sendable, ResidentIndexHeader, Detail, Model, OpenAIChatMessage, OpenAIChatRequest (+25 more)
+### Community 11 - "Raw Completion & Decode Progress"
+Cohesion: 0.10
+Nodes (31): .isPureGreedy, RawCompletionScratch, RawCompletionStart, reset, resume, RawDecodeProgress, prefill, tail (+23 more)
 
-### Community 28 - "Remote Data Transfer"
+### Community 12 - "SwiftUI App Scene & Shortcuts"
+Cohesion: 0.07
+Nodes (31): App, Binding, Scene, AppNewlineShortcut, .id, `return`, .sendMessageLabel, shiftReturn (+23 more)
+
+### Community 13 - "MoE Metal Kernels"
 Cohesion: 0.12
+Nodes (57): float2, ExpertOffsets, down_b_off, down_s_off, down_W_off, gate_b_off, gate_s_off, gate_W_off (+49 more)
+
+### Community 14 - "App Stop Reason & Memory Sampler"
+Cohesion: 0.07
+Nodes (29): AppStopReason, cancelled, endOfTurn, eos, failed, maxTokens, stopString, toolCalls (+21 more)
+
+### Community 15 - "Posix File IO & Mmap"
+Cohesion: 0.10
+Nodes (19): MmapHandle, Posix, Bool, Data, Int, Int32, off_t, String (+11 more)
+
+### Community 16 - "NIO HTTP Server"
+Cohesion: 0.10
+Nodes (27): ByteBuffer, ChannelHandlerContext, ChannelInboundHandler, EventLoop, EventLoopFuture, HTTPRequestHead, HTTPResponseStatus, NIOAny (+19 more)
+
+### Community 17 - "Checkpoint Repacker & Validator"
+Cohesion: 0.07
+Nodes (33): GTurboLayoutValidator, String, LocalCheckpointRepacker, LocalFileSourceByteProvider, Int, Int32, Sendable, Set (+25 more)
+
+### Community 18 - "App Prompt Presets & Options"
+Cohesion: 0.06
+Nodes (36): CaseIterable, Identifiable, AppPromptPreset, .primary, .secondary, String, AppExpertCachePolicy, .id (+28 more)
+
+### Community 19 - "Model Load & Install Tests"
+Cohesion: 0.08
+Nodes (17): makeCompleteModelInstall(), quantSlot(), Any, Int, String, URL, AppModelLoadStateTests, MockLifecycleInferenceClient (+9 more)
+
+### Community 20 - "Generate Control UI"
+Cohesion: 0.08
+Nodes (19): GenerateControl, .body, .generateButton, .runningPill, CGFloat, .footer, AppModelTests, MockInferenceClient (+11 more)
+
+### Community 21 - "Model Loader Symlink Tests"
+Cohesion: 0.07
+Nodes (13): ModelLoadStats, UInt64, ModelLoaderPreadTests, UInt8, ModelLoaderTests, Any, Bool, String (+5 more)
+
+### Community 22 - "Sampling Kernels"
+Cohesion: 0.08
+Nodes (29): LogitSoftcapSoftmax, Sample, SampleTopK64, SampleTopK64Error, scratchAllocationFailed, unsupportedVocabulary, Float, Int (+21 more)
+
+### Community 23 - "KV Cache Manager"
+Cohesion: 0.09
+Nodes (15): KVCacheManager, KVView, LayerKind, full, linear, swa, Bool, Int (+7 more)
+
+### Community 24 - "Installation Appmodelinstalldescriptor"
+Cohesion: 0.07
+Nodes (32): AppModelInstallDescriptor, .requiredFreeBytes, .unavailableCatalogEntries, AppModelInstallReadiness, checking, failed, insufficientSpace, ready (+24 more)
+
+### Community 25 - "Workflow Errors"
+Cohesion: 0.04
+Nodes (48): RepackError, configJsonInvalid, configurationInvalid, .description, diskSpaceInsufficient, dtypeMismatch, fileOpenFailed, fileStatFailed (+40 more)
+
+### Community 26 - "Macpresentation Responsemarkdownrenderertests"
+Cohesion: 0.07
+Nodes (4): AppKit, SwiftUI, TurboFieldfareAppCore, TurboFieldfareMacPresentation
+
+### Community 27 - "Tokenization Tokenizer"
+Cohesion: 0.08
+Nodes (26): Element, Array, FunctionDefinition, GFTokenizerError, .description, invalidChatTemplate, missingSpecialToken, missingToolTemplate (+18 more)
+
+### Community 28 - "Prefill Prefillruntimeconfig"
+Cohesion: 0.08
+Nodes (30): Mode, chunked, off, PrefillChunkCommitState, .inFlightEndPosition, PrefillChunkCompleteness, complete, unsupported (+22 more)
+
+### Community 29 - "Moe Prefillgroupedroutedmoe"
+Cohesion: 0.09
+Nodes (27): PrefillGroupedRoutedMoE, PrefillGroupedRoutedMoEBufferIndex, PrefillGroupedRoutedMoEError, allocationFailed, .description, invalidStreamedTileBinding, PrefillGroupedRoutedMoEStreamedMetadataBuffers, PrefillGroupedRoutedMoEStreamedParams (+19 more)
+
+### Community 30 - "System Diskspacechecker"
+Cohesion: 0.08
+Nodes (23): ActiveInstall, InstallTaskState, RepackModelInstallerClient, AsyncThrowingStream, Error, Never, Task, URL (+15 more)
+
+### Community 31 - "Macpresentation Responsemarkdownrenderer"
+Cohesion: 0.09
+Nodes (25): AttributedString, InlinePresentationIntent, NSFont, NSParagraphStyle, PresentationIntent, Block, BlockKind, code (+17 more)
+
+### Community 32 - "Inference Appgenerationrequesttests"
+Cohesion: 0.09
+Nodes (21): AppGenerationRequest, .isPureGreedy, Bool, FileManager, Float, Int, String, URL (+13 more)
+
+### Community 33 - "Remote Remoterangetransfer"
+Cohesion: 0.11
 Nodes (27): Result, normalizedStrongETag(), redactRemoteURL(), remoteHeader(), RemoteRangeExpectation, RemoteRangeTransfer, RemoteRangeTransferDelegate, RemoteRangeTransferResult (+19 more)
 
-### Community 29 - "Model Directory Access"
+### Community 34 - "Inference Realforwardrunner"
+Cohesion: 0.10
+Nodes (21): ExpertIOAdviceResult, ElementwiseAdd, MTLComputePipelineState, DequantInt5GEMV, MTLComputePipelineState, LayerSharedExpertProjections, RDAdviceAdaptivePolicyConfig, RDAdviceAdaptivePolicyState (+13 more)
+
+### Community 35 - "Prefill Prefillaffinetests"
+Cohesion: 0.07
+Nodes (26): SharedExpertInt4, MTLComputePipelineState, DequantInt4GEMV, Shape, Int, MTLBuffer, MTLCommandBuffer, MTLComputeCommandEncoder (+18 more)
+
+### Community 36 - "Primitives Rmsnorm"
+Cohesion: 0.10
+Nodes (26): LMHeadChainInt4, Float, Int, MTLBuffer, MTLCommandBuffer, MTLComputePipelineState, UInt32, PrefillFinalRowHeadInt4 (+18 more)
+
+### Community 37 - "Serverpromptcache"
+Cohesion: 0.13
+Nodes (21): GFTokenizer, Set, ServerModelSession, Int, URL, CachedAssistantTurn, ServerPromptCache, ServerPromptCacheDomain (+13 more)
+
+### Community 38 - "Diagnostics Appdiagnostics"
+Cohesion: 0.10
+Nodes (18): AppDiagnostics, .prefillTokensPerSecond, .requestStartTimeToFirstTokenSeconds, AppInferenceEvent, cancelled, failed, finished, prefillProgress (+10 more)
+
+### Community 39 - "Serverinference"
 Cohesion: 0.09
-Nodes (28): GTurboModelDirectory, Data, Int32, String, UInt64, URL, ModelError, archMismatch (+20 more)
+Nodes (26): CustomDebugStringConvertible, .tokens, StructuredOutputFailure, .debugDescription, StructuredOutputFailureCause, malformed, none, oversized (+18 more)
 
-### Community 30 - "Expert Layout Reader"
-Cohesion: 0.11
-Nodes (20): ExpertEntry, LayerLayout, PackedExpertsLayout, PackedExpertsLayoutReader, SubTensorEntry, Data, Int, String (+12 more)
+### Community 40 - "Remote Huggingfaceremote"
+Cohesion: 0.12
+Nodes (23): RemoteRetryJitter, RemoteRetrySleeper, HuggingFaceRemoteSource, RemoteFileInfo, remoteSize(), Bool, HTTPURLResponse, Int (+15 more)
 
-### Community 31 - "Local Checkpoint Repacking"
-Cohesion: 0.10
-Nodes (25): LocalCheckpointRepacker, LocalFileSourceByteProvider, Int, Int32, Sendable, Set, String, UInt64 (+17 more)
-
-### Community 32 - "Int4 Prefill Matrix-Multiplication"
+### Community 41 - "Turbofieldfaredecodeservice Decodeserviceoutbox"
 Cohesion: 0.09
-Nodes (26): PrefillInt4QMM, MPPPrefillInt4QMM, Path, affineThreadgroupF16, unavailable, Bool, Int, MTLBuffer (+18 more)
+Nodes (20): DecodeServiceCommand, cancel, generate, load, shutdown, unload, DecodeCommandQueue, DecodeServiceOutbox (+12 more)
 
-### Community 33 - "AppGenerationRequest"
-Cohesion: 0.10
-Nodes (17): AppGenerationRequest, Bool, FileManager, Float, Int, String, URL, AppGenerationRequestTests (+9 more)
-
-### Community 34 - "Sub-Byte Quantization"
-Cohesion: 0.16
-Nodes (11): Int5AffineRow, Int6AffineRow, Int8AffineRow, QuantizationSubByte, Float, Int, UInt16, UInt8 (+3 more)
-
-### Community 35 - "JSON Value Handling"
-Cohesion: 0.11
-Nodes (21): Decimal, JSONValue, array, bool, decimal, integer, null, number (+13 more)
-
-### Community 36 - "Shared Expert Logits"
-Cohesion: 0.11
-Nodes (24): SharedExpertInt4, MTLComputePipelineState, PrefillFinalRowHeadInt4, Float, Int, MTLBuffer, MTLCommandBuffer, UInt32 (+16 more)
-
-### Community 37 - "HTTP Server Testing"
-Cohesion: 0.18
-Nodes (16): TurboFieldfareHTTPServer, abortSocket(), connectedSocket(), httpRequest(), HTTPServerTests, RawSocketError, systemCall, timeout (+8 more)
-
-### Community 38 - "Seed Tree Randomization"
-Cohesion: 0.10
-Nodes (18): SeedTree, SplitMix64, String, UInt64, MoeRef, Float, Int, Float (+10 more)
-
-### Community 39 - "Manifest Reader Tests"
+### Community 42 - "Modelio Manifestreadertests"
 Cohesion: 0.15
-Nodes (9): URL, ManifestReaderLagunaTests, ManifestReaderTests, Any, ArchConfig, Bool, Int, String (+1 more)
+Nodes (8): URL, ManifestReaderLagunaTests, ManifestReaderTests, Any, Bool, Int, String, URL
 
-### Community 40 - "Expert Layout Codec"
-Cohesion: 0.17
-Nodes (17): GTurboFormatError, truncated, GTurboExpertV1, GTurboLayerV1, GTurboPackedExpertsLayoutCodec, GTurboPackedExpertsLayoutV1, GTurboSubTensorV1, GTurboV1StructuralValidator (+9 more)
+### Community 43 - "Moe Prefillmoegrouping"
+Cohesion: 0.11
+Nodes (25): PrefillMoEGroup, PrefillMoEGroupedRoutes, .maxLiveExpertsPerTile, .maxPairsPerExpert, .maxPairsPerTile, PrefillMoEGrouping, PrefillMoEGroupingError, .description (+17 more)
 
-### Community 41 - "Structured Output Diagnostics"
-Cohesion: 0.09
-Nodes (24): CustomDebugStringConvertible, StructuredOutputFailure, StructuredOutputFailureCause, malformed, none, oversized, unexpected, unknownTool (+16 more)
+### Community 44 - "Turbofieldfareformat Gturbopackedexpertslayoutv1"
+Cohesion: 0.19
+Nodes (14): GTurboExpertV1, GTurboLayerV1, GTurboPackedExpertsLayoutCodec, GTurboPackedExpertsLayoutV1, GTurboSubTensorV1, GTurboV1StructuralValidator, Data, Int (+6 more)
 
-### Community 42 - "DeltaNet Recurrent Layers"
-Cohesion: 0.14
+### Community 45 - "Deltanet Deltanetruletests"
+Cohesion: 0.13
 Nodes (8): DeltaNetGate, DeltaNetHeadExpansion, DeltaNetOutputGate, DeltaNetQKNorm, DeltaNetRecurrence, Float, Int, DeltaNetRuleTests
 
-### Community 43 - "Diagnostic UI Components"
-Cohesion: 0.08
-Nodes (25): ErrorBanner, GenerateControl, CGFloat, HUDMetricView, String, ModelStatusBadge, Color, AdvancedRunnerDiagnosticsView (+17 more)
+### Community 46 - "Runtime Ngramspeculatortests"
+Cohesion: 0.14
+Nodes (12): NGramSpeculator, NGramSpeculatorConfig, SpeculationStats, .acceptanceRate, .tokensPerRound, Double, Int, Int32 (+4 more)
 
-### Community 44 - "Installation Verification Tool"
-Cohesion: 0.17
-Nodes (11): Data, Int, String, UInt64, VerifiedInstallTool, VerifyInstallOptions, VerifyInstallResult, Data (+3 more)
-
-### Community 45 - "Remote Streaming Installer"
-Cohesion: 0.13
-Nodes (17): DiscardRunner, InstallRunner, RemoteStreamingRepacker, RemoteStreamingRepackOptions, RemoteStreamingRepackResult, Bool, Data, Error (+9 more)
-
-### Community 46 - "Resident Index Reader"
-Cohesion: 0.10
-Nodes (20): ResidentEntry, ResidentIndexEntry, ResidentIndexReader, Int32, off_t, String, UInt32, UInt64 (+12 more)
-
-### Community 47 - "MoE Tile Scheduling"
-Cohesion: 0.13
-Nodes (15): PrefillGroupedRoutedMoEBufferIndex, invalidStreamedTileBinding, PrefillStreamedTileBinding, PrefillStreamedTileFetchResult, PrefillStreamedTileLifetimeError, completeWithoutInFlightTile, duplicateSlots, slotReuseBeforeCompletion (+7 more)
-
-### Community 48 - "KV Cache Management"
-Cohesion: 0.15
-Nodes (13): KVCacheManager, KVView, LayerKind, full, linear, swa, ArchConfig, Bool (+5 more)
-
-### Community 49 - "Model Manifest Codec"
+### Community 47 - "Turbofieldfareformat Gturbomanifestv1"
 Cohesion: 0.17
 Nodes (17): GTurboManifestArchV1, GTurboManifestCodec, GTurboManifestFileV1, GTurboManifestQuantLayerOverrideV1, GTurboManifestQuantSlotV1, GTurboManifestQuantV1, GTurboManifestV1, Bool (+9 more)
 
-### Community 50 - "Chat Completion Parameters"
-Cohesion: 0.06
-Nodes (33): CodingKeys, cachedTokens, completionTokens, content, created, frequencyPenalty, id, includeUsage (+25 more)
+### Community 48 - "Remote Remotestreamingrepacker"
+Cohesion: 0.13
+Nodes (17): DiscardRunner, InstallRunner, RemoteStreamingRepacker, RemoteStreamingRepackOptions, RemoteStreamingRepackResult, Bool, Data, Error (+9 more)
 
-### Community 51 - "Fused QKV GEMV"
-Cohesion: 0.07
-Nodes (20): Int, Bits, eight, five, FusedQKVGEMVGeneric, MTLBuffer, MTLCommandBuffer, MTLComputePipelineState (+12 more)
+### Community 49 - "Modelio Modeltypes"
+Cohesion: 0.09
+Nodes (25): GTurboModelDirectory, Data, Int32, String, UInt64, URL, ModelError, archMismatch (+17 more)
 
-### Community 52 - "MoE Streamed Parameters"
+### Community 50 - "Tokenization Tokenizertests"
+Cohesion: 0.15
+Nodes (8): GFDetokenizer, Bool, Int, Int32, String, Tokenizer, String, TokenizerTests
+
+### Community 51 - "Remote Supportedmodelsource"
+Cohesion: 0.10
+Nodes (20): .currentModelSource, ModelSelectionError, .description, notInstallable, unknownID, ModelSource, SupportedModelSource, .approximateDownloadBytes (+12 more)
+
+### Community 52 - "Planning Rangecopyplanner"
+Cohesion: 0.17
+Nodes (14): CoalescedRangeCopy, FingerprintWriter, hashData(), RangeCopy, RangeCopyPlan, RangeCopyPlanner, RemoteExpectedOutput, Bool (+6 more)
+
+### Community 53 - "Httpservertests"
+Cohesion: 0.13
+Nodes (27): ServerInferenceBackend, abortSocket(), AdmissionBlockingPreparationBackend, CancellableServerBackend, connectedSocket(), ContentAndToolBackend, FailingServerBackend, httpRequest() (+19 more)
+
+### Community 54 - "Modelio Modelruntimeschemavalidationtests"
+Cohesion: 0.16
+Nodes (16): ExpertEntry, LayerLayout, PackedExpertsLayout, PackedExpertsLayoutReader, SubTensorEntry, Data, Int, String (+8 more)
+
+### Community 55 - "Prefill Prefill"
 Cohesion: 0.06
 Nodes (33): PrefillGroupedRoutedMoEStreamedParamsMSL, D, down_b_off, down_s_off, down_W_off, F, gate_b_off, gate_s_off (+25 more)
 
-### Community 53 - "N-Gram Speculative Decoding"
-Cohesion: 0.15
-Nodes (10): NGramSpeculator, NGramSpeculatorConfig, SpeculationStats, Double, Int, Int32, NGramSpeculatorTests, Int32 (+2 more)
+### Community 56 - "Turbofieldfareformat Gturboresidentindexv1"
+Cohesion: 0.16
+Nodes (15): q, GTurboFormatError, .description, truncated, GTurboResidentIndexCodec, GTurboResidentIndexEntryV1, Int, String (+7 more)
 
-### Community 54 - "HuggingFace Remote Source"
-Cohesion: 0.15
-Nodes (19): HuggingFaceRemoteSource, RemoteFileInfo, remoteSize(), Bool, HTTPURLResponse, Int, String, UInt64 (+11 more)
+### Community 57 - "Prefill Prefillchunkscratch"
+Cohesion: 0.08
+Nodes (26): PrefillChunkScratchBuffers, PrefillChunkScratchLayout, .attentionOutputElements, .denseXElements, .devicePrivateBytes, .h1Elements, .h2Elements, .hiddenElements (+18 more)
 
-### Community 55 - "GFTokenizer"
-Cohesion: 0.14
-Nodes (19): GFTokenizer, missingSpecialToken, Bool, Int32, Set, Tokenizer, CachedAssistantTurn, ServerPromptCache (+11 more)
+### Community 58 - "Openaimodels"
+Cohesion: 0.06
+Nodes (33): CodingKeys, cachedTokens, completionTokens, content, created, frequencyPenalty, id, includeUsage (+25 more)
 
-### Community 56 - "TokenizerTests"
-Cohesion: 0.18
-Nodes (8): GFDetokenizer, Bool, Int, Int32, String, Tokenizer, String, TokenizerTests
+### Community 59 - "Attention Attentiontests"
+Cohesion: 0.09
+Nodes (17): AttentionRef, Float, Int, AttentionTests, Mode, .description, full, swa (+9 more)
 
-### Community 57 - "ValidatedChatRequest"
-Cohesion: 0.30
-Nodes (7): ParsedToolCall, OpenAIUsage, ValidatedChatRequest, ServerCompletion, Sendable, TestGenerationError, sensitiveFailure
+### Community 60 - "Remote Remotedownloadsession"
+Cohesion: 0.11
+Nodes (21): AnyClass, MetadataRedirectDelegate, RemoteDownloadSession, .configurationSnapshot, RemoteDownloadSessionConfigurationSnapshot, RemoteDownloadSessionPolicy, RemoteMetadataRedirectPolicy, Bool (+13 more)
 
-### Community 58 - "Remote Download Session"
+### Community 61 - "Installation Huggingfacemodelsearchclient"
 Cohesion: 0.12
-Nodes (20): AnyClass, MetadataRedirectDelegate, RemoteDownloadSession, RemoteDownloadSessionConfigurationSnapshot, RemoteDownloadSessionPolicy, RemoteMetadataRedirectPolicy, Bool, Data (+12 more)
+Nodes (23): CodingKey, CodingKeys, downloads, id, likes, pipelineTag, tags, HFAPIModel (+15 more)
 
-### Community 59 - "Transcript UI Styling"
-Cohesion: 0.17
+### Community 62 - "Inference Decodeprotocoltests"
+Cohesion: 0.15
+Nodes (13): Pipe, DecodeServiceResponseRouter, State, Error, FileHandle, UUID, DecodeFrameCodec, DecodeServiceEvent (+5 more)
+
+### Community 63 - "Modelio Modeltypes"
+Cohesion: 0.15
+Nodes (11): ArchConfig, .maxNumHeads, .numSparseLayers, .topology, RopeScaling, Bool, Double, Int (+3 more)
+
+### Community 64 - "Fusions Fusedqkvepiloguetests"
+Cohesion: 0.09
+Nodes (22): FusedQKVEpilogue, Shape, Bool, Float, Int, MTLBuffer, MTLCommandBuffer, MTLComputePipelineState (+14 more)
+
+### Community 65 - "Moe Routertopktests"
+Cohesion: 0.12
+Nodes (17): PrefillMoE, Int, MTLBuffer, MTLCommandBuffer, MTLComputePipelineState, UInt32, Result, RouterTopKTests (+9 more)
+
+### Community 66 - "Tensorcore Mppprefillint4qmmtests"
+Cohesion: 0.12
+Nodes (22): PrefillInt4QMM, MPPPrefillInt4QMM, .isAvailable, Path, affineThreadgroupF16, unavailable, Bool, Int (+14 more)
+
+### Community 67 - "Macpresentation Instructiontranscriptdocumentcontroller"
+Cohesion: 0.18
 Nodes (9): NSColor, InstructionTranscriptDocumentController, Any, Bool, NSAttributedString, NSMutableAttributedString, String, TurboFieldfareMacTheme (+1 more)
 
-### Community 60 - "SHA256 Hashing Utilities"
+### Community 68 - "Prefill Prefillruntimeconfig"
+Cohesion: 0.09
+Nodes (21): ExpertCachePhase, decode, prefill, PrefillOutputMode, greedyIfAvailable, logits, ArraySlice, Int32 (+13 more)
+
+### Community 69 - "Streaming Preadexpertstreamertests+cacheplanning"
 Cohesion: 0.11
-Nodes (18): SHA256, Sha256Stream, Bool, Int, Int32, String, UnsafeRawBufferPointer, Int (+10 more)
+Nodes (8): PreadExpertStreamer, .cachePhase, .cachePolicyDefault, .cacheStats, .pinnedSlotCount, PreadExpertStreamerTests, .streamOffset, .streamSize
 
-### Community 61 - "Prefill MoE Grouping"
+### Community 70 - "Httpservertests"
+Cohesion: 0.17
+Nodes (11): ParsedToolCall, OpenAIUsage, ValidatedChatRequest, ServerCompletion, ServerPreparedRequest, .promptTokenCount, Int32, CancellationIgnoringPreparationBackend (+3 more)
+
+### Community 71 - "Turbofieldfaredecodeprotocol Decodeprotocol"
 Cohesion: 0.14
-Nodes (21): PrefillMoEGroup, PrefillMoEGroupedRoutes, PrefillMoEGrouping, PrefillMoEGroupingError, duplicateTokenRank, expertOutOfRange, expertSortKeyCountMismatch, invalidNumExperts (+13 more)
+Nodes (21): DecodeGenerationRequest, DecodeLoadRequest, DecodePrefillDiagnostics, DecodeRunnerDiagnostics, DecodeRuntimeOptions, DecodeServiceEventKind, cancelled, failed (+13 more)
 
-### Community 62 - "Attention Mechanism Tests"
-Cohesion: 0.10
-Nodes (16): AttentionRef, Float, Int, AttentionTests, Mode, full, swa, ArchConfig (+8 more)
+### Community 72 - "Installation Appmodelinstallstate"
+Cohesion: 0.07
+Nodes (30): AppModelInstallEvent, checking, copyingPayload, downloadingMetadata, finalizing, hashingOutput, installed, planning (+22 more)
 
-### Community 63 - "Remote Retry Policy"
+### Community 73 - "Verification Verifiedinstalltests"
+Cohesion: 0.19
+Nodes (9): Data, Int, UInt64, VerifiedInstallTool, VerifyInstallOptions, VerifyInstallResult, UInt64, URL (+1 more)
+
+### Community 74 - "Remote Remotepayloadcopytests"
+Cohesion: 0.23
+Nodes (16): assertNoInternalRemoteDirs(), assertRemoteTokenizerFilesRecorded(), cleanUpRemote(), fakeHFSession(), InstallProgressRecorder, remoteFiles(), remoteOptions(), RemotePayloadCopyTests (+8 more)
+
+### Community 75 - "Modelio Manifestreader"
+Cohesion: 0.17
+Nodes (18): Decodable, Manifest, ManifestArch, ManifestFileEntry, ManifestQuant, ManifestQuantLayerOverride, ManifestQuantSlot, .distinctConfigurations (+10 more)
+
+### Community 76 - "Serverinference"
+Cohesion: 0.11
+Nodes (15): MultiThreadedEventLoopGroup, ServerCoordinator, .isActive, .queuedCount, CheckedContinuation, T, UUID, Void (+7 more)
+
+### Community 77 - "Verification Sha256stream"
+Cohesion: 0.12
+Nodes (18): SHA256, pread, Sha256Stream, Bool, Int, Int32, String, UnsafeRawBufferPointer (+10 more)
+
+### Community 78 - "Modelio Residentindextests"
+Cohesion: 0.12
+Nodes (17): ResidentIndexEntry, ResidentIndexReader, Int32, off_t, String, UInt32, UInt64, UInt8 (+9 more)
+
+### Community 79 - "Diagnostics Runnerdiagnosticssection"
+Cohesion: 0.12
+Nodes (22): HUDMetricView, .body, String, ModelStatusBadge, .body, .statusDot, Color, AdvancedRunnerDiagnosticsView (+14 more)
+
+### Community 80 - "Prefill Prefillperheadnormtests"
 Cohesion: 0.13
-Nodes (19): RemoteRetryJitter, RemoteRetrySleeper, parseRetryAfterNs(), RemoteRetryPolicy, retryableStatus(), saturatingAdd(), Bool, Date (+11 more)
+Nodes (17): PrefillQKVEpilogue, PrefillPerHeadNorm, MTLComputePipelineState, PrefillRoPE, MTLComputePipelineState, PrefillPerHeadNormTests, Float16, Int (+9 more)
 
-### Community 64 - "Gemma Tool Parser"
-Cohesion: 0.18
-Nodes (10): Character, GemmaToolCallParserError, malformed, oversized, unknownTool, Parser, Bool, Set (+2 more)
-
-### Community 65 - "Model Manifest Reader"
-Cohesion: 0.18
-Nodes (17): Decodable, Manifest, ManifestArch, ManifestFileEntry, ManifestQuant, ManifestQuantLayerOverride, ManifestQuantSlot, ManifestReader (+9 more)
-
-### Community 66 - "Logit Production Runner"
-Cohesion: 0.14
-Nodes (20): ChunkedPrefillRunner, ContextWindowReporting, ContinuableLogitProducer, LogitProducer, PrefillResult, PrefillSeed, greedyToken, logitsWritten (+12 more)
-
-### Community 67 - "Remote Payload Tests"
-Cohesion: 0.22
-Nodes (16): assertNoInternalRemoteDirs(), assertRemoteTokenizerFilesRecorded(), RemotePayloadCopyTests, cleanUpRemote(), fakeHFSession(), RemotePayloadCopyTests, InstallProgressRecorder, remoteFiles() (+8 more)
-
-### Community 68 - "Verified Install Receipt"
-Cohesion: 0.12
-Nodes (12): FileEntry, ModelIntegrityPolicy, fullSha256, sizeCheckTrustedReceipt, Data, Int, String, UInt64 (+4 more)
-
-### Community 69 - ".executePrefillChunk"
-Cohesion: 0.12
-Nodes (20): Int, MTLBuffer, MTLCommandBuffer, UInt32, PrefillOutputMode, greedyIfAvailable, logits, ArraySlice (+12 more)
-
-### Community 70 - "Routed Tile Scheduler"
+### Community 81 - "Moe Prefillroutedtilescheduler"
 Cohesion: 0.15
 Nodes (14): PrefillRoutedTileScheduler, PrefillRoutedTileSchedulerConfig, PrefillRoutedTileSchedulerDecision, drainBeforeIssue, issueWithoutPending, prefetchNext, PrefillRoutedTileSchedulerDrainReason, avoidingSlotPlanUnavailable (+6 more)
 
-### Community 71 - "Range Copy Planning"
-Cohesion: 0.23
-Nodes (13): CoalescedRangeCopy, FingerprintWriter, hashData(), RangeCopy, RangeCopyPlan, RangeCopyPlanner, RemoteExpectedOutput, ResidentEntry (+5 more)
-
-### Community 72 - "OpenAI Request Validation"
+### Community 82 - "Prefill Prefillsharedexperttests"
 Cohesion: 0.14
-Nodes (5): OpenAIRequestValidator, OpenAIToolName, GenerationConfig, OpenAIValidationTests, String
+Nodes (15): PrefillSharedExpert, Int, MTLBuffer, MTLCommandBuffer, SharedExpertInt8Proj, PrefillRMSNorm, MTLComputePipelineState, Float16 (+7 more)
 
-### Community 73 - "App Scroll View"
-Cohesion: 0.17
-Nodes (12): Context, NSScrollView, NSTextView, NSViewRepresentable, Coordinator, IncrementalTranscriptView, OutputPaneView, Bool (+4 more)
+### Community 83 - "Deltanet Deltanet"
+Cohesion: 0.25
+Nodes (27): dn_cast_f16_to_f32(), dn_cast_f32_to_f16(), dn_conv_step(), dn_conv_step_batched(), dn_gates(), dn_gates_batched(), dn_load_hidden(), dn_load_hidden_batched() (+19 more)
 
-### Community 74 - "App Model Synchronization"
+### Community 84 - "Prefill Prefillqkvepiloguetests"
+Cohesion: 0.14
+Nodes (15): PrefillQKVEpilogueTests, Bool, Float, Float16, Int, MTLBuffer, String, UInt32 (+7 more)
+
+### Community 85 - "Deltanet Deltanetmetalblock"
+Cohesion: 0.23
+Nodes (13): DeltaNetMetalBlock, .lastDeltaOut, GPUStateStore, LayerWeights, Bool, Float, Int, MTLBuffer (+5 more)
+
+### Community 86 - "State Appmodel"
 Cohesion: 0.09
 Nodes (3): Observation, Synchronization, TurboFieldfareRepackCore
 
-### Community 75 - "Activation Function Implementation"
-Cohesion: 0.11
-Nodes (19): ActivationType, geluPytorchTanh, silu, Implementation, int4, int8, SharedExpertError, dimensionMismatch (+11 more)
+### Community 87 - "Inference Modelexpertio"
+Cohesion: 0.14
+Nodes (15): RoutedExpertBatchFetchPlan, .experts, .hits, .misses, .tokenCount, .topK, .totalLookups, RoutedExpertFetchPlan (+7 more)
 
-### Community 76 - "DeltaNet Metal Kernels"
-Cohesion: 0.26
-Nodes (25): dn_conv_step(), dn_conv_step_batched(), dn_gates(), dn_gates_batched(), dn_load_hidden(), dn_load_hidden_batched(), dn_log1p(), dn_matvec() (+17 more)
+### Community 88 - "Turbofieldfarecli Args"
+Cohesion: 0.15
+Nodes (11): ArgsError, contextCapExceeded, .description, helpRequested, invalidValue, missingValue, modeMissing, mutuallyExclusive (+3 more)
 
-### Community 77 - "Expert Streamer Errors"
-Cohesion: 0.11
-Nodes (20): StreamerError, allocFailed, bufferWrapFailed, invalidIOSplitConfiguration, offsetOutOfRange, openFailed, preadFailed, sizeMismatch (+12 more)
+### Community 89 - "Httpservertests"
+Cohesion: 0.23
+Nodes (8): Error, TurboFieldfareHTTPServer, .acceptedConnectionCount, .hasActiveRequest, .queuedRequestCount, HTTPServerTests, ScriptedServerBackend, UInt64
 
-### Community 78 - "Fused Metal Kernels"
+### Community 90 - "Generation Logitproducer"
+Cohesion: 0.14
+Nodes (17): Range, ChunkedPrefillRunner, ContextWindowReporting, ContinuableLogitProducer, LogitProducer, PrefillResult, PrefillSeed, greedyToken (+9 more)
+
+### Community 91 - "Fusions Fused"
 Cohesion: 0.23
 Nodes (24): fused_compute_rope_freq(), fused_fc_d(), fused_fc_head_dim(), fused_fc_n(), fused_fc_num_kv_heads(), fused_fc_num_q_heads(), fused_fc_rotary(), fused_layer_tail() (+16 more)
 
-### Community 79 - "Prefill Attention Kernels"
+### Community 92 - "Prefill Prefill"
 Cohesion: 0.26
 Nodes (25): attention_prefill_causal_tiled(), attention_prefill_full_tensorops_2d_validity_v2(), attention_prefill_full_tensorops_2d_validity_v2_impl(), constant, device, kernel, uint, uint3 (+17 more)
 
-### Community 80 - "DecodeServiceInferenceClient"
+### Community 93 - "Configuration Runtimeconfiguration"
+Cohesion: 0.11
+Nodes (20): RuntimeConfiguration, .fp16RingEnabled, .modelExpertCachePolicy, .prefillConfig, .production, .rdadviseEnabled, RuntimeExpertCachePolicy, lfu (+12 more)
+
+### Community 94 - "Inference Decodeserviceinferenceclient"
 Cohesion: 0.16
-Nodes (10): Connection, DecodeServiceInferenceClient, AsyncThrowingStream, Bool, Error, FileHandle, Int, String (+2 more)
+Nodes (11): Connection, DecodeServiceInferenceClient, .currentInferenceMemoryBytes, AsyncThrowingStream, Bool, Error, FileHandle, Int (+3 more)
 
-### Community 81 - "Command Line Arguments"
-Cohesion: 0.16
-Nodes (10): ArgsError, contextCapExceeded, helpRequested, invalidValue, missingValue, modeMissing, mutuallyExclusive, requiredMissing (+2 more)
+### Community 95 - "Inference Realinferenceclient"
+Cohesion: 0.21
+Nodes (8): Entry, GenerationTaskRegistry, RealInferenceClient, Never, Task, UUID, Void, RealInferenceClientStateTests
 
-### Community 82 - "HTTPServerTests.swift"
-Cohesion: 0.13
-Nodes (18): MultiThreadedEventLoopGroup, ServerInferenceBackend, AdmissionBlockingPreparationBackend, CancellableServerBackend, CancellationIgnoringPreparationBackend, ContentAndToolBackend, FailingServerBackend, InvalidRequestServerBackend (+10 more)
-
-### Community 83 - "Expert Cache Planning"
+### Community 96 - "Installation Downloadetaestimator"
 Cohesion: 0.15
-Nodes (7): Bool, MTLBuffer, Set, PreadExpertStreamerTests, Bool, Int, URL
+Nodes (11): DownloadETAEstimator, DownloadETAFormatter, DownloadETAObservation, DownloadETAPresentation, estimating, hidden, remaining, Double (+3 more)
 
-### Community 84 - "Logit Softmax Kernels"
+### Community 97 - "Kernels Layer0isolationnumerictests"
+Cohesion: 0.19
+Nodes (12): Fixture, FixtureEntry, Qwen36Layer0NumericIsolationTests, .isFixtureAvailable, .isModelAvailable, Bool, Data, Float (+4 more)
+
+### Community 98 - "Prefill Prefillgroupedroutedmoetests"
+Cohesion: 0.17
+Nodes (9): PrefillGroupedRoutedMoETests, Float, Float16, Int, MTLDevice, UInt16, UInt32, UInt8 (+1 more)
+
+### Community 99 - "Generation Outputpaneview"
+Cohesion: 0.19
+Nodes (11): Context, NSScrollView, NSTextView, NSViewRepresentable, Coordinator, IncrementalTranscriptView, Bool, String (+3 more)
+
+### Community 100 - "Sampling Logit"
 Cohesion: 0.24
 Nodes (23): lm_head_greedy_int4_rows_chunk_raw(), lm_head_greedy_int4_rows_reduce(), lmhead_fc_d(), lmhead_fc_v(), lmhead_gumbel_for(), lmhead_int4_gemv_row_simd_dev(), lmhead_splitmix64(), logit_softcap_softmax() (+15 more)
 
-### Community 85 - "Model Source Selection"
-Cohesion: 0.17
-Nodes (10): ModelSelectionError, notInstallable, unknownID, ModelSource, SupportedModelSource, Bool, String, UInt64 (+2 more)
-
-### Community 86 - "Numeric Isolation Fixtures"
-Cohesion: 0.21
-Nodes (11): Fixture, FixtureEntry, Qwen36Layer0NumericIsolationTests, Bool, Data, Float, Int, Model (+3 more)
-
-### Community 87 - "Integrity Verification Tests"
+### Community 101 - "Modelio Modeltypes"
 Cohesion: 0.13
-Nodes (8): Sha256Verifier, Data, Int, Int32, String, URL, ModelLoaderTests, Sha256VerifierTests
+Nodes (17): MetalRopeScalingParams, Float, Float, Int, MTLBuffer, MTLCommandBuffer, UInt32, Float (+9 more)
 
-### Community 88 - "MoE Synthetic Testing"
-Cohesion: 0.23
-Nodes (10): PrefillGroupedRoutedMoEError, PrefillGroupedRoutedMoETests, Float, Float16, Int, MTLDevice, UInt16, UInt32 (+2 more)
+### Community 102 - "Installation Modelpickerview"
+Cohesion: 0.16
+Nodes (9): AppModelCatalog, AppModelCatalogEntry, String, UInt64, ModelPickerView, .body, Bool, String (+1 more)
 
-### Community 89 - "DeltaNet GPU Dispatch"
-Cohesion: 0.23
-Nodes (13): DeltaNetMetalBlock, GPUStateStore, LayerWeights, Bool, Float, Int, Model, MTLBuffer (+5 more)
+### Community 103 - "Attention Prefillattentiontests"
+Cohesion: 0.22
+Nodes (9): RelError, Float, Fixture, PrefillAttentionTests, Float, Int, String, UInt32 (+1 more)
 
-### Community 90 - "Prefill Scratch Allocation"
+### Community 104 - "Moe Sharedexpertint4"
 Cohesion: 0.13
-Nodes (11): PrefillChunkScratchBuffers, PrefillChunkScratchLayout, ArchConfig, Int, MTLBuffer, MTLDevice, ArchConfig, DenseMLPLayerTests (+3 more)
+Nodes (18): ActivationType, .description, geluPytorchTanh, silu, .activation, Implementation, int4, int8 (+10 more)
 
-### Community 91 - "Model Catalog UI"
-Cohesion: 0.15
-Nodes (8): AppModelCatalog, AppModelCatalogEntry, String, UInt64, ModelPickerView, Bool, String, AppModelCatalogTests
-
-### Community 92 - "Model Install Readiness"
-Cohesion: 0.15
-Nodes (13): Identifiable, AppModelInstallDescriptor, AppModelInstallReadiness, checking, failed, insufficientSpace, ready, AppModelInstallRequirement (+5 more)
-
-### Community 93 - "Architecture Configuration Detection"
-Cohesion: 0.24
-Nodes (6): ArchConfig, RopeScaling, Bool, Double, Int, UInt8
-
-### Community 94 - "Expert Cache Phase"
-Cohesion: 0.13
-Nodes (7): ExpertCachePhase, decode, prefill, PreadExpertStreamer, UnsafeMutableRawPointer, PreadExpertStreamerTests, PreadExpertStreamerTests
-
-### Community 95 - "Attention Geometry Encoding"
+### Community 105 - "Attention Attention"
 Cohesion: 0.29
 Nodes (11): Attention, AttentionSplitGeometry, SpecializationKey, Bool, Float, Int, MTLBuffer, MTLCommandBuffer (+3 more)
 
-### Community 96 - "Runtime Path Configuration"
-Cohesion: 0.13
-Nodes (18): RuntimeConfiguration, RuntimeExpertCachePolicy, lfu, lru, RuntimeHeadPath, fusedRows, logits, RuntimePrefillAttentionPath (+10 more)
-
-### Community 97 - "HuggingFace Search Client"
-Cohesion: 0.17
-Nodes (11): HuggingFaceModelSearchClient, URL, URLSession, HuggingFaceModelSearchClientTests, StubURLProtocol, Bool, Data, HTTPURLResponse (+3 more)
-
-### Community 98 - "GTurbo Format Validation"
-Cohesion: 0.16
-Nodes (15): DType, bf16, fp16, fp32, u32, gturboCheckedAdd(), gturboCheckedMultiply(), invalid (+7 more)
-
-### Community 99 - "Fake Inference Testing"
-Cohesion: 0.18
-Nodes (12): FakeInferenceClientTests, MainActor, FakeInferenceClient, State, StateBox, AsyncThrowingStream, Bool, Duration (+4 more)
-
-### Community 100 - "Error Handling and Types"
-Cohesion: 0.10
-Nodes (19): CustomStringConvertible, Error, GeneratorError, contextOverflow, emptyPrompt, invalidContinuation, invalidGenerationConfig, Int (+11 more)
-
-### Community 101 - "MoE Router Kernels"
-Cohesion: 0.33
+### Community 106 - "Moe Moe"
+Cohesion: 0.29
 Nodes (9): MoE, MoEExpertOffsets, Bool, Int, MTLArgumentEncoder, MTLBuffer, MTLCommandBuffer, MTLComputePipelineState (+1 more)
 
-### Community 102 - ".encode"
-Cohesion: 0.27
-Nodes (9): SampleTopK64Error, scratchAllocationFailed, unsupportedVocabulary, Float, Int, MTLBuffer, MTLCommandBuffer, UInt32 (+1 more)
+### Community 107 - "Generation Samplertests"
+Cohesion: 0.18
+Nodes (11): SamplePath, gpuSampled, greedyGPU, hostPenalty, Rig, SamplerTests, Float, Int (+3 more)
 
-### Community 103 - "Expert Routing Management"
-Cohesion: 0.22
-Nodes (7): Model, RoutedExpertBatchFetchPlan, RoutedExpertFetchPlan, Int, MTLBuffer, Set, UInt64
+### Community 108 - "System Gturbodirectoryaccess"
+Cohesion: 0.23
+Nodes (9): GTurboDirectoryAccess, .directoryFileDescriptor, Bool, Data, Int, Int32, String, UInt64 (+1 more)
 
-### Community 104 - "Decode Service Outbox"
+### Community 109 - "Serverarguments"
+Cohesion: 0.12
+Nodes (10): ServerArgumentError, .description, help, invalid, ServerArguments, Int, String, ServerArgumentTests (+2 more)
+
+### Community 110 - "System Installlock"
+Cohesion: 0.19
+Nodes (8): .hasPartialModelDownload, InstallLock, RemoteInstallPaths, Int32, Set, String, InstallLockTests, String
+
+### Community 111 - "Format Safetensors"
 Cohesion: 0.15
-Nodes (11): DecodeServiceOutbox, PrefillProgress, State, Error, FileHandle, Int, String, UInt64 (+3 more)
+Nodes (13): Header, Safetensors, Data, String, UInt64, LocalRepacker, LocalRepackResult, Bool (+5 more)
 
-### Community 105 - "Prefill Attention Setup"
-Cohesion: 0.17
-Nodes (13): PrefillPostAttentionSetup, Float, Int, MTLBuffer, MTLCommandBuffer, MTLComputePipelineState, UInt32, PrefillPostAttentionSetupTests (+5 more)
-
-### Community 106 - "Tool Call Parsing"
-Cohesion: 0.15
-Nodes (11): GemmaToolCallParser, label, StructuredAssistantDecoder, StructuredAssistantEvent, content, toolCall, Bool, Int32 (+3 more)
-
-### Community 107 - "DecodeRuntimeOptions"
-Cohesion: 0.26
-Nodes (12): DecodeGenerationRequest, DecodeLoadRequest, DecodePrefillDiagnostics, DecodeRunnerDiagnostics, DecodeRuntimeOptions, Bool, Double, Float (+4 more)
-
-### Community 108 - "Installation Locking"
+### Community 112 - "Modelio Verifiedinstallreceipt"
 Cohesion: 0.20
-Nodes (7): InstallLock, RemoteInstallPaths, Int32, Set, String, InstallLockTests, String
+Nodes (11): FileEntry, ModelIntegrityPolicy, fullSha256, sizeCheckTrustedReceipt, Data, Int, String, UInt64 (+3 more)
 
-### Community 109 - "Mock HTTP Protocol"
+### Community 113 - "Streaming Expertstreamer"
+Cohesion: 0.14
+Nodes (16): StreamerError, allocFailed, bufferWrapFailed, .description, invalidIOSplitConfiguration, offsetOutOfRange, openFailed, preadFailed (+8 more)
+
+### Community 114 - "Turbofieldfareformat Gturboformatcodectests"
+Cohesion: 0.28
+Nodes (6): GTurboResidentIndexHeaderV1, GTurboResidentIndexCodecTests, Data, UInt32, UInt64, UInt8
+
+### Community 115 - "Remote Remoteretry"
+Cohesion: 0.17
+Nodes (11): parseRetryAfterNs(), RemoteRetryPolicy, retryableStatus(), saturatingAdd(), Bool, Date, Error, Int (+3 more)
+
+### Community 116 - "Openaivalidationtests"
+Cohesion: 0.17
+Nodes (3): name, OpenAIValidationTests, String
+
+### Community 117 - "Remote Remotepayloadcopytests"
 Cohesion: 0.19
 Nodes (12): parts, FakeFailure, http, response, truncatedBody, url, FakeHFURLProtocol, Data (+4 more)
 
-### Community 110 - "Server Coordination"
-Cohesion: 0.17
-Nodes (11): ServerCoordinator, CheckedContinuation, T, UUID, Void, Waiter, ServerCoordinatorTests, CheckedContinuation (+3 more)
-
-### Community 111 - "Prefill Router Tests"
-Cohesion: 0.28
+### Community 118 - "Prefill Prefillroutertests"
+Cohesion: 0.26
 Nodes (8): PrefillRouterTests, RouterBuffers, Float, Float16, Int, MTLBuffer, SplitMix64, UInt32
 
-### Community 112 - "CLI Shell Utilities"
+### Community 119 - "Wizard Template"
 Cohesion: 0.22
 Nodes (16): ask(), ask_secret(), banner(), _clear(), finish(), note(), open_url(), pause() (+8 more)
 
-### Community 113 - "Streamed MoE Prefill"
-Cohesion: 0.15
-Nodes (12): PrefillGroupedRoutedMoE, allocationFailed, PrefillGroupedRoutedMoEStreamedMetadataBuffers, PrefillGroupedRoutedMoEStreamedParams, PrefillStreamedTileArgumentBuffer, MTLArgumentEncoder, MTLBuffer, MTLCommandBuffer (+4 more)
+### Community 120 - "Deltanet Deltanetmetalparitytests"
+Cohesion: 0.19
+Nodes (11): checkCommandBufferError(), DeltaNetParityTests, .intGate, .isModelAvailable, LCG, Bool, Float, UInt64 (+3 more)
 
-### Community 114 - "Shared Expert Prefill"
-Cohesion: 0.25
-Nodes (9): PrefillSharedExpert, Float16, PrefillSharedExpertTests, Float16, Int, SharedExpertInt8Proj, SplitMix64, UInt16 (+1 more)
+### Community 121 - "Prefill Prefilllayertailtests"
+Cohesion: 0.18
+Nodes (13): PrefillLayerTail, Float, Int, MTLBuffer, MTLCommandBuffer, MTLComputePipelineState, UInt32, PrefillLayerTailTests (+5 more)
 
-### Community 115 - "RoPE Metal Kernels"
+### Community 122 - "Primitives Rope"
 Cohesion: 0.24
 Nodes (18): apply_neox_pair(), compute_rope_freq(), constant, device, kernel, uint, uint3, rope_default_neox() (+10 more)
 
-### Community 116 - "Architecture Configuration"
-Cohesion: 0.22
+### Community 123 - "Turbofieldfareformat Gturboformatv1"
+Cohesion: 0.16
+Nodes (15): DType, bf16, fp16, fp32, u32, gturboCheckedAdd(), gturboCheckedMultiply(), invalid (+7 more)
+
+### Community 124 - "Format Archinfotests"
+Cohesion: 0.21
 Nodes (9): ArchInfo, RopeScalingInfo, Bool, Double, Int, String, UInt8, ArchInfoTests (+1 more)
 
-### Community 117 - "RMSNorm Reference Implementation"
-Cohesion: 0.14
+### Community 125 - "Remote Remoteinstallcheckpoint"
+Cohesion: 0.25
+Nodes (9): RemoteCompletedRange, RemoteInstallCheckpoint, Bool, Int, Self, String, UInt64, RemoteInstallCheckpointTests (+1 more)
+
+### Community 126 - "Reference Rmsnormreferencetests"
+Cohesion: 0.13
 Nodes (11): RmsNormRef, Float, FusedLayerTailTests, Float, Float16, Int, UInt16, RMSNormReferenceTests (+3 more)
 
-### Community 118 - "Fused GEMV Tests"
-Cohesion: 0.22
-Nodes (8): FusedQKVGEMVGenericTests, Projection, Float, Int, SplitMix64, UInt16, UInt64, UInt8
+### Community 127 - "System Installlocktests"
+Cohesion: 0.12
+Nodes (10): StubURLProtocol, Bool, Data, URLRequest, HangingInstallURLProtocol, .started, Bool, URLRequest (+2 more)
 
-### Community 119 - "Sampler Logic Tests"
-Cohesion: 0.28
-Nodes (8): Rig, SamplerTests, Float, GenerationConfig, Int, Int32, MTLBuffer, UInt32
+### Community 128 - "Streaming Preadexpertstreamer"
+Cohesion: 0.16
+Nodes (6): Bool, Set, .assignedSlots, Bool, Int, URL
 
-### Community 120 - "Int8 Shared Expert"
-Cohesion: 0.28
-Nodes (12): SharedExpertInt8, SharedExpertInt8Error, dimensionMismatch, scratchTooSmall, SharedExpertProjection, Int, MTLBuffer, MTLCommandBuffer (+4 more)
-
-### Community 121 - "Attention Metal Kernels"
+### Community 129 - "Attention Attention"
 Cohesion: 0.35
 Nodes (17): apply_attention_gating_per_head(), attention_decode_combine(), attention_decode_gqa_swa_partial(), attention_decode_partial(), attn_fc_head_dim(), attn_fc_num_chunks(), attn_fc_num_kv_heads(), attn_fc_num_q_heads() (+9 more)
 
-### Community 122 - "Int4 Dequantization Kernels"
+### Community 130 - "Quant Dequant Int4"
 Cohesion: 0.36
 Nodes (17): dequant_int4_gemv_generic(), dequant_int4_gemv_generic_body(), dequant_int4_gemv_simd(), dequant_int4_gemv_simd_body(), dequant_int4_qkv_gemv_simd(), embed_lookup_int4(), int4_fc_m(), int4_fc_n() (+9 more)
 
-### Community 123 - "Digest and Byte Providers"
-Cohesion: 0.24
-Nodes (11): DestinationDigest, HTTPRangeSourceByteProvider, Int, Int32, Sendable, Set, String, UInt64 (+3 more)
-
-### Community 124 - "Prefill Attention Tests"
-Cohesion: 0.31
-Nodes (7): Fixture, PrefillAttentionTests, Float, Int, String, UInt32, UInt64
-
-### Community 126 - "Metric Formatting"
-Cohesion: 0.24
-Nodes (7): ByteCountFormatter, Int64, MetricFormat, Double, Int, String, UInt64
-
-### Community 127 - "HuggingFace API Client"
-Cohesion: 0.17
-Nodes (15): CodingKey, CodingKeys, downloads, id, likes, pipelineTag, tags, HFAPIModel (+7 more)
-
-### Community 128 - "Prefill QKV Epilogue"
-Cohesion: 0.24
-Nodes (9): PrefillQKVEpilogue, PrefillPerHeadNorm, MTLComputePipelineState, PrefillPerHeadNormTests, Float16, Int, MTLBuffer, String (+1 more)
-
-### Community 129 - "Response Routing Service"
-Cohesion: 0.27
-Nodes (7): DecodeServiceResponseRouter, State, Error, FileHandle, UUID, DecodeServiceEvent, DecodeServiceResponseMatchingTests
-
-### Community 130 - "Decode Command Queue"
-Cohesion: 0.19
-Nodes (10): DecodeServiceCommand, cancel, generate, load, shutdown, unload, DecodeCommandQueue, FileHandle (+2 more)
-
-### Community 131 - "Int4 GEMV Tests"
-Cohesion: 0.24
-Nodes (4): DequantInt4GEMVTests, Float, Int, UInt64
-
-### Community 132 - "ContinuationProducer"
-Cohesion: 0.31
-Nodes (7): Range, ContinuationProducer, ArraySlice, Int, Int32, MTLBuffer, Void
-
-### Community 133 - "Draft Verification Service"
-Cohesion: 0.23
+### Community 131 - "Inference Draftverifier"
+Cohesion: 0.18
 Nodes (10): BatchedPassResult, DraftVerifier, Bool, Error, Int, Int32, MTLBuffer, MTLCommandBuffer (+2 more)
 
-### Community 134 - "Model Installation States"
+### Community 132 - "Diagnostics Metricformat"
+Cohesion: 0.22
+Nodes (8): ByteCountFormatter, MetricFormat, Double, Int, String, UInt64, .body, .memoryText
+
+### Community 133 - "Modelio Modeltypes"
+Cohesion: 0.13
+Nodes (16): .asArchConfig, AttentionGating, none, perElement, perHead, LayerTopology, .description, gemma4 (+8 more)
+
+### Community 134 - "Inference Appinferenceerror"
 Cohesion: 0.12
-Nodes (16): AppModelInstallState, cancelled, cancelling, checking, copyingPayload, discarding, downloadingMetadata, failed (+8 more)
+Nodes (16): AppInferenceError, cancelled, contextOverflow, .description, generationInFlight, invalidRequest, modelLoadFailed, modelNotFound (+8 more)
 
-### Community 135 - "Model Layout Repacker"
+### Community 135 - "State Apppresentationstate"
 Cohesion: 0.18
-Nodes (10): GTurboLayoutValidator, String, LocalRepacker, LocalRepackResult, Bool, Int, String, LayerWriter (+2 more)
+Nodes (13): .presentation, AppPresentationSeverity, active, error, neutral, success, warning, AppPresentationSnapshot (+5 more)
 
-### Community 136 - "Remote Install Checkpoints"
-Cohesion: 0.31
-Nodes (8): RemoteCompletedRange, RemoteInstallCheckpoint, Int, Self, String, UInt64, RemoteInstallCheckpointTests, sampleCheckpoint()
+### Community 136 - "State Appmodelloadstate"
+Cohesion: 0.15
+Nodes (14): AppModelLoadState, cancelling, failed, .isFailed, .isLoading, .isReady, loading, notLoaded (+6 more)
 
-### Community 137 - "Server Logging"
+### Community 137 - "Sampling Logitsoftcapsoftmaxtests"
+Cohesion: 0.19
+Nodes (10): LogitSoftcapSoftmaxRef, Float, LogitSoftcapSoftmaxTests, Float, Float16, Int, LogitSoftcapSoftmaxReferenceTests, Float (+2 more)
+
+### Community 138 - "Fusions Fusedqkvgemvgenerictests"
+Cohesion: 0.22
+Nodes (7): FusedQKVGEMVGenericTests, Projection, Float, Int, UInt16, UInt64, UInt8
+
+### Community 139 - "Quant Dequantint4gemvtests"
+Cohesion: 0.22
+Nodes (4): DequantInt4GEMVTests, Float, Int, UInt64
+
+### Community 140 - "State Appmodelservicereportingtests"
+Cohesion: 0.18
+Nodes (10): AnyObject, AppInferenceClient, AppInferenceMemoryReporting, AppInferenceTranscriptReporting, AppModelLifecycleClient, AppModelServiceReportingTests, ReportingInferenceClient, AsyncThrowingStream (+2 more)
+
+### Community 141 - "Modelio Sha256verifier"
+Cohesion: 0.20
+Nodes (8): CommonCrypto, Sha256Verifier, Data, Int, Int32, String, URL, Sha256VerifierTests
+
+### Community 142 - "Attention Attentiongatingtests"
+Cohesion: 0.15
+Nodes (11): AttentionGatingKernel, Int, MTLBuffer, MTLCommandBuffer, MTLComputePipelineState, UInt32, AttentionGatingRef, AttentionGatingTests (+3 more)
+
+### Community 143 - "Quant Dequantint6gemvtests"
+Cohesion: 0.18
+Nodes (10): DequantInt6GEMV, Int, MTLBuffer, MTLCommandBuffer, MTLComputePipelineState, UInt32, DequantInt6GEMVTests, Float (+2 more)
+
+### Community 144 - "Quant Dequantint8gemvtests"
+Cohesion: 0.17
+Nodes (11): DequantInt8GEMV, Shape, Int, MTLBuffer, MTLCommandBuffer, MTLComputePipelineState, UInt32, DequantInt8GEMVTests (+3 more)
+
+### Community 145 - "State Apppresentationstate"
+Cohesion: 0.20
+Nodes (12): AppModelAction, cancelInstall, cancelLoad, install, load, reload, retryLoad, unload (+4 more)
+
+### Community 146 - "Installation Modelinstallview"
+Cohesion: 0.17
+Nodes (13): ModelInstallView, .actions, .body, .identity, .modelPicker, .progressArea, .readinessLabel, .storageCard (+5 more)
+
+### Community 147 - "Generation Promptcomposerview"
+Cohesion: 0.13
+Nodes (14): PromptComposerView, .body, .clearAction, .editor, .editorHeight, .promptGuide, .promptHasMarkedText, .promptTips (+6 more)
+
+### Community 148 - "Serverlog"
 Cohesion: 0.25
 Nodes (7): ServerLog, Bool, Duration, Error, Int, String, UInt
 
-### Community 138 - "Qwen36 Layer Isolation"
+### Community 149 - "Kernels Layer0isolationtests"
 Cohesion: 0.23
-Nodes (3): Qwen36Layer0IsolationTests, Bool, Model
+Nodes (3): Qwen36Layer0IsolationTests, .isModelAvailable, Bool
 
-### Community 139 - "QKV Epilogue Tests"
-Cohesion: 0.24
-Nodes (9): PrefillQKVEpilogueTests, Bool, Float, Float16, Int, MTLBuffer, String, UInt32 (+1 more)
-
-### Community 140 - "KV Cache Management"
-Cohesion: 0.23
-Nodes (3): KVCacheManagerTests, Bool, Int
-
-### Community 141 - "Decode Frame Codec"
-Cohesion: 0.30
-Nodes (6): Pipe, DecodeFrameCodec, Data, FileHandle, T, DecodeProtocolTests
-
-### Community 142 - "Expert Cache Planning"
+### Community 150 - "Assets Turbofieldfare"
 Cohesion: 0.22
-Nodes (4): BatchedExpertCachePlan, ExpertCachePlan, PreadExpertStreamerTests, String
+Nodes (15): App Screenshot, Benchmarks, Community Benchmarks, Experiment Inventory, Summary: Model Install and Expert I/O, Summary: Decode MoE, INT4, and Router, Summary: Expert Cache and Layout, Summary: RDADVISE (+7 more)
 
-### Community 143 - "Expert IO Advice"
-Cohesion: 0.32
-Nodes (4): ExpertIOAdviceResult, Int, UInt64, pread
+### Community 151 - "Diagnostics Inspectorview"
+Cohesion: 0.14
+Nodes (13): PreferenceKey, ConversationChromeHeightKey, RootView, .body, .conversationView, .primaryContent, CGFloat, InspectorView (+5 more)
 
-### Community 144 - "Model Location Resolution"
+### Community 152 - "Streaming Preadexpertstreamer"
+Cohesion: 0.19
+Nodes (7): BatchedExpertCachePlan, .hitRate, .totalLookups, .uniqueFetchCount, ExpertCachePlan, Double, String
+
+### Community 153 - "Streaming Preadexpertstreamer"
+Cohesion: 0.30
+Nodes (4): Int, MTLBuffer, UInt64, UnsafeMutableRawPointer
+
+### Community 154 - "Inference Realforwardrunner"
+Cohesion: 0.20
+Nodes (9): FusedLayerTail, Float, Int, MTLBuffer, MTLCommandBuffer, MTLComputePipelineState, UInt32, Float (+1 more)
+
+### Community 155 - "Moe Sharedexpertint8"
+Cohesion: 0.35
+Nodes (10): SharedExpertInt8, dimensionMismatch, scratchTooSmall, SharedExpertProjection, Int, MTLBuffer, MTLCommandBuffer, MTLComputePipelineState (+2 more)
+
+### Community 156 - "Moe Prefillrouter"
+Cohesion: 0.24
+Nodes (10): PrefillRouter, PrefillTokenExpertPair, .weight, Bool, Float16, Int, MTLBuffer, MTLCommandBuffer (+2 more)
+
+### Community 157 - "Generation Generator"
+Cohesion: 0.13
+Nodes (14): GeneratorError, contextOverflow, .description, emptyPrompt, invalidContinuation, invalidGenerationConfig, StopReason, endOfTurn (+6 more)
+
+### Community 158 - "Tokenization Structuredassistantdecoder"
+Cohesion: 0.20
+Nodes (10): label, StructuredAssistantDecoder, .hasToolCalls, StructuredAssistantEvent, content, toolCall, Bool, Int32 (+2 more)
+
+### Community 159 - "Httpserver"
+Cohesion: 0.21
+Nodes (11): Channel, thought, visible, ChildChannelRegistry, .count, State, Never, ObjectIdentifier (+3 more)
+
+### Community 160 - "Configuration Appcontextlengthoption"
+Cohesion: 0.14
+Nodes (11): AppContextLengthOption, eightK, fourK, .fp16KVBytes, .id, .menuLabel, .shortLabel, sixteenK (+3 more)
+
+### Community 161 - "Installation Appmodellocation"
 Cohesion: 0.29
 Nodes (5): AppModelLocation, Bool, String, URL, AppModelLocationTests
 
-### Community 145 - "App Presentation State"
-Cohesion: 0.21
-Nodes (11): AppPresentationSeverity, active, error, neutral, success, warning, AppPresentationSnapshot, AppPresentationState (+3 more)
+### Community 162 - "Streaming Rdadvice"
+Cohesion: 0.23
+Nodes (7): CInt, RDAdvice, RDAdviceCallResult, .succeeded, Bool, UInt64, RDAdviceProbeTests
 
-### Community 146 - "Safetensors Header Parsing"
-Cohesion: 0.26
-Nodes (7): Header, Safetensors, Data, String, UInt64, RangeCopyPlannerTests, String
+### Community 163 - "Fusions Fusedqkvgemvgeneric"
+Cohesion: 0.16
+Nodes (11): Int, Bits, eight, five, .functionName, FusedQKVGEMVGeneric, MTLBuffer, MTLCommandBuffer (+3 more)
 
-### Community 147 - "Inference Client Infrastructure"
-Cohesion: 0.13
-Nodes (3): CryptoKit, TurboFieldfareDecodeProtocol, TurboFieldfareDecodeService
-
-### Community 148 - "Model Topology Types"
+### Community 164 - "Streaming Preadexpertstreamer"
 Cohesion: 0.14
-Nodes (13): AttentionGating, none, perElement, perHead, LayerTopology, gemma4, qwen36, NormTopology (+5 more)
+Nodes (7): ExpertCacheStats, .decodeHits, .decodeLookups, .decodeMisses, .hitRate, .prefillHitRate, .prefillIOReductionFactor
 
-### Community 149 - "Prefill Attention Pipeline"
+### Community 165 - "Attention Prefillattention"
 Cohesion: 0.25
 Nodes (8): PrefillAttention, PrefillAttentionParams, Float, Int, MTLBuffer, MTLCommandBuffer, MTLComputePipelineState, UInt32
 
-### Community 150 - "Prefill Router Encoding"
+### Community 166 - "Generation Streamingstopmatcher"
+Cohesion: 0.29
+Nodes (4): StreamingStopMatcher, Int, String, StreamingStopMatcherTests
+
+### Community 167 - "Tokenization Tokenizerloadcoordinatortests"
+Cohesion: 0.20
+Nodes (6): Bool, FileManager, Tokenizer, URL, URL, TokenizerLoadCoordinatorTests
+
+### Community 168 - "Command Main"
 Cohesion: 0.25
-Nodes (9): PrefillRouter, PrefillTokenExpertPair, Bool, Float16, Int, MTLBuffer, MTLCommandBuffer, MTLComputePipelineState (+1 more)
+Nodes (12): Arguments, ParseError, .description, help, invalidMode, missingRequired, missingValue, unknown (+4 more)
 
-### Community 151 - "Sampler"
-Cohesion: 0.24
-Nodes (14): LogitSoftcapSoftmax, Sample, SampleTopK64, MTLComputePipelineState, GenerationConfig, Sampler, Float, Int (+6 more)
-
-### Community 152 - "ChildChannelRegistry"
-Cohesion: 0.23
-Nodes (9): Channel, thought, visible, ChildChannelRegistry, State, Never, ObjectIdentifier, Task (+1 more)
-
-### Community 153 - "Model Loading States"
-Cohesion: 0.19
-Nodes (11): AppModelLoadState, cancelling, failed, loading, notLoaded, ready, unloading, Bool (+3 more)
-
-### Community 154 - "Model Lifecycle Actions"
-Cohesion: 0.18
-Nodes (11): AppModelAction, cancelInstall, cancelLoad, install, load, reload, retryLoad, unload (+3 more)
-
-### Community 155 - "Rig"
-Cohesion: 0.30
-Nodes (7): Rig, SampleTopK64Tests, Float, Int, MTLBuffer, UInt32, UInt64
-
-### Community 156 - "App Inference Client"
-Cohesion: 0.23
-Nodes (9): AnyObject, AppInferenceClient, AppInferenceMemoryReporting, AppInferenceTranscriptReporting, AppModelLifecycleClient, ReportingInferenceClient, AsyncThrowingStream, Error (+1 more)
-
-### Community 157 - "Server Termination Signals"
+### Community 169 - "Serverterminationsignals"
 Cohesion: 0.29
 Nodes (6): AsyncStream, Dispatch, DispatchSourceSignal, ServerTerminationSignals, Int32, ServerTerminationSignalTests
 
-### Community 158 - "Read Advice Utilities"
-Cohesion: 0.26
-Nodes (6): CInt, RDAdvice, RDAdviceCallResult, Bool, UInt64, RDAdviceProbeTests
-
-### Community 159 - "Prompt Preset Management"
-Cohesion: 0.18
-Nodes (6): GridItem, AppPromptPreset, String, PromptExamplesView, Void, AppPromptPresetTests
-
-### Community 160 - "Weight Encoding Kernels"
-Cohesion: 0.22
-Nodes (10): Float, Int, MTLBuffer, MTLCommandBuffer, UInt32, Float, Int, MTLBuffer (+2 more)
-
-### Community 161 - "Sub-byte Dequantization Kernels"
+### Community 170 - "Quant Dequant Subbyte"
 Cohesion: 0.44
 Nodes (12): dequant_int5_gemv_simd(), dequant_int5_qkv_gemv_simd(), dequant_int6_gemv_simd(), dequant_int8_gemv_generic(), dequant_int8_qkv_gemv_simd(), dequant_subbyte_gemv_body(), extract_subbyte_code(), constant (+4 more)
 
-### Community 162 - "Context Capacity Validation"
+### Community 171 - "Cli Clicontextcaptests"
 Cohesion: 0.18
 Nodes (4): ContextCap, Int, String, CLIContextCapTests
 
-### Community 163 - "DeltaNetDimensions"
-Cohesion: 0.14
-Nodes (11): DeltaNetConv, Float, Int, DeltaNetDimensions, DeltaNetStateStore, Bool, Float, Int (+3 more)
+### Community 172 - "Deltanet Deltanetconvstatetests"
+Cohesion: 0.22
+Nodes (6): DeltaNetConv, Float, Int, DeltaNetConvStateTests, Double, Float
 
-### Community 164 - "DeltaNet CPU Implementation"
-Cohesion: 0.36
-Nodes (6): DeltaNetCPUBlock, LayerWeights, Float, Int, Model, WeightsCache
+### Community 173 - "Deltanet Deltanetstate"
+Cohesion: 0.27
+Nodes (7): DeltaNetDimensions, .convStateCount, .recurrentStateCount, DeltaNetStateStore, Bool, Float, Int
 
-### Community 165 - "Generation Configuration Keys"
+### Community 174 - "Runtime Attentionquantselectiontests"
+Cohesion: 0.23
+Nodes (4): AttentionQuantSelectionTests, Int, PrefillAttentionQuantTests, Int
+
+### Community 175 - "Configuration Macappsettings"
 Cohesion: 0.15
 Nodes (13): CodingKeys, contextTokens, expertCacheSlots, newlineShortcut, prefillEnabled, sentPromptBehavior, showPromptExamples, temperature (+5 more)
 
-### Community 166 - "Repack CLI Parser"
-Cohesion: 0.28
-Nodes (11): Arguments, ParseError, help, invalidMode, missingRequired, missingValue, unknown, printError() (+3 more)
+### Community 176 - "Inference Generationtranscriptmailbox"
+Cohesion: 0.32
+Nodes (6): GenerationTranscriptMailbox, .completeText, Snapshot, State, String, GenerationTranscriptMailboxTests
 
-### Community 167 - "Server Argument Parsing"
-Cohesion: 0.22
-Nodes (8): ServerArgumentError, help, invalid, ServerArguments, Int, String, ServerArgumentTests, ServerContextCapTests
+### Community 177 - "Generation Outputpaneview"
+Cohesion: 0.21
+Nodes (10): CGRect, CGSize, ProposedViewSize, EmptyConversationLayout, EmptyPlaceholderIcon, .body, .placeholder, CGFloat (+2 more)
 
-### Community 168 - "Model Loader Tests"
-Cohesion: 0.23
-Nodes (8): ModelLoaderTests, Any, ArchConfig, Bool, String, UInt64, URL, Void
+### Community 178 - "Readme"
+Cohesion: 0.18
+Nodes (12): Expert Cache System, Gemma 4 26B-A4B Model, Metal Runtime Kernels, Qwen3.6-35B-A3B Plan, Qwen 3.6 35B-A3B Model, TurboFieldfare README, TurboFieldfare Library, TurboFieldfareCLI (+4 more)
 
-### Community 169 - "Text Range Mutation"
-Cohesion: 0.23
-Nodes (8): NSRange, Mutation, appended, finalized, none, rebuilt, Int, UpdateResult
-
-### Community 170 - "DeltaNet Parity Tests"
-Cohesion: 0.35
-Nodes (6): checkCommandBufferError(), DeltaNetParityTests, LCG, Bool, Float, UInt64
-
-### Community 171 - "Expert Cache Statistics"
-Cohesion: 0.24
-Nodes (3): ExpertCacheStats, Double, PreadExpertStreamerTests
-
-### Community 172 - "RoPE Pipeline Dispatch"
+### Community 179 - "Primitives Rope"
 Cohesion: 0.32
 Nodes (7): Float, Int, MTLBuffer, MTLCommandBuffer, MTLComputeCommandEncoder, MTLComputePipelineState, UInt32
 
-### Community 173 - "Int6 GEMV Implementation"
-Cohesion: 0.29
-Nodes (6): DequantInt6GEMV, MTLComputePipelineState, DequantInt6GEMVTests, Float, Int, UInt64
-
-### Community 174 - "Attention Parameter Schema"
+### Community 180 - "Prefill Prefill"
 Cohesion: 0.17
 Nodes (12): PrefillAttentionParams, headDim, kvTokenStrideElements, kvValidCount, numKVHeads, numQHeads, oTokenStrideElements, qTokenStrideElements (+4 more)
 
-### Community 175 - "Int8 Dequantization Kernels"
+### Community 181 - "Quant Dequant Int8"
 Cohesion: 0.41
 Nodes (11): dequant_int8_gemv_simd(), int8_fc_m(), int8_fc_n(), int8_gelu_pytorch_tanh(), int8_silu(), constant, device, kernel (+3 more)
 
-### Community 176 - "Runtime Prefill Policy"
+### Community 182 - "Configuration Runtimeconfiguration"
 Cohesion: 0.29
 Nodes (9): RuntimePrefillPolicy, chunked, off, Args, Bool, Float, Int, String (+1 more)
 
-### Community 177 - ".generate"
-Cohesion: 0.14
-Nodes (10): StreamingStopMatcher, Int, String, ServerInferenceEvent, content, toolCall, ServerModelSession, ServerPreparedRequest (+2 more)
+### Community 183 - "Deltanet Deltanetcpublock"
+Cohesion: 0.39
+Nodes (5): DeltaNetCPUBlock, LayerWeights, Float, Int, WeightsCache
 
-### Community 178 - "Generation Transcript Mailbox"
-Cohesion: 0.36
-Nodes (5): GenerationTranscriptMailbox, Snapshot, State, String, GenerationTranscriptMailboxTests
+### Community 184 - "State Appmodelloadstate"
+Cohesion: 0.18
+Nodes (11): AppGenerationPhase, decode, idle, prefill, AppModelLoadPhase, .label, preparingRunner, tokenizer (+3 more)
 
-### Community 179 - "Install Event Tracking"
+### Community 186 - "Diagnostics Statushudview"
 Cohesion: 0.17
-Nodes (12): AppModelInstallEvent, checking, copyingPayload, downloadingMetadata, finalizing, hashingOutput, installed, planning (+4 more)
+Nodes (12): Content, loading, pulse, quiet, steady, StatusHUDView, .body, .rateText (+4 more)
 
-### Community 181 - "Fused QKV Tests"
-Cohesion: 0.27
-Nodes (7): FusedQKVGEMVTests, Int, MTLBuffer, SplitMix64, UInt16, UInt64, UInt8
+### Community 187 - "Fixtures Scriptedlogitproducer"
+Cohesion: 0.23
+Nodes (9): .values, ScriptedLogitProducer, Step, argmax, vector, Float, Int, Int32 (+1 more)
 
-### Community 182 - "Qwen36 Model Loading"
+### Community 188 - "Kernels Layer3isolationtests"
 Cohesion: 0.29
-Nodes (3): Qwen36Layer3IsolationTests, Bool, Model
+Nodes (3): Qwen36Layer3IsolationTests, .isModelAvailable, Bool
 
-### Community 183 - "Repack CLI Tests"
+### Community 189 - "Command Repackclitests"
 Cohesion: 0.47
 Nodes (3): RepackCLITests, Int32, String
 
-### Community 184 - "Synthetic Snapshot Builder"
+### Community 190 - "Support Syntheticsnapshot"
 Cohesion: 0.41
 Nodes (7): Arch, Snapshot, Int, SplitMix64, String, UInt8, SyntheticSnapshot
 
-### Community 185 - "Qwen36 Reference Script"
-Cohesion: 0.27
-Nodes (6): HookedQwen3Next, main(), mlx_to_np(), Recursively convert an MLX pytree to numpy for safetensors., Qwen3Next model with hooks to capture per-layer activations., Run forward pass and capture all registered hooks.          The checkpoint's mlx
+### Community 191 - "Macpresentation Instructiontranscriptdocumentcontroller"
+Cohesion: 0.24
+Nodes (8): NSRange, Mutation, appended, finalized, none, rebuilt, Int, UpdateResult
 
-### Community 186 - "Resident Buffer Management"
+### Community 192 - "Scripts Dump Qwen36"
+Cohesion: 0.24
+Nodes (6): HookedQwen3Next, main(), mlx_to_np(), Recursively convert an MLX pytree to numpy for safetensors., Qwen3Next model with hooks to capture per-layer activations., Run forward pass and capture all registered hooks. The checkpoint's mlx_lm…
+
+### Community 193 - "Modelio Residentbuffertests"
 Cohesion: 0.22
 Nodes (7): ResidentBuffer, Int32, MTLBuffer, MTLDevice, UInt64, URL, ResidentBufferTests
 
-### Community 187 - "Fused Layer Tail"
-Cohesion: 0.29
-Nodes (7): FusedLayerTail, Float, Int, MTLBuffer, MTLCommandBuffer, MTLComputePipelineState, UInt32
-
-### Community 188 - "Prefill Metal Kernels"
+### Community 194 - "Prefill Prefill"
 Cohesion: 0.33
 Nodes (10): prefill_gelu_pytorch_tanh(), prefill_grouped_routed_moe_batched_down(), prefill_grouped_routed_moe_batched_phase1(), prefill_moe_int4_gemv_row_dev(), prefill_moe_reduce_token_major(), prefill_silu(), prefill_streamed_local_expert_id(), PrefillStreamedRoutedBlobsMSL (+2 more)
 
-### Community 189 - "RMSNorm Metal Kernels"
+### Community 195 - "Primitives Rmsnorm"
 Cohesion: 0.56
 Nodes (10): constant, device, threadgroup, uint, rms_block_inv(), rms_fc_d(), rmsnorm_bf16w(), rmsnorm_bf16w_perhead() (+2 more)
 
-### Community 190 - "Tokenizer.swift"
-Cohesion: 0.16
-Nodes (9): Element, Array, GFTokenizerLoadCoordinator, GFTokenizerLoadSource, local, pretrained, Int, Task (+1 more)
+### Community 196 - "Generation Outputpaneview"
+Cohesion: 0.25
+Nodes (9): OutputPaneView, .body, .copyResponseButton, .isLoadingModel, .needsModelLoad, .placeholderHint, .placeholderSymbol, .transcript (+1 more)
 
-### Community 191 - "RealForwardRunner.swift"
-Cohesion: 0.22
-Nodes (9): PrefillProjectionDispatch, qmm, repeatedGEMV, PrefillProjectionDispatchPolicy, PrefillProjectionFamily, kv, o, routed (+1 more)
-
-### Community 192 - "ServerPromptCacheMode"
-Cohesion: 0.14
-Nodes (9): FileManager, URL, Model, URL, ServerPromptCacheMode, off, singlePrefix, URL (+1 more)
-
-### Community 193 - "Model Load Phases"
-Cohesion: 0.20
-Nodes (10): AppGenerationPhase, decode, idle, prefill, AppModelLoadPhase, preparingRunner, tokenizer, validatingDirectory (+2 more)
-
-### Community 194 - "Install Progress Tracking"
+### Community 197 - "Workflow Modelinstallprogress"
 Cohesion: 0.18
 Nodes (10): ModelInstallProgress, checkingDisk, copyingPayload, downloadingMetadata, finalizing, hashingOutput, planning, reservingOutput (+2 more)
 
-### Community 195 - "Scripted Logit Production"
-Cohesion: 0.25
-Nodes (8): ScriptedLogitProducer, Step, argmax, vector, Float, Int, Int32, MTLBuffer
+### Community 198 - "Primitives Wht"
+Cohesion: 0.27
+Nodes (5): Float, WhtRef, Float, Int, WHTReferenceTests
 
-### Community 196 - "RoPE Reference Implementation"
-Cohesion: 0.25
-Nodes (7): RopeRef, Float, Int, RoPEReferenceTests, Float, Int, UInt64
-
-### Community 197 - "Logit Softcap Reference"
-Cohesion: 0.36
-Nodes (6): LogitSoftcapSoftmaxRef, Float, LogitSoftcapSoftmaxTests, Float, Float16, Int
-
-### Community 198 - "Expert Streamer Tests"
+### Community 199 - "Epilogues Prefillpostattentionsetup"
 Cohesion: 0.31
-Nodes (7): PreadExpertStreamerTests, Int, MTLBuffer, String, UInt64, UInt8, URL
+Nodes (7): PrefillPostAttentionSetup, Float, Int, MTLBuffer, MTLCommandBuffer, MTLComputePipelineState, UInt32
 
-### Community 199 - "Sampler Unit Tests"
-Cohesion: 0.44
-Nodes (5): SampleTests, Float, Float16, UInt32, UInt64
+### Community 200 - "Inference Realforwardrunner"
+Cohesion: 0.20
+Nodes (9): PrefillProjectionDispatch, qmm, repeatedGEMV, PrefillProjectionDispatchPolicy, PrefillProjectionFamily, kv, o, routed (+1 more)
 
-### Community 200 - "Metal Rope Scaling"
-Cohesion: 0.33
-Nodes (7): MetalRopeScalingParams, Float, Float, Int, MTLBuffer, MTLCommandBuffer, UInt32
+### Community 202 - "Macpresentation Genericerrorbannerpolicytests"
+Cohesion: 0.20
+Nodes (4): .body, GenericErrorBannerPolicy, Bool, GenericErrorBannerPolicyTests
 
-### Community 201 - "Fused Post-Attention Setup"
-Cohesion: 0.31
-Nodes (7): FusedPostAttentionSetup, Float, Int, MTLBuffer, MTLCommandBuffer, MTLComputePipelineState, UInt32
-
-### Community 202 - "Int4 Greedy Decoding"
-Cohesion: 0.29
-Nodes (7): LMHeadChainInt4, Float, Int, MTLBuffer, MTLCommandBuffer, MTLComputePipelineState, UInt32
-
-### Community 203 - "Expert Gate Weights"
+### Community 203 - "Format Gturbojson"
 Cohesion: 0.42
-Nodes (6): SharedExpertGateWeights, Float, Float16, Int, Model, UnsafePointer
+Nodes (7): FileEntry, GTurboJSON, QuantBitWidths, Data, Int, String, UInt64
 
-### Community 204 - "Prompt Submission Tests"
+### Community 204 - "Prefill Prefillpostattentionsetuptests"
+Cohesion: 0.40
+Nodes (6): PrefillPostAttentionSetupTests, Float, Float16, Int, MTLBuffer, SplitMix64
+
+### Community 205 - "Macpresentation Promptsubmissionpolicytests"
 Cohesion: 0.38
 Nodes (3): PromptSubmissionPolicyTests, Bool, EventModifiers
 
-### Community 205 - "Conversation UI Layout"
-Cohesion: 0.31
-Nodes (7): CGRect, CGSize, ProposedViewSize, EmptyConversationLayout, CGFloat, Layout, Subviews
+### Community 207 - "Generation Promptexamplesview"
+Cohesion: 0.25
+Nodes (9): GridItem, .conversationChrome, ErrorBanner, PromptExamplesView, .body, .columns, .moreExamples, .primaryCards (+1 more)
 
-### Community 206 - "Unix Socket Decoding"
+### Community 208 - "Turbofieldfaredecodeprotocol Decodeunixsocket"
 Cohesion: 0.44
 Nodes (5): sockaddr_un, DecodeUnixSocket, FileHandle, Int32, String
 
-### Community 207 - "Status HUD Phases"
-Cohesion: 0.22
-Nodes (9): Content, loading, pulse, quiet, steady, PhaseLabel, StatusHUDView, Bool (+1 more)
+### Community 209 - "Modelio Packedexpertslayouttests"
+Cohesion: 0.39
+Nodes (3): URL, PackedExpertsLayoutTests, URL
 
-### Community 208 - "Error Banner Policy"
-Cohesion: 0.22
-Nodes (3): GenericErrorBannerPolicy, Bool, GenericErrorBannerPolicyTests
+### Community 210 - "Fusions Fusedpostattentionsetup"
+Cohesion: 0.36
+Nodes (7): FusedPostAttentionSetup, Float, Int, MTLBuffer, MTLCommandBuffer, MTLComputePipelineState, UInt32
 
-### Community 209 - "Message Execution Runner"
+### Community 211 - "Primitives Prefillprimitives"
+Cohesion: 0.39
+Nodes (6): PrefillEmbedLookupInt4, Float, Int, MTLBuffer, MTLCommandBuffer, UInt32
+
+### Community 212 - "Prefill Qwen36sequentialprefilltests"
+Cohesion: 0.25
+Nodes (5): .prefillRoute, PrefillRoutePolicy, Qwen36SequentialPrefillTests, .isModelAvailable, Bool
+
+### Community 213 - "Inference Sharedexpertgate"
+Cohesion: 0.47
+Nodes (5): SharedExpertGateWeights, Float, Float16, Int, UnsafePointer
+
+### Community 214 - "Installation Appmodelinstallationprobetests"
+Cohesion: 0.33
+Nodes (3): AppModelInstallationProbe, URL, AppModelInstallationProbeTests
+
+### Community 215 - "Installation Huggingfacesearchview"
+Cohesion: 0.33
+Nodes (7): HuggingFaceSearchView, .body, Never, String, Task, UInt64, Void
+
+### Community 216 - "Turbofieldfarecli Run"
 Cohesion: 0.42
 Nodes (7): errored(), MessageJSON, run(), RunResult, FileHandle, Int32, String
 
-### Community 210 - "Service Event States"
-Cohesion: 0.22
-Nodes (9): DecodeServiceEventKind, cancelled, failed, finished, loading, prefill, ready, snapshot (+1 more)
+### Community 217 - "Writing Boundedscratch"
+Cohesion: 0.33
+Nodes (5): BoundedScratch, .zeroBuffer, Int, UnsafeMutableRawBufferPointer, UnsafeRawBufferPointer
 
-### Community 211 - "Streaming Kernel Tests"
+### Community 218 - "Moe Moe"
 Cohesion: 0.42
-Nodes (5): Sizes, StreamingKernelIntegrationTests, Float, Int, UInt8
+Nodes (4): MoeRef, Float, Int, MoEReferenceTests
 
-### Community 212 - "Int5 GEMV Tests"
-Cohesion: 0.44
-Nodes (4): DequantInt5GEMVTests, Float, Int, UInt64
+### Community 219 - "Turbofieldfaredecodeprotocol Decodeprotocol"
+Cohesion: 0.25
+Nodes (8): Error, DecodeFrameError, oversized, unexpectedEOF, RouterTestError, allocationFailed, TestGenerationError, sensitiveFailure
 
-### Community 213 - "URL Loading Protocol"
-Cohesion: 0.28
-Nodes (4): HangingInstallURLProtocol, Bool, URLRequest, URLProtocol
-
-### Community 214 - "App Delegate Lifecycle"
+### Community 220 - "App Turbofieldfaremacapp"
 Cohesion: 0.25
 Nodes (6): Notification, NSApplication, NSApplicationDelegate, NSObject, ForegroundAppDelegate, Bool
 
-### Community 215 - "Random Number Generation"
+### Community 221 - "Prng Splitmix64"
 Cohesion: 0.32
 Nodes (4): RandomNumberGenerator, SplitMix64, Float, UInt64
 
-### Community 216 - "Metal Buffer Encoding"
-Cohesion: 0.29
-Nodes (7): Shape, Bool, Float, Int, MTLBuffer, MTLCommandBuffer, UInt32
+### Community 222 - "Streaming Preadexpertstreamer"
+Cohesion: 0.25
+Nodes (6): ExpertCachePolicy, lfu, lru, Int32, MTLDevice, PublicAPISignatureCompatibilityTests
 
-### Community 217 - ".encode"
-Cohesion: 0.50
-Nodes (5): Float, Int, MTLBuffer, MTLCommandBuffer, UInt32
+### Community 223 - "Fusions Fusedqkvgemv"
+Cohesion: 0.32
+Nodes (7): FusedQKVGEMV, Shape, Int, MTLBuffer, MTLCommandBuffer, MTLComputePipelineState, UInt32
 
-### Community 218 - "RoPE Prefill Parameters"
+### Community 224 - "Prefill Prefill"
 Cohesion: 0.29
 Nodes (8): prefill_compute_rope_freq(), prefill_rope_apply_neox_pair(), RopeScalingParams, beta_fast, beta_slow, enabled, factor, original_max_position_embeddings
 
-### Community 219 - "Prompt Submission Logic"
-Cohesion: 0.25
-Nodes (7): PromptSubmissionDecision, consume, deferToEditor, submit, PromptSubmissionPolicy, Bool, EventModifiers
-
-### Community 220 - "Model Manifest Encoding"
-Cohesion: 0.44
-Nodes (7): FileEntry, GTurboJSON, QuantBitWidths, Data, Int, String, UInt64
-
-### Community 221 - "Bounded Memory Buffer"
-Cohesion: 0.36
-Nodes (4): BoundedScratch, Int, UnsafeMutableRawBufferPointer, UnsafeRawBufferPointer
-
-### Community 223 - "Fused QKV Tests"
-Cohesion: 0.32
-Nodes (6): FusedQKVPipelineTests, Int, MTLBuffer, UInt16, UInt64, UInt8
-
-### Community 224 - "Int8 GEMV Tests"
-Cohesion: 0.43
-Nodes (4): DequantInt8GEMVTests, Float, Int, UInt64
-
-### Community 225 - "Generator Stop Reasons"
+### Community 225 - "Streaming Preadexpertstreamertests"
 Cohesion: 0.29
-Nodes (6): StopReason, endOfTurn, eos, maxTokens, stopString, toolCalls
+Nodes (5): Int, MTLBuffer, UInt64, UInt8, URL
 
-### Community 226 - "Prefill Routing Policy"
-Cohesion: 0.33
-Nodes (3): PrefillRoutePolicy, Qwen36SequentialPrefillTests, Bool
+### Community 226 - "Inference Realforwardrunner"
+Cohesion: 0.29
+Nodes (5): RDAdvicePolicyMode, adaptive, bounded, `default`, off
 
-### Community 227 - "HuggingFace Search UI"
-Cohesion: 0.38
-Nodes (6): HuggingFaceSearchView, Never, String, Task, UInt64, Void
+### Community 227 - "Format Tensormetadata"
+Cohesion: 0.29
+Nodes (7): Dtype, bf16, .elementBytes, fp16, fp32, u32, Int
 
-### Community 228 - "Embedding Lookup Reference"
+### Community 228 - "Quant Embedlookup"
 Cohesion: 0.48
 Nodes (5): EmbedLookupRef, Float, Int, UInt16, UInt8
 
-### Community 229 - "Markdown Link Validation"
+### Community 229 - "Scripts Check Markdown"
 Cohesion: 0.47
 Nodes (4): anchors_for(), github_heading_slug(), local_targets(), without_inline_code()
 
-### Community 230 - "DeltaNet Oracle Script"
+### Community 230 - "Scripts Deltanet Oracle"
 Cohesion: 0.60
 Nodes (5): main(), rms_norm(), sigmoid(), softplus(), swift_floats()
 
-### Community 231 - "Metal Command Encoding"
+### Community 231 - "Quant Embedlookupint4"
 Cohesion: 0.33
 Nodes (5): Float, Int, MTLBuffer, MTLCommandBuffer, UInt32
 
-### Community 232 - "Metal Prefill Kernels"
+### Community 232 - "Tensorcore Tensorops"
 Cohesion: 0.33
 Nodes (5): constant, device, kernel, uint3, mpp_prefill_affine_threadgroup_f16()
 
-### Community 233 - "Task Execution Drive"
+### Community 233 - "Command Main"
 Cohesion: 0.47
 Nodes (6): drive(), RunBox, Int32, Never, Task, Void
 
-### Community 235 - "Softmax Reference Tests"
-Cohesion: 0.47
-Nodes (4): LogitSoftcapSoftmaxReferenceTests, Float, Int, UInt64
+### Community 234 - "Verification Verifiedinstallreceiptwriter"
+Cohesion: 0.33
+Nodes (4): Data, String, UInt64, VerifiedInstallReceiptWriter
 
-### Community 236 - "Per-Head Metal Encoding"
+### Community 235 - "Fusions Elementwiseadd"
 Cohesion: 0.40
 Nodes (4): Int, MTLBuffer, MTLCommandBuffer, UInt32
 
-### Community 237 - ".encode"
+### Community 236 - "Quant Dequantint5gemv"
 Cohesion: 0.40
 Nodes (4): Int, MTLBuffer, MTLCommandBuffer, UInt32
 
-### Community 238 - ".encode"
-Cohesion: 0.40
-Nodes (4): Int, MTLBuffer, MTLCommandBuffer, UInt32
-
-### Community 239 - "Metal Compute Encoding"
-Cohesion: 0.40
-Nodes (4): Int, MTLBuffer, MTLCommandBuffer, UInt32
-
-### Community 240 - "Prefill Token Pairs"
+### Community 237 - "Prefill Prefill"
 Cohesion: 0.40
 Nodes (5): PrefillTokenExpertPairMSL, expert, rank, token, weight_bits_and_reserved
 
-### Community 241 - "App Installation Status"
-Cohesion: 0.40
-Nodes (5): AppModelInstallationStatus, complete, missing, partial, String
+### Community 238 - "Generation Outputpaneview"
+Cohesion: 0.50
+Nodes (4): LoadingModelText, .body, .emptyPlaceholderContent, Int
 
-### Community 245 - "HITL Loop Script"
+### Community 239 - "Community 239"
+Cohesion: 0.67
+Nodes (4): Ask Matt Skill, Domain Modeling Skill, Grilling Skill, Wayfinder Skill
+
+### Community 240 - "Scripts Hitl-loop"
 Cohesion: 0.83
 Nodes (3): capture(), hitl-loop.template.sh script, step()
 
-### Community 246 - "Domain Modeling Agents"
+### Community 242 - "Moe Sharedexpertint8"
 Cohesion: 0.50
-Nodes (4): Domain Modeling Agent, Grill with Docs Agent, Improve Codebase Architecture Agent, Domain Docs
+Nodes (4): CustomStringConvertible, SharedExpertInt8Error, .description, String
 
-### Community 247 - "DeltaNet Stage Dumper"
+### Community 243 - "Community 243"
+Cohesion: 0.50
+Nodes (4): PF-12: Staged affine MPP INT4, PF-15: Batched routed MoE, PF-17: Apple10 TensorOps full-prefill attention, METH-01: Numerical reordering needs a quality oracle
+
+### Community 244 - "Scripts Dump Qwen36"
 Cohesion: 0.67
 Nodes (3): main(), mlx_to_np(), # NOTE: hidden_out.0 in the main fixture is captured AFTER the full
 
-### Community 248 - "Metal Threadgroup Kernels"
+### Community 245 - "Prefill Prefill"
 Cohesion: 0.67
 Nodes (4): threadgroup, prefill_attention_tg_sum(), prefill_attention_tg_sum_single_bank(), prefill_moe_int4_gemv_row_tg()
 
-### Community 249 - "Sampling Path Strategy"
-Cohesion: 0.50
-Nodes (4): SamplePath, gpuSampled, greedyGPU, hostPenalty
-
-### Community 253 - "Run State Machine"
-Cohesion: 0.67
-Nodes (3): RunState, idle, running
-
 ## Knowledge Gaps
-- **595 isolated node(s):** `PackageDescription`, `test.sh script`, `noDevice`, `noQueue`, `bool` (+590 more)
+- **775 isolated node(s):** `PackageDescription`, `test.sh script`, `noDevice`, `noQueue`, `.description` (+770 more)
   These have ≤1 connection - possible missing edges or undocumented components.
-- **104 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
+- **45 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `Foundation` connect `Core System Dependencies` to `Metal Compute Kernels`, `Affine Quantization Logic`, `AppRuntimeOptions`, `Model Validation Testing`, `Model Installation Client`, `Tensor Metadata Loading`, `File System Access`, `ServerHTTPHandler`, `Posix Memory Mapping`, `macOS App UI`, `Resident Index Codec`, `App Input Behavior`, `runRawCompletion`, `Prefill Layer Encoding`, `Prefill Chunk Management`, `Model Installer Tasks`, `OpenAI API Models`, `Remote Data Transfer`, `Expert Layout Reader`, `Local Checkpoint Repacking`, `AppGenerationRequest`, `Sub-Byte Quantization`, `JSON Value Handling`, `Seed Tree Randomization`, `Expert Layout Codec`, `DeltaNet Recurrent Layers`, `Remote Streaming Installer`, `MoE Tile Scheduling`, `Model Manifest Codec`, `N-Gram Speculative Decoding`, `HuggingFace Remote Source`, `GFTokenizer`, `Remote Download Session`, `Prefill MoE Grouping`, `Remote Retry Policy`, `Gemma Tool Parser`, `Model Manifest Reader`, `Remote Payload Tests`, `Verified Install Receipt`, `Range Copy Planning`, `App Model Synchronization`, `Expert Streamer Errors`, `HTTPServerTests.swift`, `Model Source Selection`, `Model Catalog UI`, `Model Install Readiness`, `GTurbo Format Validation`, `Tool Call Parsing`, `DecodeRuntimeOptions`, `Installation Locking`, `Architecture Configuration`, `Int8 Shared Expert`, `Model Component Source`, `Metric Formatting`, `HuggingFace API Client`, `Draft Verification Service`, `Model Layout Repacker`, `Remote Install Checkpoints`, `Server Logging`, `App Presentation State`, `Safetensors Header Parsing`, `Inference Client Infrastructure`, `Model Topology Types`, `Sampler`, `App Inference Client`, `Read Advice Utilities`, `Prompt Preset Management`, `DeltaNetDimensions`, `Repack CLI Parser`, `.generate`, `Synthetic Snapshot Builder`, `Tokenizer.swift`, `RealForwardRunner.swift`, `Model Load Phases`, `Install Progress Tracking`, `Message Execution Runner`, `Bounded Memory Buffer`, `Model Loader Symlink Tests`, `Generator Stop Reasons`, `Lazy Streaming Tests`, `CLI Command Core`, `Qwen Model Loading`, `Remote Chunk Policy`?**
-  _High betweenness centrality (0.133) - this node is a cross-community bridge._
-- **Why does `MetalContext` connect `Metal Compute Kernels` to `Prefill QKV Epilogue`, `Affine Quantization Logic`, `Core System Dependencies`, `Int4 GEMV Tests`, `.run`, `Metal Shader Compilation`, `QKV Epilogue Tests`, `KV Cache Management`, `Expert Cache Planning`, `RealForwardRunner`, `runRawCompletion`, `Prefill Attention Pipeline`, `Prefill Layer Encoding`, `Prefill Router Encoding`, `Sampler`, `Attention Kernel Tests`, `OpenAI API Models`, `Rig`, `Int4 Prefill Matrix-Multiplication`, `Shared Expert Logits`, `Seed Tree Randomization`, `DeltaNet Parity Tests`, `Expert Cache Statistics`, `Int6 GEMV Implementation`, `Resident Index Reader`, `MoE Tile Scheduling`, `.generate`, `Fused QKV GEMV`, `Fused QKV Tests`, `Fused Layer Tail`, `Attention Mechanism Tests`, `ServerPromptCacheMode`, `.executePrefillChunk`, `Logit Softcap Reference`, `Sampler Unit Tests`, `Fused Post-Attention Setup`, `Int4 Greedy Decoding`, `Activation Function Implementation`, `Message Execution Runner`, `Expert Cache Planning`, `Streaming Kernel Tests`, `Int5 GEMV Tests`, `DeltaNet GPU Dispatch`, `Prefill Scratch Allocation`, `Expert Cache Phase`, `Attention Geometry Encoding`, `Int8 GEMV Tests`, `Prefill Routing Policy`, `.encode`, `Prefill Attention Setup`, `Prefill Router Tests`, `Streamed MoE Prefill`, `Shared Expert Prefill`, `RMSNorm Reference Implementation`, `Fused GEMV Tests`, `Sampler Logic Tests`, `Prefill Attention Tests`?**
-  _High betweenness centrality (0.121) - this node is a cross-community bridge._
-- **Why does `AppModel` connect `Model Installation Client` to `AppRuntimeOptions`, `Model Installation States`, `.run`, `Model Installation Probing`, `macOS App UI`, `App Presentation State`, `App Input Behavior`, `Prefill Layer Encoding`, `Model Installation Tests`, `Model Loading States`, `Model Lifecycle Actions`, `App Inference Client`, `Diagnostic UI Components`, `Generation Transcript Mailbox`, `Model Load Phases`, `App Scroll View`, `App Model Synchronization`, `Status HUD Phases`, `Model Source Selection`, `Model Catalog UI`, `Model Install Readiness`, `HuggingFace Search UI`, `Fake Inference Testing`, `App Installation Status`, `Run State Machine`?**
-  _High betweenness centrality (0.062) - this node is a cross-community bridge._
-- **Are the 104 inferred relationships involving `MetalContext` (e.g. with `.executePrefillChunk()` and `.produceToken()`) actually correct?**
-  _`MetalContext` has 104 INFERRED edges - model-reasoned connections that need verification._
+- **Why does `Foundation` connect `Metal Context & Model Directory` to `App Model Installer Client`, `Install Probe & Runtime Tests`, `Sub-byte Quantization Rows`, `Gemma Tool Call Parser`, `Index Loader & Tensor Metadata`, `Int4/Int8 Affine Quantization`, `Install Status & Run State`, `Raw Completion & Decode Progress`, `SwiftUI App Scene & Shortcuts`, `Posix File IO & Mmap`, `NIO HTTP Server`, `Checkpoint Repacker & Validator`, `App Prompt Presets & Options`, `Installation Appmodelinstalldescriptor`, `Workflow Errors`, `Macpresentation Responsemarkdownrenderertests`, `Tokenization Tokenizer`, `Prefill Prefillruntimeconfig`, `Moe Prefillgroupedroutedmoe`, `System Diskspacechecker`, `Inference Appgenerationrequesttests`, `Remote Remoterangetransfer`, `Inference Realforwardrunner`, `Serverpromptcache`, `Diagnostics Appdiagnostics`, `Remote Huggingfaceremote`, `Moe Prefillmoegrouping`, `Turbofieldfareformat Gturbopackedexpertslayoutv1`, `Deltanet Deltanetruletests`, `Runtime Ngramspeculatortests`, `Turbofieldfareformat Gturbomanifestv1`, `Remote Remotestreamingrepacker`, `Remote Supportedmodelsource`, `Planning Rangecopyplanner`, `Httpservertests`, `Modelio Modelruntimeschemavalidationtests`, `Turbofieldfareformat Gturboresidentindexv1`, `Remote Remotedownloadsession`, `Installation Huggingfacemodelsearchclient`, `Turbofieldfaredecodeprotocol Decodeprotocol`, `Remote Remotepayloadcopytests`, `Modelio Manifestreader`, `State Appmodel`, `Installation Downloadetaestimator`, `Installation Modelpickerview`, `Attention Prefillattentiontests`, `Attention Attention`, `Moe Moe`, `Serverarguments`, `Format Safetensors`, `Modelio Verifiedinstallreceipt`, `Streaming Expertstreamer`, `Remote Remoteretry`, `Turbofieldfareformat Gturboformatv1`, `Format Archinfotests`, `Remote Remoteinstallcheckpoint`, `Inference Draftverifier`, `Diagnostics Metricformat`, `Modelio Modeltypes`, `Inference Appinferenceerror`, `State Apppresentationstate`, `State Appmodelservicereportingtests`, `Modelio Sha256verifier`, `Serverlog`, `Generation Generator`, `Tokenization Structuredassistantdecoder`, `Streaming Rdadvice`, `Generation Streamingstopmatcher`, `Command Main`, `Deltanet Deltanetconvstatetests`, `Deltanet Deltanetstate`, `State Appmodelloadstate`, `Support Syntheticsnapshot`, `Workflow Modelinstallprogress`, `Primitives Wht`, `Turbofieldfaredecodeservice Decodeserviceoutboxtests`, `Fusions Lmheadchainint4tests`, `Turbofieldfarecli Run`, `Writing Boundedscratch`, `Verification Verifiedinstallreceiptwriter`, `Configuration Apppromptpresettests`, `Cli Clicontextcaptests`, `Remote Remotechunkpolicy`?**
+  _High betweenness centrality (0.154) - this node is a cross-community bridge._
+- **Why does `MetalContext` connect `Metal Pipeline Compilation` to `Streaming Preadexpertstreamer`, `Metal Context & Model Directory`, `Int4 Embed Lookup & Buffers`, `Sub-byte Quantization Rows`, `Resident Index & TensorView`, `Int4/Int8 Affine Quantization`, `Install Status & Run State`, `Fusions Fusedqkvgemvgenerictests`, `Raw Completion & Decode Progress`, `Quant Dequantint4gemvtests`, `Sampling Logitsoftcapsoftmaxtests`, `App Stop Reason & Memory Sampler`, `Attention Attentiongatingtests`, `Quant Dequantint6gemvtests`, `Quant Dequantint8gemvtests`, `Sampling Kernels`, `KV Cache Manager`, `Inference Realforwardrunner`, `Moe Prefillrouter`, `Moe Prefillgroupedroutedmoe`, `Inference Realforwardrunner`, `Fusions Fusedqkvgemvgeneric`, `Primitives Rmsnorm`, `Attention Prefillattention`, `Serverpromptcache`, `Prefill Prefillaffinetests`, `Prefill Prefillchunkscratch`, `Attention Attentiontests`, `Modelio Modeltypes`, `Fusions Fusedqkvepiloguetests`, `Moe Routertopktests`, `Tensorcore Mppprefillint4qmmtests`, `Prefill Prefillruntimeconfig`, `Streaming Preadexpertstreamertests+cacheplanning`, `Epilogues Prefillpostattentionsetup`, `Prefill Prefillpostattentionsetuptests`, `Prefill Prefillperheadnormtests`, `Prefill Prefillsharedexperttests`, `Prefill Prefillqkvepiloguetests`, `Deltanet Deltanetmetalblock`, `Prefill Qwen36sequentialprefilltests`, `Turbofieldfarecli Run`, `Prefill Prefillgroupedroutedmoetests`, `Attention Prefillattentiontests`, `Moe Sharedexpertint4`, `Attention Attention`, `Generation Samplertests`, `Prefill Prefillroutertests`, `Deltanet Deltanetmetalparitytests`, `Prefill Prefilllayertailtests`, `Reference Rmsnormreferencetests`?**
+  _High betweenness centrality (0.130) - this node is a cross-community bridge._
+- **Why does `AppModel` connect `App Model Installer Client` to `Inference Appinferenceerror`, `State Apppresentationstate`, `State Appmodelloadstate`, `Install Status & Run State`, `SwiftUI App Scene & Shortcuts`, `State Appmodelservicereportingtests`, `App Stop Reason & Memory Sampler`, `State Apppresentationstate`, `App Prompt Presets & Options`, `Model Load & Install Tests`, `Generate Control UI`, `Generation Promptcomposerview`, `Installation Modelinstallview`, `Diagnostics Inspectorview`, `Installation Appmodelinstalldescriptor`, `Inference Appgenerationrequesttests`, `Diagnostics Appdiagnostics`, `Inference Generationtranscriptmailbox`, `Remote Supportedmodelsource`, `State Appmodelloadstate`, `Diagnostics Statushudview`, `Generation Outputpaneview`, `Installation Appmodelinstallstate`, `Generation Promptexamplesview`, `Diagnostics Runnerdiagnosticssection`, `State Appmodel`, `Installation Huggingfacesearchview`, `Installation Downloadetaestimator`, `Installation Modelpickerview`, `System Installlock`?**
+  _High betweenness centrality (0.043) - this node is a cross-community bridge._
+- **Are the 105 inferred relationships involving `MetalContext` (e.g. with `.executePrefillChunk()` and `.produceToken()`) actually correct?**
+  _`MetalContext` has 105 INFERRED edges - model-reasoned connections that need verification._
+- **Are the 43 inferred relationships involving `AppModel` (e.g. with `AppRuntimeOptions` and `DownloadETAEstimator`) actually correct?**
+  _`AppModel` has 43 INFERRED edges - model-reasoned connections that need verification._
 - **What connects `PackageDescription`, `test.sh script`, `noDevice` to the rest of the system?**
-  _595 weakly-connected nodes found - possible documentation gaps or missing edges._
-- **Should `Metal Compute Kernels` be split into smaller, more focused modules?**
-  _Cohesion score 0.044537114261884905 - nodes in this community are weakly interconnected._
-- **Should `Affine Quantization Logic` be split into smaller, more focused modules?**
-  _Cohesion score 0.04926819212533498 - nodes in this community are weakly interconnected._
+  _775 weakly-connected nodes found - possible documentation gaps or missing edges._
+- **Should `Int4 Embed Lookup & Buffers` be split into smaller, more focused modules?**
+  _Cohesion score 0.04649694929518199 - nodes in this community are weakly interconnected._

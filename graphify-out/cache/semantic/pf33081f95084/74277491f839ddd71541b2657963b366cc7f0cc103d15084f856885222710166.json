@@ -1,1 +1,1 @@
-{"nodes": [{"id": "domain_modeling_skill", "label": "Domain Modeling", "file_type": "document", "source_file": ".agents/skills/domain-modeling/SKILL.md"}], "edges": [], "hyperedges": []}
+{"nodes": [{"id": "domain_modeling_skill", "label": "Domain Modeling", "file_type": "document", "source_file": ".agents/skills/domain-modeling/SKILL.md"}, {"id": "skill_domain_modeling", "label": "Domain Modeling Skill", "file_type": "document", "source_file": ".agents/skills/domain-modeling/SKILL.md"}], "edges": [], "hyperedges": []}
