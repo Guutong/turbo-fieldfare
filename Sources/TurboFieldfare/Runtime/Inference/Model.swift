@@ -381,8 +381,7 @@ public struct Model {
     /// touches reuse the open backend. The backend resolves the expert to an
     /// cache-slot `(MTLBuffer, offset)` pair.
     public func routedExpert(layer L: Int, expert E: Int) throws -> TensorView {
-        try ensureLayerOpened(L)
-        let backend = streamersLock.withLock { streamersBox.streamers[L]! }
+        let backend = try ensureLayerOpened(L)
         let r = try backend.loadExpert(layer: 0, expert: E)
         return TensorView(
             buffer: r.buffer,
@@ -401,12 +400,12 @@ public struct Model {
     public nonisolated(unsafe) static var debugQueueSyncNanos: UInt64 = 0
     public nonisolated(unsafe) static var debugQueueSyncCalls: UInt64 = 0
 
-    /// Open layer L's file + verify SHA, idempotent.
-    func ensureLayerOpened(_ L: Int) throws {
+    /// Open layer L's file + verify SHA, idempotent. Returns the streamer.
+    func ensureLayerOpened(_ L: Int) throws -> PreadExpertStreamer {
         // P8-3: fast-path check without lock to avoid contention overhead.
         // Safe: if streamers[L] is non-nil, layer is already open and stable.
-        if streamersBox.streamers[L] != nil {
-            return
+        if let streamer = streamersBox.streamers[L] {
+            return streamer
         }
 
         let t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
@@ -414,8 +413,9 @@ public struct Model {
             Model.debugQueueSyncNanos &+= clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0
             Model.debugQueueSyncCalls &+= 1
         }
-        try streamersLock.withLock {
+        return try streamersLock.withLock {
             try openLayerLocked(L)
+            return streamersBox.streamers[L]!
         }
     }
 
