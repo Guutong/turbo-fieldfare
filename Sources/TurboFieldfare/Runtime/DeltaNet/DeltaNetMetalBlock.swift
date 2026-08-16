@@ -1,6 +1,13 @@
 import Foundation
 import Metal
 
+/// P8-1: Opaque snapshot of DeltaNet conv/recurrent state for spec decode rollback.
+/// File-scope so DraftVerifier can reference it without nested type qualification.
+struct DeltaNetStateSnapshot: Sendable {
+    let convBytes: [Data?]
+    let recurrentBytes: [Data?]
+}
+
 /// P4-1: the DeltaNet decode step on the GPU, with the conv and recurrent
 /// state resident in Metal buffers.
 ///
@@ -182,7 +189,39 @@ final class DeltaNetMetalBlock {
                 if let r = recurrentState[L] { memset(r.contents(), 0, r.length) }
             }
         }
+
+        /// P8-1: Snapshot conv/recurrent state for speculative decoding rollback.
+        /// Returns opaque snapshot that can be restored via restoreSnapshot().
+        func snapshot() -> DeltaNetStateSnapshot {
+            var convBytes: [Data?] = Array(repeating: nil, count: numLayers)
+            var recurrentBytes: [Data?] = Array(repeating: nil, count: numLayers)
+            for L in 0..<numLayers {
+                if let c = convState[L] {
+                    convBytes[L] = Data(bytes: c.contents(), count: c.length)
+                }
+                if let r = recurrentState[L] {
+                    recurrentBytes[L] = Data(bytes: r.contents(), count: r.length)
+                }
+            }
+            return DeltaNetStateSnapshot(convBytes: convBytes,
+                                          recurrentBytes: recurrentBytes)
+        }
+
+        /// P8-1: Restore conv/recurrent state from a prior snapshot.
+        func restoreSnapshot(_ snapshot: DeltaNetStateSnapshot) {
+            for L in 0..<numLayers {
+                if let c = convState[L], let data = snapshot.convBytes[L] {
+                    data.copyBytes(to: c.contents().assumingMemoryBound(to: UInt8.self),
+                                   count: c.length)
+                }
+                if let r = recurrentState[L], let data = snapshot.recurrentBytes[L] {
+                    data.copyBytes(to: r.contents().assumingMemoryBound(to: UInt8.self),
+                                   count: r.length)
+                }
+            }
+        }
     }
+
 
     // MARK: - Pipelines and scratch.
 

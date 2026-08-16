@@ -18,6 +18,7 @@ public struct Args: Equatable, Sendable {
     public var prefillPolicy: RuntimePrefillPolicy
     public var prefillChunkTokens: Int
     public var rdadvisePolicy: RDAdvicePolicyMode
+    public var specDecode: Bool
 
     public init(model: String,
                 prompt: String? = nil,
@@ -35,7 +36,8 @@ public struct Args: Equatable, Sendable {
                 expertCachePolicy: RuntimeExpertCachePolicy = RuntimeConfiguration.production.expertCachePolicy,
                 prefillPolicy: RuntimePrefillPolicy = RuntimeConfiguration.production.prefillPolicy,
                 prefillChunkTokens: Int = RuntimeConfiguration.production.prefillChunkTokens,
-                rdadvisePolicy: RDAdvicePolicyMode = RuntimeConfiguration.production.rdadvisePolicy) {
+                rdadvisePolicy: RDAdvicePolicyMode = RuntimeConfiguration.production.rdadvisePolicy,
+                specDecode: Bool = false) {
         self.model = model
         self.prompt = prompt
         self.messagesFile = messagesFile
@@ -53,6 +55,7 @@ public struct Args: Equatable, Sendable {
         self.prefillPolicy = prefillPolicy
         self.prefillChunkTokens = prefillChunkTokens
         self.rdadvisePolicy = rdadvisePolicy
+        self.specDecode = specDecode
     }
 }
 
@@ -107,6 +110,7 @@ extension Args {
                                  Chunked prefill requires 16 or more cache slots.
       --prefill-chunk-tokens <n> Prefill chunk size: 32, 64, or 128 (default 128).
       --rdadvise <s>             Read-advice policy: off, default, bounded, or adaptive (default off).
+      --spec-decode              Enable n-gram speculative decoding (greedy only, ~1.5-2x tok/s).
       --help                     Show this message.
     """
 
@@ -133,7 +137,8 @@ extension Args {
             rdadvisePolicy: rdadvisePolicy,
             prefillEnabled: prefillPolicy == .chunked,
             prefillChunkTokens: prefillChunkTokens,
-            forceLogitsHead: forceLogitsHead)
+            forceLogitsHead: forceLogitsHead,
+            enableSpeculation: specDecode)
     }
 
     public static func parse(_ argv: [String]) throws -> Args {
@@ -155,6 +160,7 @@ extension Args {
         var prefillPolicy = runtimeDefaults.prefillPolicy
         var prefillChunkTokens = runtimeDefaults.prefillChunkTokens
         var rdadvisePolicy = runtimeDefaults.rdadvisePolicy
+        var specDecode = false
 
         var index = 0
         while index < argv.count {
@@ -251,6 +257,9 @@ extension Args {
                     throw ArgsError.invalidValue(flag: flag, value: value)
                 }
                 rdadvisePolicy = parsed
+            case "--spec-decode":
+                specDecode = true
+                index += 1
             default:
                 throw ArgsError.unknownFlag(flag)
             }
@@ -282,7 +291,8 @@ extension Args {
                              expertCachePolicy: expertCachePolicy,
                              prefillPolicy: prefillPolicy,
                              prefillChunkTokens: prefillChunkTokens,
-                             rdadvisePolicy: rdadvisePolicy)
+                             rdadvisePolicy: rdadvisePolicy,
+                             specDecode: specDecode)
         _ = try arguments.resolvedRuntimeConfiguration(forceLogitsHead: false)
         return arguments
     }

@@ -114,7 +114,20 @@ enum DraftVerifier {
         greedyTokens.reserveCapacity(K)
         var layerPlans: [(layer: Int, experts: [Int])] = []
 
+        // P8-1: snapshot DeltaNet state before each draft token so we can
+        // restore to the accepted-count boundary after verification. Without
+        // this, rejected drafts leave corrupted recurrent state.
+        var deltaNetSnapshots: [DeltaNetStateSnapshot] = []
+        if let stateStore = runner.deltaNetState {
+            deltaNetSnapshots.reserveCapacity(K)
+            _ = stateStore  // silence unused warning if snapshots not needed
+        }
+
         for tk in 0..<K {
+            // Snapshot state BEFORE processing this draft token
+            if let stateStore = runner.deltaNetState {
+                deltaNetSnapshots.append(stateStore.snapshot())
+            }
             let seqLen = UInt32(startKVPosition + tk + 1)
             let tokenOff = tk * Int(D) * MemoryLayout<Float16>.stride
 
@@ -670,6 +683,14 @@ enum DraftVerifier {
             } else {
                 break
             }
+        }
+
+        // P8-1: restore DeltaNet state to BEFORE any draft processing.
+        // The caller (RawCompletion) always falls through to the standard
+        // single-token path, which expects state at the pre-spec position.
+        // Snapshot[0] = state before tk=0 = the caller's original state.
+        if let stateStore = runner.deltaNetState, !deltaNetSnapshots.isEmpty {
+            stateStore.restoreSnapshot(deltaNetSnapshots[0])
         }
 
         return BatchedPassResult(greedyTokens: greedyTokens,

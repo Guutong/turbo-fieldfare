@@ -200,8 +200,14 @@ public func runRawCompletion(producer: any LogitProducer,
         }
         generated += 1
 
-        // --- Speculative batch verification branch ---
-        var batchVerified = false
+        // --- Speculative batch verification branch (P8-1: observational) ---
+        //
+        // DraftVerifier runs for speculator stats only. DeltaNet state is
+        // snapshot/restored inside DraftVerifier so persistent state is
+        // unchanged. KV position is never advanced by DraftVerifier.
+        // All token emission goes through the standard single-token path.
+        // Phase 3 (layer-major batched verification) will restructure this
+        // for actual speed gain.
         if let spec = speculator,
            history.count >= 3,
            let rrunner = producer as? RealForwardRunner {
@@ -216,7 +222,7 @@ public func runRawCompletion(producer: any LogitProducer,
                         0
                     )
 
-                    // Count consecutive accepted drafts
+                    // Count consecutive accepted drafts (observational only)
                     var acceptedCount = 0
                     for k in 0..<K {
                         if Int32(bitPattern: result.greedyTokens[k])
@@ -228,112 +234,21 @@ public func runRawCompletion(producer: any LogitProducer,
                         }
                     }
 
-                    // Emit accepted drafted tokens
+                    // Update speculator stats via observe() for accepted
+                    // drafts. The standard path below will emit the real
+                    // tokens; this just teaches the drafter what worked.
                     for k in 0..<acceptedCount {
-                        history.append(drafts[k])
-                        speculator?.observe(
-                            realToken: drafts[k], context: history)
-                        uncommittedBoundaryTokenIDs.append(drafts[k])
-                        let delta = detok.push(drafts[k])
-                        let visible = stopMatcher.push(delta)
-                        onProgress(.token(
-                            index: generated - 1 + k, id: drafts[k],
-                            delta: visible))
-
-                        let hitStopString = stopMatcher.isStopped || shouldStop()
-                        let hitMax = generated + k
-                            >= config.maxNewTokens
-                        if hitStopString || hitMax {
-                            let tail = stopMatcher.push(detok.flush())
-                                + stopMatcher.finish()
-                            if !tail.isEmpty { onProgress(.tail(tail)) }
-                            reason = hitMax ? .maxTokens : .stopString
-                            return RawDecodeResult(
-                                prefillTokens: promptIds.count,
-                                cachedPromptTokens: cachedPromptTokens,
-                                computedPrefillTokens: computedPrefillTokens,
-                                prefillSeconds: prefillSeconds,
-                                newTokens: generated + k,
-                                decodeSeconds: Date().timeIntervalSince(
-                                    decodeStart),
-                                reason: reason,
-                                kvPosition: position + k,
-                                kvBackedTokenIDs: history,
-                                uncommittedBoundaryTokenIDs:
-                                    uncommittedBoundaryTokenIDs)
-                        }
-                        position += 1
-                    }
-
-                    // Determine bonus token and whether to skip the standard
-                    // single-token path below.
-                    //
-                    // Mismatch (accepted < K): bonus is at greedy[accepted].
-                    // We MUST skip the standard path (batchVerified=true)
-                    // because the batch already computed this bonus token
-                    // and we don't want to double-emit it.
-                    //
-                    // All K accepted: no bonus from the batch (we only have
-                    // K greedy outputs matching K accepted drafts). The
-                    // standard path below will compute the continuation
-                    // token via produce() at position+K.
-                    if acceptedCount < K {
-                        // Bonus = greedy at mismatch index
-                        let bonusToken = Int32(
-                            bitPattern: result.greedyTokens[acceptedCount])
-                        history.append(bonusToken)
-                        speculator?.observe(
-                            realToken: bonusToken, context: history)
-                        uncommittedBoundaryTokenIDs = [bonusToken]
-                        let delta = detok.push(bonusToken)
-                        let visible = stopMatcher.push(delta)
-                        onProgress(.token(
-                            index: generated - 1 + acceptedCount,
-                            id: bonusToken, delta: visible))
-
-                        let hitStopString = stopMatcher.isStopped
-                            || shouldStop()
-                        let hitMax = generated + acceptedCount
-                            >= config.maxNewTokens
-                        if hitStopString || hitMax {
-                            let tail = stopMatcher.push(detok.flush())
-                                + stopMatcher.finish()
-                            if !tail.isEmpty { onProgress(.tail(tail)) }
-                            reason = hitMax ? .maxTokens : .stopString
-                            return RawDecodeResult(
-                                prefillTokens: promptIds.count,
-                                cachedPromptTokens: cachedPromptTokens,
-                                computedPrefillTokens: computedPrefillTokens,
-                                prefillSeconds: prefillSeconds,
-                                newTokens: generated + acceptedCount + 1,
-                                decodeSeconds: Date().timeIntervalSince(
-                                    decodeStart),
-                                reason: reason,
-                                kvPosition: position + 1,
-                                kvBackedTokenIDs: history,
-                                uncommittedBoundaryTokenIDs:
-                                    uncommittedBoundaryTokenIDs)
-                        }
-                        position += 1
-                        generated += acceptedCount + 1
-                        batchVerified = true   // skip standard path below
-                    } else {
-                        // All K accepted. batchVerified stays false so the
-                        // standard path will compute one more token via
-                        // produce(position) at the new position.
-                        generated += acceptedCount
+                        spec.observe(realToken: drafts[k],
+                                     context: history)
                     }
                 }
             } catch {
-                // Batched pass failed (e.g. MoE stub not wired for Qwen3.6).
-                // Reset speculator round state so it tries again next
-                // iteration via the standard single-token path.
-                if let spec = speculator { spec.reset() }
+                // DraftVerifier failed — reset speculator round state.
+                spec.reset()
             }
         }
 
-        if !batchVerified {
-            // --- Standard single-token path (original) ---
+        // --- Standard single-token path (always runs) ---
             // P6b-4: n-gram speculation accounting. `history` here is exactly the
             // tokens already fed to the producer, and `tokenID` is the real greedy
             // token the forward pass just produced — so the drafter is verified
@@ -377,7 +292,6 @@ public func runRawCompletion(producer: any LogitProducer,
                 token: tokenID, position: position, into: scratch.logits)
             position += 1
             uncommittedBoundaryTokenIDs.removeAll(keepingCapacity: true)
-        }
     }
 
     return RawDecodeResult(prefillTokens: promptIds.count,

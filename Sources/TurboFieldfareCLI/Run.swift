@@ -16,6 +16,13 @@ public func run(args: Args,
                 stdout: FileHandle = .standardOutput,
                 stderr: FileHandle = .standardError) async -> RunResult {
     do {
+        // P8-1: TFF_SPEC_DECODE env var also enables speculation (in addition
+        // to --spec-decode CLI flag). This allocates K-sized scratch buffers
+        // in RuntimeConfiguration so DraftVerifier can run batched verification.
+        var args = args
+        if ProcessInfo.processInfo.environment["TFF_SPEC_DECODE"] == "1" {
+            args.specDecode = true
+        }
         // Validated before tokenizer/weight load so an oversized context fails
         // fast with a message instead of an allocation failure.
         if let reason = ContextCap.rejectionReason(for: args.maxContext) {

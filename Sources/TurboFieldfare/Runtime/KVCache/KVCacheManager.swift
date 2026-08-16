@@ -237,6 +237,22 @@ public final class KVCacheManager {
         position += count
     }
 
+    // MARK: - Speculative decode snapshot/rollback
+
+    /// Snapshot the current KV position for speculative decode rollback.
+    /// On rejection, `restorePosition` rewinds the cursor so attention ignores
+    /// the rejected drafts' KV slots (they sit beyond `validTokenCount`).
+    /// No buffer copy needed — stale data past position is invisible.
+    public func snapshotPosition() -> Int { position }
+
+    /// Restore KV position to a pre-verification snapshot. Called after a spec
+    /// decode round when not all drafts were accepted.
+    public func restorePosition(_ savedPosition: Int) {
+        precondition(savedPosition >= 0 && savedPosition <= position,
+                     "restorePosition: \(savedPosition) out of range [0, \(position)]")
+        position = savedPosition
+    }
+
     /// Drop all cached positions and return physical pages to the OS.
     ///
     /// No buffer zeroing — the attention kernels read only `[0, validTokenCount]`,
