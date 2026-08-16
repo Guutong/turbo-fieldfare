@@ -692,17 +692,10 @@ enum DraftVerifier {
 
     // MARK: – Helpers
 
-    /// Synchronously wait for a command buffer to complete (async-compatible).
-    /// Uses the underlying Objective-C setCompletionHandler since `any
-    /// MTLCommandBuffer` doesn't expose Metal completion methods.
+    /// Synchronously wait for a command buffer to complete.
+    /// P8-3: use proper Metal API instead of broken ObjC selector hack.
     private static func waitForCommandBuffer(_ cb: MTLCommandBuffer) {
-        let semaphore = DispatchSemaphore(value: 0)
-        typealias HandlerBlock = @convention(block) (MTLCommandBuffer?) -> Void
-        var capturedSem = semaphore
-        let block: HandlerBlock = { _ in capturedSem.signal() }
-        let obj = unsafeBitCast(block, to: AnyObject.self)
-        (cb as AnyObject).perform(Selector(("addCompletedHandler:")), with: obj)
-        semaphore.wait()
+        cb.waitUntilCompleted()
     }
 
     /// Check command buffer status and throw on failure.
