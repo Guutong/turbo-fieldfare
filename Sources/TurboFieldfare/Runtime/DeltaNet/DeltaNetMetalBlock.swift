@@ -371,12 +371,22 @@ final class DeltaNetMetalBlock {
     /// `xF32Offset`/`yF32Offset` are byte offsets into the (possibly
     /// batched, `[tk x dim]`) fp32 scratch; `xF16`/`yF16` are always the
     /// single-token half scratch (reused per token in the batched loop).
+    ///
+    /// `castX`: when several projections share the same `xF32` source (the
+    /// qkv/z/a/b calls in `encode()` all read `normedBuf`), the caller casts
+    /// it once and passes `castX: false` for the rest — same `xF16` buffer,
+    /// no reason to redo an identical cast 4 times. Defaults `true` since
+    /// most callers (including every `matVecInt4Batched` iteration, where
+    /// `xF32Offset` differs per token) do need their own cast.
     private func matVecInt4(_ enc: MTLComputeCommandEncoder,
                             w: TensorView,
                             xF32: MTLBuffer, xF32Offset: Int = 0, xF16: MTLBuffer,
+                            castX: Bool = true,
                             yF16: MTLBuffer, yF32: MTLBuffer, yF32Offset: Int = 0,
                             rows: Int, cols: Int) {
-        cast(enc, psoCastToHalf, src: xF32, srcOffset: xF32Offset, dst: xF16, count: cols)
+        if castX {
+            cast(enc, psoCastToHalf, src: xF32, srcOffset: xF32Offset, dst: xF16, count: cols)
+        }
         int4GEMV.encode(encoder: enc,
                         weights: w.buffer, weightsOffset: Int(w.offset),
                         scales: w.buffer, scalesOffset: Int(w.scaleOffset),
@@ -465,13 +475,16 @@ final class DeltaNetMetalBlock {
             matVec(enc, w: weights.a!, x: normedBuf, y: aRawBuf, rows: dims.numValueHeads, cols: D)
             matVec(enc, w: weights.b!, x: normedBuf, y: bRawBuf, rows: dims.numValueHeads, cols: D)
         } else {
+            // qkv/z/a/b all read the same normedBuf -> cast to half ONCE
+            // (castX: false on the rest) instead of 4 redundant casts of the
+            // identical source into the identical destination.
             matVecInt4(enc, w: weights.qkvTV, xF32: normedBuf, xF16: normedBufF16,
                       yF16: qkvBufF16, yF32: qkvBuf, rows: dims.convDim, cols: D)
-            matVecInt4(enc, w: weights.zTV, xF32: normedBuf, xF16: normedBufF16,
+            matVecInt4(enc, w: weights.zTV, xF32: normedBuf, xF16: normedBufF16, castX: false,
                       yF16: zBufF16, yF32: zBuf, rows: valueDim, cols: D)
-            matVecInt4(enc, w: weights.aTV, xF32: normedBuf, xF16: normedBufF16,
+            matVecInt4(enc, w: weights.aTV, xF32: normedBuf, xF16: normedBufF16, castX: false,
                       yF16: aRawBufF16, yF32: aRawBuf, rows: dims.numValueHeads, cols: D)
-            matVecInt4(enc, w: weights.bTV, xF32: normedBuf, xF16: normedBufF16,
+            matVecInt4(enc, w: weights.bTV, xF32: normedBuf, xF16: normedBufF16, castX: false,
                       yF16: bRawBufF16, yF32: bRawBuf, rows: dims.numValueHeads, cols: D)
         }
 

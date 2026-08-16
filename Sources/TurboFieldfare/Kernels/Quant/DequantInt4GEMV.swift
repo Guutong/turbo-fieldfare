@@ -16,6 +16,16 @@ final class DequantInt4GEMV {
         Shape(m: 8192, n: 2816),
         Shape(m: 1024, n: 2816),
         Shape(m: 2816, n: 8192),
+        // P7-7: Qwen3.6 DeltaNet's five projections (hiddenSize D=2048,
+        // convDim=8192, valueDim=4096, numValueHeads=32). None of the
+        // Gemma-FFN shapes above (all n=2816) match these, so DeltaNet's
+        // GEMV calls always fell through to the unspecialized `pipeline`
+        // (no compile-time M/N constant folding). Additive only — doesn't
+        // change dispatch for any shape already in this list.
+        Shape(m: 8192, n: 2048),  // qkv
+        Shape(m: 4096, n: 2048),  // z
+        Shape(m: 32, n: 2048),    // a, b
+        Shape(m: 2048, n: 4096),  // out
     ]
 
     private let pipeline: MTLComputePipelineState
