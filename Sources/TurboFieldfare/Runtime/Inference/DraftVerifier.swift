@@ -383,21 +383,20 @@ enum DraftVerifier {
                             n: D,
                             outputTokenStride: outputTokenStride)
                     }
-                    cb.commit()
-
                     // C) Handle gated-Q de-interleave + epilogue
+                    // P8-2: GPU kernels replace CPU readback, all in one CB.
                     if isGatedAttn {
-                        waitForCommandBuffer(cb)
-                        try checkCmdError(cb.error)
-                        runner.splitGatedQProjection(
-                            qDim: Int(qDim),
-                            headDim: headDimL)
+                        runner.gatedAttn.encodeSplit(
+                            commandBuffer: cb,
+                            qRaw: qRawScratch,
+                            qOut: qScratch,
+                            gateOut: runner.qGateScratch,
+                            numHeads: UInt32(cfg.numHeads),
+                            headDim: UInt32(headDimL))
+                    }
 
-                        cb = queue.makeCommandBuffer()!
-
-                        // RoPE + norm on Q. In spec mode kRoPE/vRoPE resolve to
-                        // the per-token strided stage offset so RoPE sees token tk's
-                        // own K/V. In real-cache mode they point to the ring-slot.
+                    // RoPE + norm on Q.
+                    do {
                         let rotated: UInt32 = isFull
                             ? UInt32(
                                 Double(cfg.fullHeadDim)
@@ -407,7 +406,7 @@ enum DraftVerifier {
 
                         runner.fusedQKVEpilogue.encode(
                             commandBuffer: cb,
-                            q: qScratch, qOffset: 0,
+                            q: isGatedAttn ? qScratch : qRawScratch, qOffset: 0,
                             k: kRoPE.buffer, kOffset: kRoPE.offset,
                             v: vRoPE.buffer, vOffset: vRoPE.offset,
                             qWeight: qNormT.buffer,
@@ -429,18 +428,9 @@ enum DraftVerifier {
                                 ? 2 * rotated : nil,
                             normalizeV: cfg.topology != .qwen36,
                             scaling: scaling)
-                        cb.commit()
-
-                        waitForCommandBuffer(cb)
-                        try checkCmdError(cb.error)
-                        runner.applyAttentionOutputGate(qDim: Int(qDim))
-
-                        cb = queue.makeCommandBuffer()!
                     }
 
-                    // D) Attention kernel. kRoPE/vRoPE resolve to per-token
-                    // locations (ring-slot in autoregressive mode, strided
-                    // stage offset during speculation).
+                    // D) Attention kernel.
                     let attnScale: Float = isFull
                         ? Float(cfg.ropeScaling(atLayer: L)?
                                 .attentionFactor ?? 1.0)
@@ -481,6 +471,15 @@ enum DraftVerifier {
                             window: UInt32(cfg.slidingWindow),
                             scale: 1.0,
                             ringCapacity: activeRC)
+                    }
+
+                    // P8-2: sigmoid gate on attention output (GPU)
+                    if isGatedAttn {
+                        runner.gatedAttn.encodeOutputGate(
+                            commandBuffer: cb,
+                            attnOut: attnOut,
+                            gate: runner.qGateScratch,
+                            count: UInt32(Int(qDim)))
                     }
                     cb.commit()
 

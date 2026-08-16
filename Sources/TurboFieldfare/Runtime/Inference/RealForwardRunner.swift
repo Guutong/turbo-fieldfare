@@ -171,6 +171,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     internal let fusedPostAttentionSetup: FusedPostAttentionSetup
     internal let fusedTail: FusedLayerTail
     internal let elementwiseAdd: ElementwiseAdd
+    /// P8-2: Qwen3.6 gated attention GPU kernels (split + sigmoid gate).
+    internal let gatedAttn: GatedAttentionFusion
 
     // Prefill kernels. These are initialized once per runner so the chunk path
     // cannot accidentally rebuild PSOs inside a per-layer loop.
@@ -201,7 +203,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     /// de-interleaved into `qScratch` (query) and `qGateScratch` (gate).
     /// Unused (and zero-length) for topologies without gated attention.
     internal let qRawScratch: MTLBuffer
-    private let qGateScratch: MTLBuffer
+    internal let qGateScratch: MTLBuffer
     internal let kStage: MTLBuffer        // [max KV heads * head_dim] FP16, current token
     internal let vStage: MTLBuffer        // [max KV heads * head_dim] FP16, current token
     private let oOut: MTLBuffer          // [D] FP16
@@ -347,6 +349,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         self.fusedPostAttentionSetup = try FusedPostAttentionSetup(context: context)
         self.fusedTail = try FusedLayerTail(context: context)
         self.elementwiseAdd = try ElementwiseAdd(context: context)
+        self.gatedAttn = try GatedAttentionFusion(context: context)
         self.prefillEmbed = try PrefillEmbedLookupInt4(context: context)
         self.prefillRMS = try PrefillRMSNorm(context: context)
         self.prefillQMM = try PrefillInt4QMM(context: context)
@@ -2266,24 +2269,23 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 gInputNorm(cb)
                 gQKV(cb)
                 if isGatedAttn {
-                    // De-interleaving the per-head [query | gate] halves and
-                    // applying sigmoid(gate) are CPU steps (ADR-0001: plain and
-                    // obviously correct), so the layer's attention work splits
-                    // into three command buffers instead of one.
-                    cb.commit()
-                    waitUntilCompleted(cb)
-                    try checkCommandBufferError(cb.error)
-                    splitGatedQProjection(qDim: Int(qDim), headDim: headDimL)
-
-                    cb = ctx.queue.makeCommandBuffer()!
+                    // P8-2: GPU kernels replace the CPU readback points that
+                    // previously forced 3-CB splits. All dispatches stay in
+                    // one CB — Metal serializes encoders within a CB.
+                    gatedAttn.encodeSplit(
+                        commandBuffer: cb,
+                        qRaw: qRawScratch,
+                        qOut: qScratch,
+                        gateOut: qGateScratch,
+                        numHeads: UInt32(cfg.numHeads),
+                        headDim: UInt32(headDimL))
                     gQKVEpilogue(cb)
                     gAttention(cb)
-                    cb.commit()
-                    waitUntilCompleted(cb)
-                    try checkCommandBufferError(cb.error)
-                    applyAttentionOutputGate(qDim: Int(qDim))
-
-                    cb = ctx.queue.makeCommandBuffer()!
+                    gatedAttn.encodeOutputGate(
+                        commandBuffer: cb,
+                        attnOut: attnOut,
+                        gate: qGateScratch,
+                        count: UInt32(Int(qDim)))
                 } else {
                     gQKVEpilogue(cb)
                     gAttention(cb)

@@ -410,3 +410,45 @@ void apply_attention_gating_per_head(
     const uint idx = (t * num_heads + h) * head_dim + d;
     attn_out[idx] = half(float(attn_out[idx]) * softplus_g);
 }
+
+// ── P8-2: Qwen3.6 gated attention kernels ───────────────────────────
+
+/// De-interleave gated QKV projection output into separate Q and gate buffers.
+/// Input layout: [heads, 2*head_dim] with [q, gate] interleaved per head.
+/// Output: q[h*head_dim + d] = raw[h*2*head_dim + d]
+///         gate[h*head_dim + d] = raw[h*2*head_dim + head_dim + d]
+[[kernel]]
+void gated_qkv_split(
+    device const half* raw    [[buffer(0)]],
+    device half*       q_out  [[buffer(1)]],
+    device half*       gate   [[buffer(2)]],
+    constant uint&     num_heads [[buffer(3)]],
+    constant uint&     head_dim  [[buffer(4)]],
+    uint               gid    [[thread_position_in_grid]]
+) {
+    const uint total = num_heads * head_dim;
+    if (gid >= total) return;
+
+    const uint h = gid / head_dim;
+    const uint d = gid % head_dim;
+    const uint src_base = h * 2 * head_dim;
+
+    q_out[gid]    = raw[src_base + d];
+    gate[gid]     = raw[src_base + head_dim + d];
+}
+
+/// Apply sigmoid gate to attention output: out[i] *= sigmoid(gate[i]).
+/// Matches CPU reference: g = 1 / (1 + exp(-gate)).
+[[kernel]]
+void gated_attn_output_sigmoid(
+    device half*       attn_out [[buffer(0)]],
+    device const half* gate     [[buffer(1)]],
+    constant uint&     count    [[buffer(2)]],
+    uint               gid      [[thread_position_in_grid]]
+) {
+    if (gid >= count) return;
+
+    const float g = float(gate[gid]);
+    const float s = 1.0f / (1.0f + exp(-g));
+    attn_out[gid] = half(float(attn_out[gid]) * s);
+}

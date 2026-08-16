@@ -85,7 +85,10 @@ final class LMHeadChainInt4 {
                         d: d,
                         eps: rmsEps)
 
+        // P8-2: hold one encoder open across both dispatches (rowGreedy +
+        // rowReducer) to eliminate encoder boundary overhead.
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            // Dispatch 1: row-greedy chunk processing
             let specialized = d == Self.realDecodeD && vocab == Self.realDecodeVocab
             encoder.setComputePipelineState(specialized ? rowGreedySpecialized : rowGreedy)
             encoder.setBuffer(xNormedBuffer, offset: 0, index: 0)
@@ -105,18 +108,15 @@ final class LMHeadChainInt4 {
             encoder.dispatchThreadgroups(
                 MTLSize(width: rowGroups, height: 1, depth: 1),
                 threadsPerThreadgroup: threadgroupSize)
-            encoder.endEncoding()
-        }
 
-        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            // Dispatch 2: row-reducer (reads rowSummariesBuffer written above)
             encoder.setComputePipelineState(rowReducer)
-            encoder.setBuffer(rowSummariesBuffer, offset: 0, index: 0)
             encoder.setBuffer(outToken, offset: 0, index: 1)
             var rowGroupCount = UInt32(rowGroups)
             encoder.setBytes(&rowGroupCount, length: MemoryLayout<UInt32>.size, index: 2)
 
-            let threadgroupSize = MTLSize(width: 256, height: 1, depth: 1)
-            encoder.dispatchThreads(threadgroupSize, threadsPerThreadgroup: threadgroupSize)
+            let reducerThreadgroupSize = MTLSize(width: 256, height: 1, depth: 1)
+            encoder.dispatchThreads(reducerThreadgroupSize, threadsPerThreadgroup: reducerThreadgroupSize)
             encoder.endEncoding()
         }
     }
