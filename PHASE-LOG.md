@@ -2405,3 +2405,91 @@ not after two rounds of `plausible-looking mechanism -> no effect`.
 3. Confirm the 8 full-suite test failures are pre-existing (targeted
    58-test subset covering this change's files passed clean).
 4. Speed gate (>=4 tok/s) and memory gate (<=2GB) both still FAILED.
+
+### 2026-08-16 — P7-7 — TODO -> DONE  ← MILESTONE, BOTH GATES PASS
+
+Root cause of the `cb1Wait` bottleneck flagged in P7-6 (2026-08-15): 30 of
+Qwen3.6's 40 layers are DeltaNet ("linear attention") layers, and
+`DeltaNetMetalBlock.LayerWeights` was dequantizing their five big
+projections (`qkv`/`z`/`a`/`b`/`out`) from int4 to fp32 and multiplying
+with a naive one-thread-per-row `dn_matvec` kernel — no `simd_sum`, no
+threadgroup staging, ~12% of peak memory bandwidth. Measured: DeltaNet
+layers cost 11.4ms/layer of GPU time vs 0.36ms/layer for full-attention
+layers doing comparable work with the SIMD-reduction int4 GEMV kernel
+(`DequantInt4GEMV`) the codebase already had — a 32x per-layer gap, and
+~4.05GB of resident fp32 weight (matching the memory-gate failure).
+Full plan: `docs/PHASE-7-7-DELTANET-INT4-GEMV.md`.
+
+**Task 2** — `LayerWeights` now holds int4-resident `TensorView`s (`qkvTV`/
+`zTV`/`aTV`/`bTV`/`outTV`) referencing the model's existing resident weight
+arena directly — no dequant, no copy. Old fp32-dequant path kept behind
+`TFF_DELTANET_FP32=1` for A/B and rollback.
+
+**Task 3** — wired `DequantInt4GEMV` into `encode()`'s five `matVec` call
+sites through a thin `fp32<->half` cast boundary (`dn_cast_f32_to_f16`/
+`dn_cast_f16_to_f32`, new kernels in `deltanet.metal`), scoped deliberately
+narrow: every other kernel's fp32 math (RMSNorm, conv, QK-norm, gates,
+recurrence, output gate) is untouched, so only the GEMV boundary itself
+carries any new numeric risk.
+
+**Task 4** — the int4 path fails `DeltaNetMetalParityTests`' original
+1e-5 relL2 gate: measured relL2 is flat at ~4e-4 to 1.1e-3 across all 30
+DeltaNet layers, not growing with token index (rules out a state-plumbing
+bug — the magnitude matches fp16's ~2^-11 mantissa precision almost
+exactly, i.e. rounding noise from the cast boundary, on top of int4
+quantization noise). The test's docstring explicitly says (citing
+ADR-0002) this gate is "not to be widened to make a failing kernel pass."
+User confirmed overriding that for this one kernel family, twice, after
+being shown the conflict directly. Added `Self.intGate` — 1e-5 under
+`TFF_DELTANET_FP32=1` (fp32 kernel unchanged, still meets the original
+gate), 2e-3 for the int4 default, with the reasoning and a tripwire
+("if this ever grows across tokens instead of staying flat, that's a
+real bug, not more rounding to excuse") recorded in the suite doc comment.
+Re-ran: 4/4 tests pass, worst deltaOut relL2 0.00106, worst state relL2
+0.00049 (layer 26). `swift test --filter DeltaNet` (26/26, 4 suites) and
+`swift test --filter Qwen36` (28/28, 8 suites, model-level relL2
+~0.006-0.0075, under the ~1e-2 model-level ADR-0002 budget) both pass.
+(No dedicated `DraftVerifier` test suite exists — the doc's Task 6
+acceptance criterion assumed one; real coverage of the batched path is
+`DeltaNetParityTests.encodeBatchedMatchesKSequentialCPUCallsChainingState`,
+which passed under the same gate.)
+
+**Task 6** — `DequantInt4GEMV` has no batch dimension, so
+`encodeBatched`'s int4 path (`matVecInt4Batched`) loops the single-token
+GEMV over `tk` tokens, reusing the single-token half scratch each
+iteration — race-free because Metal serializes dispatch order within one
+encoder, the same guarantee the rest of `encode()` already relies on.
+
+**Task 7** — full `swift test`: 853 tests, 149 suites, **8 failures** —
+exactly the documented pre-existing baseline (config parsing, model
+catalog, fixtures, dense-layer prefill/decode — none touch DeltaNet, int4,
+or GEMV). Zero new failures from this work.
+
+**Measured on target (M2 Air, Mac14,2, 16GB, idle):**
+```
+cb1GPUlinear: 350ms/tok -> 81ms/tok   (4.3x — bandwidth win only; this
+  implementation kept the surrounding kernels fp32 with a cast boundary
+  rather than doc's full fp16-everywhere rewrite, so it captures the int4
+  storage win but not the full ALU win section 5.1/5.2 projected)
+tok/s:        2.2 -> 4.1-4.2          (>=4 gate: PASS)
+RSS:          4-5GB -> 1.32GB         (<=2GB gate: PASS)
+text output:  byte-identical to the fp32 baseline at temperature 0
+```
+
+**Both P7-7 gates pass — first time either has passed this bringup.**
+
+**Not done / next:**
+1. The 32x per-layer gap is now ~4.3x closed (81ms vs a ~20ms/tok
+   projection in the plan doc) — full fp16-everywhere rewrite of the
+   surrounding DeltaNet kernels (RMSNorm/conv/QK-norm/gates/recurrence/
+   output-gate, currently all still fp32 with a cast boundary bolted on)
+   would close more of the remaining gap, at the cost of touching every
+   kernel's numerics instead of just the GEMV boundary — deliberately
+   deferred this session to keep the correctness blast radius small.
+2. `io` phase (~104-110ms/tok, routed-expert pread) is now comparable in
+   size to `cb1` and is the next largest phase — out of scope for P7-7,
+   flagged as the next target in the plan doc.
+3. `Self.intGate`'s 2e-3 ADR-0002 exception is scoped to
+   `DeltaNetMetalParityTests` only; if int4 GEMV gets reused elsewhere
+   for DeltaNet-family tensors, re-derive rather than assume the same
+   ceiling applies.
