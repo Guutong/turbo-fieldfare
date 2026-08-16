@@ -301,13 +301,7 @@ enum DraftVerifier {
                     // batch copy later doesn't overwrite earlier ones.
                     let outputTokenStride: Int = runner.kv != nil ? 1 : kvDimElements
 
-                    // Copy token tk's hidden to offset 0 for kernel call.
-                    copyScratchRegion(from: hidden,
-                                      srcStart: tokenOff,
-                                      dstStart: 0,
-                                      byteCount: Int(D)
-                                              * MemoryLayout<Float16>
-                                                      .stride)
+                    // P8-3: kernels now support xOffset — no copy needed.
 
                     if attnQuant.weightBits != 4 {
                         // Wide GEMV — also lacks xOffset. Same fix applies.
@@ -336,8 +330,8 @@ enum DraftVerifier {
                             vScalesOffset: Int(vProj.scaleOffset),
                             vBiases: vProj.buffer,
                             vBiasesOffset: Int(vProj.biasOffset),
-                            // NOTE: No xOffset — kernel hardcodes 0
                             x: hidden,
+                            xOffset: tokenOff,
                             qOut: qScratch,
                             kOut: kOutGEMV.buffer,
                             kOutOffset: kOutGEMV.offset,
@@ -370,8 +364,8 @@ enum DraftVerifier {
                             vScalesOffset: Int(vProj.scaleOffset),
                             vBiases: vProj.buffer,
                             vBiasesOffset: Int(vProj.biasOffset),
-                            // NOTE: No xOffset — kernel hardcodes 0
                             x: hidden,
+                            xOffset: tokenOff,
                             qOut: isGatedAttn
                                 ? qRawScratch : qScratch,
                             kOut: kOutGEMV.buffer,
