@@ -403,6 +403,12 @@ public struct Model {
 
     /// Open layer L's file + verify SHA, idempotent.
     func ensureLayerOpened(_ L: Int) throws {
+        // P8-3: fast-path check without lock to avoid contention overhead.
+        // Safe: if streamers[L] is non-nil, layer is already open and stable.
+        if streamersBox.streamers[L] != nil {
+            return
+        }
+
         let t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
         defer {
             Model.debugQueueSyncNanos &+= clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0
